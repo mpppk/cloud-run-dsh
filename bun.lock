@@ -32,6 +32,9 @@
     "packages/dsh-subprocess-cloud-run": {
       "name": "@cloud-run-dsh/dsh-subprocess-cloud-run",
       "version": "0.0.0",
+      "dependencies": {
+        "@cloud-run-dsh/cloud-run-sandbox": "workspace:*",
+      },
     },
     "packages/github-credential-broker": {
       "name": "@cloud-run-dsh/github-credential-broker",

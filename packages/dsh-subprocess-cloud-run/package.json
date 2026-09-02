@@ -9,5 +9,8 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test src",
     "build": "tsc --build"
+  },
+  "dependencies": {
+    "@cloud-run-dsh/cloud-run-sandbox": "workspace:*"
   }
 }
