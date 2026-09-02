@@ -38,6 +38,15 @@ export class AgentGateway {
       return healthzResponse(this.deps.health.snapshot());
     }
 
+    // TRUST ASSUMPTION (仕様書 section 21 / 実装手順書 section 25): identity is
+    // accepted from the IAP-set header on presence alone. This host is only
+    // reachable behind IAP, which strips/overwrites this header before the
+    // request reaches us — a directly-set header from an outside caller is
+    // not reachable. Resolving the authenticated identity to an internal user
+    // and authorizing it (user → workspace membership → authorization) is the
+    // CONTROL PLANE's responsibility (T9); this host deliberately does not
+    // duplicate membership resolution, and the workspace-id match below is
+    // the only host-side authorization.
     const identity = request.headers.get(IAP_IDENTITY_HEADER);
     if (!identity) {
       return this.json(401, { error: "unauthenticated: missing IAP identity" });

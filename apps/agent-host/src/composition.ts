@@ -39,6 +39,8 @@ import { CheckpointCoordinator, WorkspaceBootstrapper } from "./bootstrap.js";
 import { buildLifecycleSteps, RestartRecovery } from "./recovery.js";
 import type { RecoveryResult } from "./recovery.js";
 import { HealthService } from "./health.js";
+import { LeaseHeartbeatLoop } from "./lease-heartbeat.js";
+import type { IntervalScheduler } from "./lease-heartbeat.js";
 import type { AgentGatewayDeps } from "./gateway.js";
 import { AgentGateway } from "./gateway.js";
 
@@ -60,8 +62,14 @@ export interface AgentHostDependencies {
   readonly secretProvider: SecretProvider;
   /** Real: fetch-based transport. Test: canned transport. */
   readonly brokerTransport: HttpTransport;
-  /** Real: BunSqlLeaseStore. Test: InMemoryLeaseStore. */
+  /** Real: BunSqlLeaseStore. Test: InMemoryLeaseStore (from ./testing). */
   readonly leaseStore: LeaseStore;
+  /**
+   * Interval scheduler driving the controller-lease heartbeat loop.
+   * Real: unref'd setInterval. Test: fake-clock-bound scheduler so renewals
+   * can be driven by advancing the injected clock (review BLOCKER fix).
+   */
+  readonly heartbeatScheduler?: IntervalScheduler;
   /** Real: persistent TransactionalStateStore. Test: InMemoryTransactionalStore. */
   readonly stateStore: TransactionalStateStore;
   /** Optional: DeepSeek Harness composition. Defaults to the fake (see harness.ts TODO). */
@@ -84,11 +92,19 @@ export interface AgentHost {
   readonly runtime: WorkspaceRuntime;
   readonly health: HealthService;
   readonly recovery: RestartRecovery;
+  /**
+   * Controller-lease renewal loop. Started automatically by `recover()`
+   * (after the lease is acquired), stopped on graceful stop, and self-terminating
+   * once the runtime reaches STOPPED.
+   */
+  readonly leaseHeartbeat: LeaseHeartbeatLoop;
   readonly gateway: AgentGateway;
   readonly logger: Logger;
   readonly metrics: Metrics;
   /** Runs the restart recovery path (実装手順書 section 30). */
   recover(): Promise<RecoveryResult>;
+  /** Stops the lease renewal loop (invoked on graceful stop / shutdown). */
+  stopLeaseHeartbeat(): void;
 }
 
 export function composeAgentHost(deps: AgentHostDependencies): AgentHost {
@@ -176,6 +192,35 @@ export function composeAgentHost(deps: AgentHostDependencies): AgentHost {
   const gatewayDeps: AgentGatewayDeps = { config, health, runtime, lease, logger };
   const gateway = new AgentGateway(gatewayDeps);
 
+  // Controller-lease renewal loop (review BLOCKER fix): without it the 45s
+  // lease expires and the gateway 409s every request permanently. Driven by
+  // the injected scheduler; fails health + re-acquires on lease loss.
+  const leaseHeartbeat = new LeaseHeartbeatLoop({
+    lease,
+    workspaceId: config.workspaceId,
+    controllerId: config.controllerId,
+    userId: config.userId,
+    scheduler: deps.heartbeatScheduler,
+    health,
+    logger,
+    onLeaseRegained: () => {
+      // Only report healthy again if the workspace actually is (the loop
+      // must never un-fail health for a workspace that is not READY).
+      if (runtime.getState() === "READY") health.setReady();
+    },
+    // Self-termination: a gracefully stopped host must not keep renewing
+    // (nor be kept alive by) the heartbeat loop.
+    isStopped: () => runtime.getState() === "STOPPED",
+  });
+
+  // The graceful stop (runtime.stop) ends the renewal loop immediately — the
+  // next-tick STOPPED check is only a backstop.
+  const runtimeStopBound = runtime.stop.bind(runtime);
+  runtime.stop = async () => {
+    leaseHeartbeat.stop();
+    return runtimeStopBound();
+  };
+
   return {
     config,
     harness,
@@ -189,9 +234,16 @@ export function composeAgentHost(deps: AgentHostDependencies): AgentHost {
     runtime,
     health,
     recovery,
+    leaseHeartbeat,
     gateway,
     logger,
     metrics,
-    recover: () => recovery.recover(),
+    recover: async () => {
+      const result = await recovery.recover();
+      // The lease is held — start renewing it for as long as the host lives.
+      leaseHeartbeat.start();
+      return result;
+    },
+    stopLeaseHeartbeat: () => leaseHeartbeat.stop(),
   };
 }

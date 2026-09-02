@@ -11,8 +11,8 @@ import {
   PermissionDeniedError,
   InstanceClientError,
   CloudRunInstanceClient,
-  FakeTransport,
 } from "./index.js";
+import { FakeTransport } from "./testing.js";
 
 describe("cloud-run-instance-client config defaults", () => {
   test("DEFAULT_INSTANCE_CONFIG matches spec section 6", () => {

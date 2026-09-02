@@ -66,6 +66,9 @@ export async function main(): Promise<void> {
   host.checkpointScheduler.startPeriodic();
   host.runtime.startIdlePolling(60_000, () => {
     host.checkpointScheduler.stopPeriodic();
+    // Graceful stop: the lease loop must not outlive the stopped host
+    // (the loop also self-terminates on the next tick via the STOPPED check).
+    host.stopLeaseHeartbeat();
     void server.stop(true);
   });
 }

@@ -28,6 +28,7 @@ import { defaultCheckpointKey } from "./config.js";
 
 export class FakeClock implements Clock {
   private currentMs: number;
+  private advanceListeners: Array<() => void> = [];
   constructor(initialMs = 1_000_000_000_000) {
     this.currentMs = initialMs;
   }
@@ -39,6 +40,75 @@ export class FakeClock implements Clock {
   }
   advance(ms: number): void {
     this.currentMs += ms;
+    // Notify bound schedulers so interval callbacks fire in fake time.
+    for (const listener of [...this.advanceListeners]) listener();
+  }
+  /** Registers a callback invoked after every advance (test wiring only). */
+  onAdvance(listener: () => void): () => void {
+    this.advanceListeners.push(listener);
+    return () => {
+      this.advanceListeners = this.advanceListeners.filter((l) => l !== listener);
+    };
+  }
+}
+
+/**
+ * Interval scheduler bound to a FakeClock: intervals fire when the clock
+ * advances past their scheduled time, so tests drive lease renewals by
+ * advancing fake time instead of waiting on wall time.
+ */
+export class FakeIntervalScheduler {
+  private jobs: Array<{
+    fn: () => void;
+    everyMs: number;
+    nextAtMs: number;
+    cancelled: boolean;
+  }> = [];
+  private readonly detach: () => void;
+
+  constructor(private readonly clock: FakeClock) {
+    this.detach = clock.onAdvance(() => this.fireDue());
+  }
+
+  start(fn: () => void, intervalMs: number): { cancel(): void } {
+    const job = {
+      fn,
+      everyMs: intervalMs,
+      nextAtMs: this.clock.nowMs() + intervalMs,
+      cancelled: false,
+    };
+    this.jobs.push(job);
+    return {
+      cancel: () => {
+        job.cancelled = true;
+      },
+    };
+  }
+
+  private get nowMs(): number {
+    return this.clock.nowMs();
+  }
+
+  /** Fires every non-cancelled job whose scheduled time has passed. */
+  private fireDue(): void {
+    // Loop until no job is due: callbacks may schedule/advance internally.
+    let progressed = true;
+    while (progressed) {
+      progressed = false;
+      for (const job of this.jobs) {
+        if (job.cancelled) continue;
+        if (job.nextAtMs <= this.nowMs) {
+          job.nextAtMs += job.everyMs;
+          job.fn();
+          progressed = true;
+        }
+      }
+    }
+  }
+
+  /** Stops reacting to clock advances (test teardown). */
+  dispose(): void {
+    this.detach();
   }
 }
 
@@ -199,7 +269,7 @@ export function makeConfig(overrides: Partial<AgentHostConfig> = {}): AgentHostC
 // ---------------------------------------------------------------------------
 
 import { InMemoryCheckpointStorage } from "@cloud-run-dsh/workspace-checkpoint";
-import { InMemoryLeaseStore } from "@cloud-run-dsh/controller-lease";
+import { InMemoryLeaseStore } from "@cloud-run-dsh/controller-lease/testing";
 import { InMemoryTransactionalStore } from "@cloud-run-dsh/workspace-runtime";
 import { PostgresSessionPersistenceRepository } from "@cloud-run-dsh/session-persistence-postgres";
 import { InMemoryFakeExecutor } from "@cloud-run-dsh/session-persistence-postgres/src/fakeExecutor.js";
@@ -217,6 +287,8 @@ export interface TestHost {
   readonly executor: InMemoryFakeExecutor;
   readonly repository: PostgresSessionPersistenceRepository;
   readonly clock: FakeClock;
+  /** Interval scheduler bound to the fake clock (drives lease heartbeats). */
+  readonly scheduler: FakeIntervalScheduler;
 }
 
 export async function composeTestHost(
@@ -232,6 +304,7 @@ export async function composeTestHost(
   const executor = new InMemoryFakeExecutor();
   const repository = new PostgresSessionPersistenceRepository(executor);
   const config = makeConfig(configOverrides);
+  const scheduler = new FakeIntervalScheduler(clock);
 
   const host = composeAgentHost({
     config,
@@ -249,9 +322,10 @@ export async function composeTestHost(
     leaseStore,
     stateStore: new InMemoryTransactionalStore({}, clock),
     clock,
+    heartbeatScheduler: scheduler,
   });
 
-  return { host, git, fs, storage, sandboxRunner, instance, leaseStore, executor, repository, clock };
+  return { host, git, fs, storage, sandboxRunner, instance, leaseStore, executor, repository, clock, scheduler };
 }
 
 export async function seedWorkspace(th: TestHost): Promise<void> {

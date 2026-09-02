@@ -7,7 +7,8 @@
 // always runs.
 
 import { describe, expect, test } from "bun:test";
-import { LeaseAlreadyHeldError, InMemoryLeaseStore, ControllerLeaseService } from "../../packages/controller-lease/src/index.js";
+import { LeaseAlreadyHeldError, ControllerLeaseService } from "../../packages/controller-lease/src/index.js";
+import { InMemoryLeaseStore } from "../../packages/controller-lease/src/testing.js";
 import type { SandboxManager, SandboxExecRequest, SubprocessHandle, SandboxExecResult } from "../../packages/cloud-run-sandbox/src/index.js";
 import { CloudRunSubprocessRuntime } from "../../packages/dsh-subprocess-cloud-run/src/index.js";
 import { runArgvForPolicy } from "../../apps/agent-host/src/guard.js";

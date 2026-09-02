@@ -95,18 +95,33 @@ export interface CloudRunSubprocessRuntimeOptions {
 export class CloudRunSubprocessRuntime {
   private readonly manager: SandboxManager;
   private readonly lock: WorkspaceLock;
+  private readonly workspaceId: string;
   private readonly defaultTimeoutMs?: number;
   private readonly secrets: readonly string[];
 
   constructor(opts: CloudRunSubprocessRuntimeOptions) {
     this.manager = opts.manager;
-    this.lock = getWorkspaceLock(opts.manager.getWorkspaceId());
+    this.workspaceId = opts.manager.getWorkspaceId();
+    this.lock = getWorkspaceLock(this.workspaceId);
     this.defaultTimeoutMs = opts.defaultTimeoutMs;
     this.secrets = opts.secrets ?? [];
   }
 
   getWorkspaceId(): string {
     return this.manager.getWorkspaceId();
+  }
+
+  /**
+   * Graceful teardown: waits for any in-flight subprocess, then evicts this
+   * workspace's lock from the module-level registry so the entry (and its
+   * serialized promise chain) is not retained forever by long-lived hosts.
+   */
+  async dispose(): Promise<void> {
+    await this.lock.mutex.runExclusive(async () => {
+      if (workspaceLocks.get(this.workspaceId) === this.lock) {
+        workspaceLocks.delete(this.workspaceId);
+      }
+    });
   }
 
   /**

@@ -5,6 +5,10 @@
   "type": "module",
   "description": "Cloud Run Instance client adapter \u2014 GCP SDK isolated here",
   "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./testing": "./src/testing.ts"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test src",

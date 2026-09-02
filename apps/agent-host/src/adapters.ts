@@ -385,9 +385,22 @@ export class SqlTransactionalStateStore implements TransactionalStateStore {
         await persist({
           record: { workspaceId, from, to, at: new Date(), reason },
           persist: async (data) => {
+            // workspace_checkpoints schema (infra/migrations/0001_init.sql):
+            // id UUID PK, workspace_id, base_commit_sha NOT NULL, gcs_object
+            // NOT NULL — there is no `data` column. The persist payload must
+            // carry the T5 bundle reference (base commit + GCS object key).
+            const bundle = data as { baseCommitSha?: unknown; gcsObject?: unknown };
+            if (
+              typeof bundle?.baseCommitSha !== "string" ||
+              typeof bundle?.gcsObject !== "string"
+            ) {
+              throw new Error(
+                "persist payload must be { baseCommitSha: string; gcsObject: string } (workspace_checkpoints schema)",
+              );
+            }
             await tx.exec(
-              "INSERT INTO workspace_checkpoints(workspace_id, data) VALUES ($1, $2)",
-              [workspaceId, JSON.stringify(data)],
+              "INSERT INTO workspace_checkpoints(id, workspace_id, base_commit_sha, gcs_object) VALUES (gen_random_uuid(), $1, $2, $3)",
+              [workspaceId, bundle.baseCommitSha, bundle.gcsObject],
             );
           },
         });
@@ -466,8 +479,14 @@ export class BunSqlLeaseStore implements LeaseStore {
     return this.executor.transaction(async (tx) => {
       const leaseTx: LeaseTransaction = {
         findByWorkspaceId: async (workspaceId) => {
+          // FOR UPDATE satisfies the LeaseStore.transaction isolation
+          // contract under READ COMMITTED (bun sql.begin default): the
+          // read-then-write flows (takeover, release) serialise on the row
+          // lock, so a release whose owner check saw a stale snapshot can
+          // never DELETE a lease a concurrent takeover just committed —
+          // same pattern as SqlTransactionalStateStore.apply.
           const rows = await tx.query<Record<string, unknown>>(
-            "SELECT * FROM controller_leases WHERE workspace_id = $1",
+            "SELECT * FROM controller_leases WHERE workspace_id = $1 FOR UPDATE",
             [workspaceId],
           );
           return rows.length === 0 ? null : rowToLeaseRecord(rows[0]!);

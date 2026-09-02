@@ -4,8 +4,6 @@ import {
   HEARTBEAT_INTERVAL_MS,
   LEASE_EXPIRY_MS,
   ControllerLeaseService,
-  InMemoryLeaseStore,
-  FakeClock,
   LeaseAlreadyHeldError,
   NotLeaseOwnerError,
   LeaseNotFoundError,
@@ -14,6 +12,7 @@ import {
   type LeaseStore,
   type LeaseTransaction,
 } from "./index.js";
+import { InMemoryLeaseStore, FakeClock } from "./testing.js";
 
 describe("controller-lease constants", () => {
   test("named constants", () => {

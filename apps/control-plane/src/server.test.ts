@@ -11,10 +11,8 @@ import {
 } from "@cloud-run-dsh/workspace-runtime";
 import type { ActivityKind } from "@cloud-run-dsh/workspace-runtime";
 import type { InstanceRuntime } from "@cloud-run-dsh/cloud-run-instance-client";
-import {
-  ControllerLeaseService,
-  InMemoryLeaseStore,
-} from "@cloud-run-dsh/controller-lease";
+import { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
+import { InMemoryLeaseStore } from "@cloud-run-dsh/controller-lease/testing";
 import {
   PostgresSessionPersistenceRepository,
   type SessionPersistenceRepository,
