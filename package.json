@@ -8,6 +8,7 @@
     "packages/*"
   ],
   "scripts": {
+    "dev:control-plane": "bun apps/control-plane/src/dev.ts",
     "typecheck": "tsc --build",
     "test": "bun test --path-ignore-patterns='**/dist/**'",
     "build": "tsc --build",
