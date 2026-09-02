@@ -53,15 +53,39 @@ const SECRET_PATTERNS: RegExp[] = [
   // We redact values that look like high-entropy tokens (>=20 chars base64-ish)
 ];
 
-const HIGH_ENTROPY_TOKEN_RE = /[A-Za-z0-9_\-]{20,}/g;
+export const HIGH_ENTROPY_TOKEN_RE = /[A-Za-z0-9_\-]{20,}/g;
+
+function shannonEntropy(str: string): number {
+  const freq = new Map<string, number>();
+  for (const ch of str) freq.set(ch, (freq.get(ch) ?? 0) + 1);
+  let entropy = 0;
+  for (const count of freq.values()) {
+    const p = count / str.length;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+function isHighEntropyToken(token: string): boolean {
+  if (token.length < 20) return false;
+  const hasLower = /[a-z]/.test(token);
+  const hasUpper = /[A-Z]/.test(token);
+  const hasDigit = /[0-9]/.test(token);
+  const classCount = [hasLower, hasUpper, hasDigit].filter(Boolean).length;
+  // Require at least 2 character classes to avoid redacting low-entropy words / repeated chars
+  if (classCount < 2) return false;
+  // Repeated-char strings like "aaaaaaaaaaaaaaaaaaaa" have entropy 0; random tokens > 3.5
+  return shannonEntropy(token) > 3.0;
+}
 
 function redactString(input: string): string {
   let out = input;
   for (const re of SECRET_PATTERNS) {
     out = out.replace(re, REDACTED);
   }
-  // Also redact any value that contains the literal secret marker from connection strings
-  // e.g., password in query params — already covered by postgres pattern, but keep generic
+  // High-entropy generic token redaction (spec 26 item 12: stdout/stderr secret redaction).
+  // Bounded by character-class + entropy check to avoid false positives on normal IDs/words.
+  out = out.replace(HIGH_ENTROPY_TOKEN_RE, (m) => (isHighEntropyToken(m) ? REDACTED : m));
   return out;
 }
 

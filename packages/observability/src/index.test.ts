@@ -155,6 +155,30 @@ describe("observability", () => {
     expect(out2["myToken"]).toBe("[REDACTED]");
   });
 
+  test("redacts high-entropy generic tokens and avoids false positives", () => {
+    // High-entropy 32-char mixed-case + digits token should be redacted (spec 26 item 12)
+    const highEntropy = "xK9mPq3vT8rY2nZ5bJ7hL0cF4dW6aG1sE2qXyZ";
+    const out = redactValue(`token is ${highEntropy} here`) as string;
+    expect(out).toContain("[REDACTED]");
+    expect(out).not.toContain(highEntropy);
+
+    // Also via logger: high-entropy token in any log value is redacted
+    const logger = new InMemoryLogger();
+    logger.info("sandbox.exec.completed", {
+      workspaceId: "ws-1",
+      sandboxId: highEntropy,
+    } as unknown as LogFields);
+    const logged = logger.parsed[0] as Record<string, unknown>;
+    expect(logged["sandboxId"] as string).toBe("[REDACTED]");
+
+    // Bounding: low-entropy 20-char repeated string must NOT be redacted (false positive check)
+    const lowEntropy = "aaaaaaaaaaaaaaaaaaaa";
+    expect(redactValue(lowEntropy) as string).toBe(lowEntropy);
+    expect(redactValue("hello world") as string).toBe("hello world");
+    // Workspace-like ID short mixed but low entropy / short should not be redacted separately
+    expect(redactValue("ws-123") as string).toBe("ws-123");
+  });
+
   // -----------------------------------------------------------------------
   // NEVER log full command line or full environment
   // -----------------------------------------------------------------------
