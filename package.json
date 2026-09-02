@@ -9,13 +9,13 @@
   ],
   "scripts": {
     "typecheck": "tsc --build",
-    "test": "bun test",
+    "test": "bun test --path-ignore-patterns='**/dist/**'",
     "build": "tsc --build",
     "lint": "tsc --noEmit"
   },
   "devDependencies": {
-    "typescript": "^5.9.3",
-    "@types/bun": "latest"
+    "typescript": "5.9.3",
+    "@types/bun": "1.4.0"
   },
   "engines": {
     "bun": ">=1.0.0"

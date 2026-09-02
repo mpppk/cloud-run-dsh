@@ -7,6 +7,8 @@ export interface WorkspaceRuntimePlaceholder {
 export const PLACEHOLDER_KIND = "workspace-runtime" as const;
 
 export function createPlaceholder(): WorkspaceRuntimePlaceholder {
-  return { kind: PLACEHOLDER_KIND } as WorkspaceRuntimePlaceholder;
+  return {
+    kind: PLACEHOLDER_KIND,
+  };
 }
 export * from "./state.js";

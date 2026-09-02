@@ -12,5 +12,11 @@ export interface AgentHostPlaceholder {
 export const PLACEHOLDER_KIND = "agent-host" as const;
 
 export function createPlaceholder(): AgentHostPlaceholder {
-  return { kind: PLACEHOLDER_KIND } as AgentHostPlaceholder;
+  return {
+    kind: PLACEHOLDER_KIND,
+    config: {
+      workspaceId: "test-workspace",
+      port: 8080,
+    },
+  };
 }

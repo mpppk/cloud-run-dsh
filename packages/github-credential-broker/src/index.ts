@@ -20,5 +20,7 @@ export interface GitHubCredentialBrokerPlaceholder {
 export const PLACEHOLDER_KIND = "github-credential-broker" as const;
 
 export function createPlaceholder(): GitHubCredentialBrokerPlaceholder {
-  return { kind: PLACEHOLDER_KIND } as GitHubCredentialBrokerPlaceholder;
+  return {
+    kind: PLACEHOLDER_KIND,
+  };
 }

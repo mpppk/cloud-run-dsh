@@ -14,5 +14,7 @@ export interface WorkspaceCheckpointPlaceholder {
 export const PLACEHOLDER_KIND = "workspace-checkpoint" as const;
 
 export function createPlaceholder(): WorkspaceCheckpointPlaceholder {
-  return { kind: PLACEHOLDER_KIND } as WorkspaceCheckpointPlaceholder;
+  return {
+    kind: PLACEHOLDER_KIND,
+  };
 }

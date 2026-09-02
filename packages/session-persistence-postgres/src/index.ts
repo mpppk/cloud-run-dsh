@@ -13,5 +13,7 @@ export interface SessionPersistencePlaceholder {
 export const PLACEHOLDER_KIND = "session-persistence-postgres" as const;
 
 export function createPlaceholder(): SessionPersistencePlaceholder {
-  return { kind: PLACEHOLDER_KIND } as SessionPersistencePlaceholder;
+  return {
+    kind: PLACEHOLDER_KIND,
+  };
 }

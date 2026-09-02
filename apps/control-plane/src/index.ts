@@ -12,5 +12,11 @@ export interface ControlPlanePlaceholder {
 export const PLACEHOLDER_KIND = "control-plane" as const;
 
 export function createPlaceholder(): ControlPlanePlaceholder {
-  return { kind: PLACEHOLDER_KIND } as ControlPlanePlaceholder;
+  return {
+    kind: PLACEHOLDER_KIND,
+    config: {
+      port: 8080,
+      instanceRegion: "us-central1",
+    },
+  };
 }

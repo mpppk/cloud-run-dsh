@@ -20,5 +20,7 @@ export interface CloudRunInstanceClientPlaceholder {
 export const PLACEHOLDER_KIND = "cloud-run-instance-client" as const;
 
 export function createPlaceholder(): CloudRunInstanceClientPlaceholder {
-  return { kind: PLACEHOLDER_KIND } as CloudRunInstanceClientPlaceholder;
+  return {
+    kind: PLACEHOLDER_KIND,
+  };
 }

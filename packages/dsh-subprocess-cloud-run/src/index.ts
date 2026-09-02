@@ -13,5 +13,7 @@ export interface DshSubprocessPlaceholder {
 export const PLACEHOLDER_KIND = "dsh-subprocess-cloud-run" as const;
 
 export function createPlaceholder(): DshSubprocessPlaceholder {
-  return { kind: PLACEHOLDER_KIND } as DshSubprocessPlaceholder;
+  return {
+    kind: PLACEHOLDER_KIND,
+  };
 }

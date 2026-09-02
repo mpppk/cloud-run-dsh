@@ -13,5 +13,7 @@ export interface ControllerLeasePlaceholder {
 export const PLACEHOLDER_KIND = "controller-lease" as const;
 
 export function createPlaceholder(): ControllerLeasePlaceholder {
-  return { kind: PLACEHOLDER_KIND } as ControllerLeasePlaceholder;
+  return {
+    kind: PLACEHOLDER_KIND,
+  };
 }

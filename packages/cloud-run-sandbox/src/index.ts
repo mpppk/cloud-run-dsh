@@ -20,5 +20,8 @@ export interface CloudRunSandboxPlaceholder {
 export const PLACEHOLDER_KIND = "cloud-run-sandbox" as const;
 
 export function createPlaceholder(): CloudRunSandboxPlaceholder {
-  return { kind: PLACEHOLDER_KIND } as CloudRunSandboxPlaceholder;
+  return {
+    kind: PLACEHOLDER_KIND,
+    sandboxIdPrefix: "dsh-",
+  };
 }
