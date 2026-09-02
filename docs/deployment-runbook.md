@@ -45,6 +45,7 @@ Scope of the Terraform baseline (what you are about to create):
 | `bun` | ≥ 1.0 (migrations runner) | `bun --version` |
 | `cloud-sql-proxy` | latest (Step 4 only) | `cloud-sql-proxy --version` |
 | `psql` (PostgreSQL client) | ≥ 14 (Steps 4/7) | `psql --version` |
+| `jq` | any (Step 7 response parsing) | `jq --version` |
 
 You can run the repo's read-only preflight to check all of these at once:
 
@@ -308,7 +309,7 @@ gcloud run instances create dsh-ws-demo \
 
 > 🚨 **`--restart-policy` must stay `on-failure`** — never `always` (see the warning above / 仕様書 §23).
 
-If `gcloud run instances` is rejected ("Invalid choice"), your SDK predates the Preview command — use the REST call in 5.1.
+If `gcloud run instances` is rejected ("Invalid choice"), your SDK predates the Preview command — use the REST call in 5.2.
 
 ### 5.4 Verify and stop
 
@@ -360,24 +361,38 @@ From a browser/session that goes through IAP:
 ```bash
 export DB_PASSWORD="$(gcloud secrets versions access latest --secret=db-password)"  # as in Step 4
 
-# 1. Control plane is alive (through the IAP-secured endpoint / LB URL):
+# 1. Control plane is alive (through the IAP-secured endpoint / LB URL).
+#    /healthz is served before the auth pipeline — no IAP headers needed here.
 curl -s "https://<control-plane-host>/healthz"
 # → expect a 200 with the health payload
 
-# 2. Create a workspace (IAP identity headers must be present behind IAP).
+# IAP injects BOTH headers below in front of Cloud Run; the API returns 401
+# "missing IAP identity headers" unless BOTH are present
+# (parseIapHeaders in apps/control-plane/src/auth.ts requires user-id AND
+# user-email). Set them once:
+IAP_ID='x-goog-authenticated-user-id: accounts.google.com:<sub>'
+IAP_EMAIL='x-goog-authenticated-user-email: <email@example.com>'
+
+# 2. Create a workspace (both IAP headers must be present).
 #    NOTE: the server GENERATES the workspace id (crypto.randomUUID() in
 #    handlers.ts createWorkspace) and requires repositoryOwner/repositoryName;
 #    you do NOT send an id. baseBranch is optional and defaults to "main".
-curl -s -X POST "https://<control-plane-host>/v1/workspaces" \
+CREATE_RESPONSE="$(curl -s -X POST "https://<control-plane-host>/v1/workspaces" \
   -H "Content-Type: application/json" \
-  -H "x-goog-authenticated-user-id: accounts.google.com:<sub>" \
-  -d '{"repositoryOwner":"<repo-owner>","repositoryName":"<repo-name>","baseBranch":"main"}'
+  -H "$IAP_ID" \
+  -H "$IAP_EMAIL" \
+  -d '{"repositoryOwner":"<repo-owner>","repositoryName":"<repo-name>","baseBranch":"main"}')"
+echo "$CREATE_RESPONSE"
 # → 201 with the workspace DTO { id, ownerId, repositoryOwner, repositoryName, baseBranch, runtimeState, ... }
-WORKSPACE_ID="$(<capture .id from the 201 response above>)"
+
+# Capture the server-generated workspace id from the 201 response
+# (jq is a Step 0 prerequisite; without jq, paste the id manually into WS_ID):
+WORKSPACE_ID="$(echo "$CREATE_RESPONSE" | jq -r '.id')"
 
 # 3. Open it — this is what triggers instance creation via the adapter:
 curl -s -X POST "https://<control-plane-host>/v1/workspaces/${WORKSPACE_ID}/open" \
-  -H "x-goog-authenticated-user-id: accounts.google.com:<sub>"
+  -H "$IAP_ID" \
+  -H "$IAP_EMAIL"
 
 # 4. Instance came up in Cloud Run:
 gcloud run instances list --location="$REGION"   # if the Preview command exists
