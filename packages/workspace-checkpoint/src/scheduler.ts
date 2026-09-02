@@ -56,11 +56,8 @@ export class CheckpointScheduler {
     }
   }
 
-  /** Agent turn completed trigger: if dirty, checkpoint. */
+  /** Agent turn completed trigger: dirty is defined by `git status --porcelain` (実装手順書 §20). */
   async onAgentTurnComplete(): Promise<void> {
-    if (!this.dirty) return;
-    // Optionally verify dirty via git before checkpointing
-    // but we rely on internal flag for scheduler logic; still check git
     await this.tryCheckpoint("agent-turn");
   }
 
@@ -99,43 +96,64 @@ export class CheckpointScheduler {
         return { ok: false, error: new CheckpointFailedError("lifecycle checkpoint failed: git status error", e) };
       }
     }
-    if (this.checkpointInProgress) {
+    if (!this.claimCheckpoint()) {
       return { ok: false, error: new CheckpointFailedError("lifecycle checkpoint failed: concurrent checkpoint in progress") };
     }
     try {
-      await this.doCheckpoint();
+      await this.runCheckpointBody();
       return { ok: true };
     } catch (e) {
       return { ok: false, error: new CheckpointFailedError("lifecycle checkpoint failed", e) };
+    } finally {
+      this.releaseCheckpoint();
     }
   }
 
   private async tryCheckpoint(_reason: string): Promise<void> {
-    if (this.checkpointInProgress) return;
-    if (!this.dirty) {
-      // double-check via git before skipping
-      try {
-        const dirtyViaGit = await isDirty(this.opts.git, this.opts.workspaceDir);
-        if (!dirtyViaGit) return;
-        this.dirty = true;
-        this.dirtySinceMs ??= this.opts.clock.nowMs();
-      } catch {
-        return;
-      }
-    }
+    // Claim the in-flight flag SYNCHRONOUSLY before any await so two concurrent
+    // triggers can never both enter doCheckpoint (同時checkpoint禁止:
+    // 仕様書 §12 / 実装手順書 §21).
+    if (!this.claimCheckpoint()) return;
     try {
-      await this.doCheckpoint();
+      if (!this.dirty) {
+        // double-check via git before skipping
+        try {
+          const dirtyViaGit = await isDirty(this.opts.git, this.opts.workspaceDir);
+          if (!dirtyViaGit) return;
+          this.dirty = true;
+          this.dirtySinceMs ??= this.opts.clock.nowMs();
+        } catch {
+          return;
+        }
+      }
+      await this.runCheckpointBody();
     } catch {
       // checkpoint failure is not propagated for non-lifecycle triggers;
       // but dirty should remain true for retry.
       this.dirty = true;
       // keep dirtySinceMs as is for periodic retry
+    } finally {
+      this.releaseCheckpoint();
     }
   }
 
-  private async doCheckpoint(): Promise<void> {
+  /**
+   * Synchronously claim the checkpoint slot. Returns false if a checkpoint
+   * is already in progress; otherwise marks in-progress before any await.
+   */
+  private claimCheckpoint(): boolean {
+    if (this.checkpointInProgress) return false;
     this.checkpointInProgress = true;
     this.pendingDirtyDuringCheckpoint = false;
+    return true;
+  }
+
+  private releaseCheckpoint(): void {
+    this.checkpointInProgress = false;
+  }
+
+  /** Runs checkpointFn and updates dirty bookkeeping. Throws on failure. */
+  private async runCheckpointBody(): Promise<void> {
     try {
       await this.opts.checkpointFn();
       // Success: if mutation happened during checkpoint, keep dirty=true
@@ -154,8 +172,6 @@ export class CheckpointScheduler {
       // dirtySinceMs stays as before so periodic will retry soon
       this.pendingDirtyDuringCheckpoint = false;
       throw e;
-    } finally {
-      this.checkpointInProgress = false;
     }
   }
 

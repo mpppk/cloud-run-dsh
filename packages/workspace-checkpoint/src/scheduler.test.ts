@@ -167,6 +167,78 @@ describe("CheckpointScheduler", () => {
     expect(scheduler.isCheckpointing()).toBe(false);
   });
 
+  test("no concurrent: two concurrent triggers run checkpointFn exactly once, never overlapping", async () => {
+    const clock = new FakeClock(0);
+    let invocations = 0;
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    let release: (() => void) | null = null;
+    const scheduler = new CheckpointScheduler({
+      clock,
+      git: makeGit(false),
+      workspaceDir: "/ws",
+      checkpointFn: () =>
+        new Promise<void>((r) => {
+          invocations++;
+          concurrent++;
+          maxConcurrent = Math.max(maxConcurrent, concurrent);
+          release = r;
+        }),
+    });
+    scheduler.notifyMutation();
+    // Fire two concurrent triggers; the second must be a no-op while the first is in flight.
+    const first = scheduler.triggerManual();
+    const second = scheduler.onAgentTurnComplete();
+    expect(scheduler.isCheckpointing()).toBe(true);
+    // Give the second trigger a chance to interleave before resolving.
+    await Promise.resolve();
+    expect(invocations).toBe(1);
+    release!();
+    await Promise.all([first, second]);
+    expect(invocations).toBe(1);
+    expect(maxConcurrent).toBe(1);
+    expect(scheduler.isCheckpointing()).toBe(false);
+  });
+
+  test("no concurrent: concurrent triggers race through the git dirty re-check without overlapping", async () => {
+    // Both triggers start clean internally, so both would await `git status`
+    // before deciding to checkpoint. The claim must be held across that await.
+    const clock = new FakeClock(0);
+    let invocations = 0;
+    let maxConcurrent = 0;
+    let concurrent = 0;
+    let resolve1: (() => void) | null = null;
+    const gitDirty: GitRunner = {
+      async run(args) {
+        if (args[0] === "status") return { stdout: " M foo\n", stderr: "", exitCode: 0 };
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+    };
+    const scheduler = new CheckpointScheduler({
+      clock,
+      git: gitDirty,
+      workspaceDir: "/ws",
+      checkpointFn: () =>
+        new Promise<void>((r) => {
+          invocations++;
+          concurrent++;
+          maxConcurrent = Math.max(maxConcurrent, concurrent);
+          if (invocations === 1) resolve1 = r;
+          else r();
+        }),
+    });
+    const first = scheduler.triggerManual();
+    const second = scheduler.triggerManual();
+    expect(scheduler.isCheckpointing()).toBe(true);
+    // Flush microtasks so both triggers pass through the git dirty re-check.
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(invocations).toBe(1);
+    resolve1!();
+    await Promise.all([first, second]);
+    expect(invocations).toBe(1);
+    expect(maxConcurrent).toBe(1);
+  });
+
   test("lifecycle checkpoint failure returns failure and must NOT allow stop", async () => {
     const clock = new FakeClock(0);
     const scheduler = new CheckpointScheduler({

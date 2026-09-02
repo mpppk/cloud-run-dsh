@@ -2,6 +2,7 @@ export * from "./types.js";
 export * from "./errors.js";
 export * from "./exclusions.js";
 export * from "./storage.js";
+export * from "./gcs-storage.js";
 export * from "./dirty.js";
 export * from "./bundle.js";
 export * from "./restore.js";

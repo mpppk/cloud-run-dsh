@@ -7,7 +7,3 @@ export async function isDirty(git: GitRunner, cwd: string): Promise<boolean> {
   }
   return result.stdout.trim().length > 0;
 }
-
-export async function isDirtyFromPorcelain(output: string): Promise<boolean> {
-  return output.trim().length > 0;
-}
