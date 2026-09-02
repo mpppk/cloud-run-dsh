@@ -1,0 +1,13 @@
+{
+  "name": "@cloud-run-dsh/github-credential-broker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "GitHub App credential broker \u2014 short-lived tokens",
+  "main": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src",
+    "build": "tsc --build"
+  }
+}

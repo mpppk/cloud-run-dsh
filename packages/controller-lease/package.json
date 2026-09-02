@@ -1,0 +1,13 @@
+{
+  "name": "@cloud-run-dsh/controller-lease",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Controller lease \u2014 single-writer per workspace",
+  "main": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src",
+    "build": "tsc --build"
+  }
+}

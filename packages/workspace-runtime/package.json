@@ -1,0 +1,13 @@
+{
+  "name": "@cloud-run-dsh/workspace-runtime",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Workspace runtime \u2014 state machine & domain types",
+  "main": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src",
+    "build": "tsc --build"
+  }
+}

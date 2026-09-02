@@ -1,0 +1,13 @@
+{
+  "name": "@cloud-run-dsh/dsh-subprocess-cloud-run",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Harness subprocess provider via Cloud Run Sandbox",
+  "main": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src",
+    "build": "tsc --build"
+  }
+}

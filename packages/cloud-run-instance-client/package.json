@@ -1,0 +1,13 @@
+{
+  "name": "@cloud-run-dsh/cloud-run-instance-client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloud Run Instance client adapter \u2014 GCP SDK isolated here",
+  "main": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src",
+    "build": "tsc --build"
+  }
+}

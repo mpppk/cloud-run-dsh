@@ -1,1 +1,38 @@
 .DS_Store
+
+# dependencies
+node_modules/
+
+# build outputs
+dist/
+*.tsbuildinfo
+
+# env
+.env
+.env.*
+!.env.example
+
+# coverage
+coverage/
+
+# bun
+bun.lockb
+.bun-cache/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+
+# terraform
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/terraform.tfvars
+infra/terraform/.terraform.tfstate.lock.info
+
+# logs
+*.log
+npm-debug.log*

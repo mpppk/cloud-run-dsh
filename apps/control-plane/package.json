@@ -1,0 +1,13 @@
+{
+  "name": "@cloud-run-dsh/control-plane",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Control Plane \u2014 Workspace API & Instance Controller (skeleton)",
+  "main": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src",
+    "build": "tsc --build"
+  }
+}

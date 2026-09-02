@@ -1,0 +1,90 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "cloud-run-dsh",
+      "devDependencies": {
+        "@types/bun": "1.4.0",
+        "typescript": "5.9.3",
+      },
+    },
+    "apps/agent-host": {
+      "name": "@cloud-run-dsh/agent-host",
+      "version": "0.0.0",
+    },
+    "apps/control-plane": {
+      "name": "@cloud-run-dsh/control-plane",
+      "version": "0.0.0",
+    },
+    "packages/cloud-run-instance-client": {
+      "name": "@cloud-run-dsh/cloud-run-instance-client",
+      "version": "0.0.0",
+    },
+    "packages/cloud-run-sandbox": {
+      "name": "@cloud-run-dsh/cloud-run-sandbox",
+      "version": "0.0.0",
+    },
+    "packages/controller-lease": {
+      "name": "@cloud-run-dsh/controller-lease",
+      "version": "0.0.0",
+    },
+    "packages/dsh-subprocess-cloud-run": {
+      "name": "@cloud-run-dsh/dsh-subprocess-cloud-run",
+      "version": "0.0.0",
+    },
+    "packages/github-credential-broker": {
+      "name": "@cloud-run-dsh/github-credential-broker",
+      "version": "0.0.0",
+    },
+    "packages/observability": {
+      "name": "@cloud-run-dsh/observability",
+      "version": "0.0.0",
+    },
+    "packages/session-persistence-postgres": {
+      "name": "@cloud-run-dsh/session-persistence-postgres",
+      "version": "0.0.0",
+    },
+    "packages/workspace-checkpoint": {
+      "name": "@cloud-run-dsh/workspace-checkpoint",
+      "version": "0.0.0",
+    },
+    "packages/workspace-runtime": {
+      "name": "@cloud-run-dsh/workspace-runtime",
+      "version": "0.0.0",
+    },
+  },
+  "packages": {
+    "@cloud-run-dsh/agent-host": ["@cloud-run-dsh/agent-host@workspace:apps/agent-host"],
+
+    "@cloud-run-dsh/cloud-run-instance-client": ["@cloud-run-dsh/cloud-run-instance-client@workspace:packages/cloud-run-instance-client"],
+
+    "@cloud-run-dsh/cloud-run-sandbox": ["@cloud-run-dsh/cloud-run-sandbox@workspace:packages/cloud-run-sandbox"],
+
+    "@cloud-run-dsh/control-plane": ["@cloud-run-dsh/control-plane@workspace:apps/control-plane"],
+
+    "@cloud-run-dsh/controller-lease": ["@cloud-run-dsh/controller-lease@workspace:packages/controller-lease"],
+
+    "@cloud-run-dsh/dsh-subprocess-cloud-run": ["@cloud-run-dsh/dsh-subprocess-cloud-run@workspace:packages/dsh-subprocess-cloud-run"],
+
+    "@cloud-run-dsh/github-credential-broker": ["@cloud-run-dsh/github-credential-broker@workspace:packages/github-credential-broker"],
+
+    "@cloud-run-dsh/observability": ["@cloud-run-dsh/observability@workspace:packages/observability"],
+
+    "@cloud-run-dsh/session-persistence-postgres": ["@cloud-run-dsh/session-persistence-postgres@workspace:packages/session-persistence-postgres"],
+
+    "@cloud-run-dsh/workspace-checkpoint": ["@cloud-run-dsh/workspace-checkpoint@workspace:packages/workspace-checkpoint"],
+
+    "@cloud-run-dsh/workspace-runtime": ["@cloud-run-dsh/workspace-runtime@workspace:packages/workspace-runtime"],
+
+    "@types/bun": ["@types/bun@1.4.0", "", { "dependencies": { "bun-types": "1.4.0" } }, "sha512-K+lZULY23vRgK/CfTjFIV+tyifaNdSMlPh9j+6mQ/cLfpOznLyAuzgV/JQysyECpkBQLVMSyvjlr2fBUSA9wFQ=="],
+
+    "@types/node": ["@types/node@26.4.1", "", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-k97ENvZWtvA6yqz5/FS6a7duDgOPEeOQOc2iKS/nY6mX6qJUKtLnWzQS+Xj6tXweyj6ZcTAK2Qecetnvi9nCLA=="],
+
+    "bun-types": ["bun-types@1.4.0", "", { "dependencies": { "@types/node": "*" } }, "sha512-iIKw23BspnQQYd3prITOBxeUsxBHnwzX6YJfGMuNOZzeNcMmVqzIIVGRm1l69ogaPQmb4wB6BN8mA5bE9YuC5Q=="],
+
+    "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
+
+    "undici-types": ["undici-types@8.3.0", "", {}, "sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ=="],
+  }
+}
