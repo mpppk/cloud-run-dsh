@@ -13,7 +13,8 @@
     "db:migrate": "bun run infra/migrations/runner.ts",
     "test": "bun test --path-ignore-patterns='**/dist/**'",
     "build": "tsc --build",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "preflight:gcp": "bun run scripts/preflight-gcp.ts"
   },
   "devDependencies": {
     "typescript": "5.9.3",
