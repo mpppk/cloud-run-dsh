@@ -1,5 +1,45 @@
-// Workspace runtime — state machine & domain types
-// Re-export from state.ts; placeholder kept for smoke test
+export type {
+  WorkspaceRuntimeState,
+} from "./state.js";
+export {
+  WORKSPACE_RUNTIME_STATES,
+  WORKSPACE_STATE_TRANSITIONS,
+  AGENT_INPUT_REFUSED_STATES,
+  IllegalTransitionError,
+  canTransition,
+  assertTransition,
+  isAgentInputAllowed,
+} from "./state.js";
+
+export type {
+  TransitionRecord,
+  WorkspaceStateTransaction,
+  TransactionalStateStore,
+} from "./store.js";
+export { InMemoryTransactionalStore } from "./store.js";
+
+export { WorkspaceStateMachine } from "./machine.js";
+
+export {
+  IDLE_TIMEOUT_MS,
+  isMeaningfulActivity,
+  isNonMeaningfulActivity,
+  IdleManager,
+} from "./idle.js";
+export type { ActivityKind, RunningFlags } from "./idle.js";
+
+export type {
+  WorkspaceLifecycleSteps,
+  WorkspaceRuntimeDeps,
+} from "./runtime.js";
+export {
+  WorkspaceRuntime,
+  OperationTracker,
+  AgentInputRefusedError,
+  InvalidOperationError,
+} from "./runtime.js";
+
+// Re-export placeholder for backwards compat (T1 skeleton)
 export interface WorkspaceRuntimePlaceholder {
   readonly kind: "workspace-runtime";
 }
@@ -11,4 +51,3 @@ export function createPlaceholder(): WorkspaceRuntimePlaceholder {
     kind: PLACEHOLDER_KIND,
   };
 }
-export * from "./state.js";
