@@ -1,0 +1,118 @@
+variable "project_id" {
+  description = "GCP project ID. Must be supplied out-of-band (env var TF_VAR_project_id or tfvars)."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = length(var.project_id) > 0
+    error_message = "project_id must not be empty."
+  }
+}
+
+variable "region" {
+  description = "Default GCP region for regional resources."
+  type        = string
+  default     = "asia-northeast1"
+}
+
+variable "environment" {
+  description = "Deployment environment (dev, staging, prod, etc.). Used for naming and labelling."
+  type        = string
+  default     = "dev"
+
+  validation {
+    condition     = can(regex("^[a-z0-9-]+$", var.environment))
+    error_message = "environment must be lower-case alphanumeric or hyphen."
+  }
+}
+
+variable "db_tier" {
+  description = "Cloud SQL machine type. See https://cloud.google.com/sql/docs/postgres/instance-settings"
+  type        = string
+  default     = "db-custom-1-3840"
+}
+
+variable "db_version" {
+  description = "PostgreSQL engine version for Cloud SQL."
+  type        = string
+  default     = "POSTGRES_16"
+}
+
+variable "db_name" {
+  description = "PostgreSQL database name."
+  type        = string
+  default     = "dsh"
+}
+
+variable "db_user" {
+  description = "PostgreSQL application user name."
+  type        = string
+  default     = "dsh_app"
+}
+
+variable "checkpoint_bucket_name" {
+  description = "GCS checkpoint bucket name. Leave empty to use derived name \"<project_id>-<environment>-checkpoints\"."
+  type        = string
+  default     = ""
+}
+
+variable "checkpoint_bucket_location" {
+  description = "GCS bucket location. Defaults to var.region."
+  type        = string
+  default     = ""
+}
+
+variable "artifact_registry_repository_id" {
+  description = "Artifact Registry Docker repository ID."
+  type        = string
+  default     = "agent-host"
+}
+
+variable "github_app_private_key_secret_id" {
+  description = "Secret Manager secret ID for the GitHub App private key."
+  type        = string
+  default     = "github-app-private-key"
+}
+
+variable "llm_api_key_secret_id" {
+  description = "Secret Manager secret ID for the LLM API key."
+  type        = string
+  default     = "llm-api-key"
+}
+
+variable "db_password_secret_id" {
+  description = "Secret Manager secret ID for the Cloud SQL application user password."
+  type        = string
+  default     = "db-password"
+}
+
+variable "iap_support_email" {
+  description = "Support email for the IAP OAuth brand. Required when creating google_iap_brand. Supply out-of-band."
+  type        = string
+  default     = null
+}
+
+variable "iap_members" {
+  description = "List of IAM members (e.g. \"user:alice@example.com\", \"group:eng@example.com\") granted IAP-secured Web App User."
+  type        = list(string)
+  default     = []
+}
+
+variable "checkpoint_live_delete_age_days" {
+  description = "If >0, GCS lifecycle will delete LIVE checkpoint objects older than this many days. Defaults to 0 (disabled) to avoid destructive deletion of live checkpoints; spec only requires cleanup of ARCHIVED versions."
+  type        = number
+  default     = 0
+}
+
+variable "db_password" {
+  description = "Optional direct DB password for bootstrapping. When set, used as google_sql_user.app password instead of reading from Secret Manager. Leave null to use Secret Manager (recommended for steady state). Required for first apply when the secret has no versions yet."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "labels" {
+  description = "Common labels applied to all resources."
+  type        = map(string)
+  default     = {}
+}

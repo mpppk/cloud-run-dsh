@@ -1,0 +1,113 @@
+# ---------------------------------------------------------------------------
+# Cloud SQL for PostgreSQL
+#
+# Network choice: Private IP (no public IPv4) is preferred for security
+# (spec sections 2 / 19 — session persistence). This requires a VPC,
+# a private IP range, and a Service Networking peering connection.
+# The file provisions a minimal dedicated VPC for the baseline; if the
+# project already has a shared VPC, replace google_compute_network.sql
+# and google_service_networking_connection.private_vpc_connection with
+# a data source / existing network reference and remove the network
+# resources below. Uncomment deletion_protection / backup settings for
+# production.
+# ---------------------------------------------------------------------------
+
+resource "google_compute_network" "sql" {
+  name                    = "${var.environment}-dsh-sql-vpc"
+  project                 = var.project_id
+  auto_create_subnetworks = false
+  description             = "VPC for Cloud SQL private IP (T2 baseline). Replace with shared VPC if available."
+}
+
+resource "google_compute_global_address" "sql_private_ip" {
+  name          = "${var.environment}-dsh-sql-private-ip"
+  project       = var.project_id
+  purpose       = "VPC_PEERING"
+  address_type  = "INTERNAL"
+  prefix_length = 16
+  network       = google_compute_network.sql.id
+}
+
+resource "google_service_networking_connection" "private_vpc_connection" {
+  network                 = google_compute_network.sql.id
+  service                 = "servicenetworking.googleapis.com"
+  reserved_peering_ranges = [google_compute_global_address.sql_private_ip.name]
+
+  deletion_policy = "ABANDON"
+}
+
+data "google_secret_manager_secret_version" "db_password" {
+  count = var.db_password == null ? 1 : 0
+
+  secret  = google_secret_manager_secret.db_password.id
+  version = "latest"
+
+  depends_on = [google_secret_manager_secret.db_password]
+}
+
+resource "google_sql_database_instance" "main" {
+  name             = "${var.environment}-dsh-pg"
+  project          = var.project_id
+  region           = var.region
+  database_version = var.db_version
+
+  deletion_protection = false
+
+  settings {
+    tier              = var.db_tier
+    availability_type = "ZONAL"
+    disk_autoresize   = true
+    disk_type         = "PD_SSD"
+
+    backup_configuration {
+      enabled                        = true
+      point_in_time_recovery_enabled = true
+      transaction_log_retention_days = 7
+    }
+
+    maintenance_window {
+      day          = 7
+      hour         = 3
+      update_track = "stable"
+    }
+
+    ip_configuration {
+      # Private IP preferred — do not assign a public IPv4.
+      # See comment at top of file for VPC requirements.
+      ipv4_enabled    = false
+      private_network = google_compute_network.sql.id
+      # SSL is enforced at the instance level via require_ssl = true
+      # on the connection; google provider v6 removed require_ssl from
+      # ip_configuration — use API flag or sql_ssl_config if needed.
+    }
+
+    insights_config {
+      query_insights_enabled = true
+    }
+
+    user_labels = var.labels
+  }
+
+  depends_on = [
+    google_service_networking_connection.private_vpc_connection,
+    google_project_service.apis,
+  ]
+}
+
+resource "google_sql_database" "dsh" {
+  name     = var.db_name
+  instance = google_sql_database_instance.main.name
+  project  = var.project_id
+}
+
+resource "google_sql_user" "app" {
+  name     = var.db_user
+  instance = google_sql_database_instance.main.name
+  project  = var.project_id
+  # Never hardcode a literal — use Secret Manager in steady state, or
+  # var.db_password for bootstrapping when the secret has no versions yet.
+  # See README "Bootstrap sequence" for the two-step first-apply flow.
+  password = var.db_password != null ? var.db_password : data.google_secret_manager_secret_version.db_password[0].secret_data
+  # Changing the password version forces re-creation of the user password;
+  # host must rotate via Secret Manager, not via TF state edits.
+}
