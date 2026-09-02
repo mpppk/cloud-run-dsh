@@ -272,7 +272,7 @@ import { InMemoryCheckpointStorage } from "@cloud-run-dsh/workspace-checkpoint";
 import { InMemoryLeaseStore } from "@cloud-run-dsh/controller-lease/testing";
 import { InMemoryTransactionalStore } from "@cloud-run-dsh/workspace-runtime";
 import { PostgresSessionPersistenceRepository } from "@cloud-run-dsh/session-persistence-postgres";
-import { InMemoryFakeExecutor } from "@cloud-run-dsh/session-persistence-postgres/src/fakeExecutor.js";
+import { InMemoryFakeExecutor } from "@cloud-run-dsh/session-persistence-postgres/testing";
 import { composeAgentHost } from "./composition.js";
 import type { AgentHost } from "./composition.js";
 
