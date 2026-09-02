@@ -1,20 +1,15 @@
-// Workspace checkpoint — GCS bundle (skeleton)
-export interface CheckpointManifest {
-  readonly version: 1;
-  readonly baseCommit: string;
-  readonly createdAt: string;
-  readonly patch: string;
-  readonly untracked: string;
-}
+export * from "./types.js";
+export * from "./errors.js";
+export * from "./exclusions.js";
+export * from "./storage.js";
+export * from "./dirty.js";
+export * from "./bundle.js";
+export * from "./restore.js";
+export * from "./scheduler.js";
+export * from "./tar.js";
 
-export interface WorkspaceCheckpointPlaceholder {
-  readonly kind: "workspace-checkpoint";
-}
-
+// Re-export placeholder for backwards compat
 export const PLACEHOLDER_KIND = "workspace-checkpoint" as const;
-
-export function createPlaceholder(): WorkspaceCheckpointPlaceholder {
-  return {
-    kind: PLACEHOLDER_KIND,
-  };
+export function createPlaceholder() {
+  return { kind: PLACEHOLDER_KIND };
 }
