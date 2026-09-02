@@ -44,6 +44,7 @@ Scope of the Terraform baseline (what you are about to create):
 | `docker` | any recent | `docker version` (daemon must be reachable for Steps 3) |
 | `bun` | ≥ 1.0 (migrations runner) | `bun --version` |
 | `cloud-sql-proxy` | latest (Step 4 only) | `cloud-sql-proxy --version` |
+| `psql` (PostgreSQL client) | ≥ 14 (Steps 4/7) | `psql --version` |
 
 You can run the repo's read-only preflight to check all of these at once:
 
@@ -209,9 +210,35 @@ Alternative for private-network environments: run the same command from a VM ins
 
 Baseline configuration (仕様書 §22 / 実装手順書 §6): `cpu: 4`, `memory: 8Gi`, `restartPolicy: ON_FAILURE`, `sandboxLauncher: true`, port `8080`, run as the agent-host service account.
 
+> 🚨 **NEVER set `restartPolicy: always`.** 仕様書 §23 mandates `on-failure` and explicitly rejects `always` because of a known Preview issue with `always`. `packages/cloud-run-instance-client` throws a typed `InvalidRestartPolicyError` (`restartPolicy "always" is not allowed — known Preview issue (spec section 23); use "on-failure" or "never"`) if it ever receives `always`. This applies to every place an instance is created OR updated below.
+
 > **Note:** in normal operation the **control plane** creates instances through its `InstanceRuntime` adapter (`packages/cloud-run-instance-client` → REST). This manual step exists to (a) validate the Preview API + image + service account wiring before the control plane depends on them, and (b) give you the exact call to fall back to when debugging. A manually created instance has no idle manager watching it — stop it when done (see below) or it keeps billing.
 
-### 5.1 Via REST (canonical while Pre-GA)
+### 5.1 Agent-host environment — all 13 required keys
+
+`apps/agent-host/src/config.ts` defines `REQUIRED_ENV_KEYS`; if ANY of the following is missing or blank, the container crashes at startup with `MissingRequiredEnvError` (the composition root refuses to boot). The list below mirrors `config.ts:12-26` — **if you add an env key to `config.ts`, update this table in the same PR** so this runbook cannot silently drift.
+
+| # | Key | Where the value comes from |
+|---|---|---|
+| 1 | `WORKSPACE_ID` | The workspace the instance serves (the control plane passes the workspace UUID created in Step 7). |
+| 2 | `CHECKPOINT_BUCKET` | Terraform output `checkpoint_bucket_name`. |
+| 3 | `DATABASE_URL` | `postgresql://dsh_app:<db-password>@<private-ip>:5432/dsh` — password from Secret Manager `db-password` (Step 4). |
+| 4 | `GITHUB_APP_ID` | Your GitHub App settings page. |
+| 5 | `GITHUB_APP_PRIVATE_KEY_PEM` | The GitHub App private key PEM (multi-line — keep the file-based env mechanism below). |
+| 6 | `REPOSITORY_OWNER` | Same repo owner you created the workspace with (Step 7). |
+| 7 | `REPOSITORY_NAME` | Same repo name you created the workspace with (Step 7). |
+| 8 | `BASE_BRANCH` | Workspace base branch (default `main`). |
+| 9 | `CONTROLLER_ID` | The controller identity holding the lease for this workspace (from the control plane's controller-lease service). |
+| 10 | `USER_ID` | The internal user ID that owns the workspace (returned in the workspace DTO `ownerId`). |
+| 11 | `INSTANCE_NAME` | The instance name you are creating (`dsh-ws-demo` here). |
+| 12 | `GCP_PROJECT_ID` | `$PROJECT_ID`. |
+| 13 | `GCP_REGION` | `$REGION`. |
+
+Optional (not required, have defaults in `config.ts`): `PORT` (8080), `WORKSPACE_ROOT` (`/workspace`), `CHECKPOINT_KEY`, `SANDBOX_CLI_PATH`, `SANDBOX_ALLOW_EGRESS`.
+
+### 5.2 Via REST (canonical while Pre-GA)
+
+> **Secret hygiene:** the request body carries `DATABASE_URL` (DB password) and the GitHub App PEM. Build it in a **temp file with `0600` permissions** and pass it via `--data @file` — never inline `-d '...'"` with expanded secrets, which leaks them into shell history and `ps` output.
 
 ```bash
 export SA_EMAIL="$(terraform -chdir=infra/terraform output -raw agent_host_service_account_email)"
@@ -219,34 +246,53 @@ export BUCKET="$(terraform -chdir=infra/terraform output -raw checkpoint_bucket_
 export SQL_CONNECTION="$(terraform -chdir=infra/terraform output -raw sql_connection_name)"
 export DB_PASSWORD="$(gcloud secrets versions access latest --secret=db-password)"
 
+# Build the request body in a 0600 temp file (secrets never touch shell history or ps)
+umask 077
+BODY="$(mktemp)"; trap 'rm -f "$BODY"' EXIT
+cat > "$BODY" <<EOF
+{
+  "template": {
+    "containers": [{
+      "image": "${IMAGE}",
+      "resources": { "cpu": 4, "memory": "8Gi" },
+      "ports": [{ "containerPort": 8080 }],
+      "env": [
+        { "name": "WORKSPACE_ID",  "value": "<workspace-id, e.g. the UUID from Step 7>" },
+        { "name": "CHECKPOINT_BUCKET", "value": "${BUCKET}" },
+        { "name": "DATABASE_URL",  "value": "postgresql://dsh_app:${DB_PASSWORD}@<cloudsql-private-ip>:5432/dsh" },
+        { "name": "GITHUB_APP_ID", "value": "<github-app-id>" },
+        { "name": "GITHUB_APP_PRIVATE_KEY_PEM", "value": "<pem, with \n escapes>" },
+        { "name": "REPOSITORY_OWNER", "value": "<repo-owner>" },
+        { "name": "REPOSITORY_NAME", "value": "<repo-name>" },
+        { "name": "BASE_BRANCH", "value": "main" },
+        { "name": "CONTROLLER_ID", "value": "<controller-id>" },
+        { "name": "USER_ID", "value": "<internal-user-id>" },
+        { "name": "INSTANCE_NAME", "value": "dsh-ws-demo" },
+        { "name": "GCP_PROJECT_ID", "value": "${PROJECT_ID}" },
+        { "name": "GCP_REGION", "value": "${REGION}" }
+      ]
+    }],
+    "serviceAccount": "${SA_EMAIL}",
+    "restartPolicy": "ON_FAILURE"
+  },
+  "sandboxLauncher": true
+}
+EOF
+
 curl -X POST \
   -H "Authorization: Bearer $(gcloud auth print-access-token)" \
   -H "Content-Type: application/json" \
   "https://run.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/instances?instanceId=dsh-ws-demo" \
-  -d '{
-    "template": {
-      "containers": [{
-        "image": "'"${IMAGE}"'",
-        "resources": { "cpu": 4, "memory": "8Gi" },
-        "ports": [{ "containerPort": 8080 }],
-        "env": [
-          { "name": "WORKSPACE_ID",  "value": "ws-demo" },
-          { "name": "CHECKPOINT_BUCKET", "value": "'"${BUCKET}"'" },
-          { "name": "DATABASE_URL",  "value": "postgresql://dsh_app:'"${DB_PASSWORD}"'@<cloudsql-private-ip>:5432/<db-name>" },
-          { "name": "GITHUB_APP_ID", "value": "<github-app-id>" },
-          { "name": "GITHUB_APP_PRIVATE_KEY_PEM", "value": "<pem>" }
-        ]
-      }],
-      "serviceAccount": "'"${SA_EMAIL}"'",
-      "restartPolicy": "ON_FAILURE"
-    },
-    "sandboxLauncher": true
-  }'
+  --data @"$BODY"
 ```
+
+> 🚨 **`restartPolicy` must stay `"ON_FAILURE"`** — never `ALWAYS` (see the warning above / 仕様書 §23).
 
 Exact field names for sandbox launcher, instance-level settings, and the DATABASE_URL scheme for private-IP Cloud SQL are Preview surface — **verify against the current REST reference before running**, and prefer the SDK's typed client (`packages/cloud-run-instance-client`) as the source of truth for the shape the control plane actually sends.
 
-### 5.2 Via gcloud (if your SDK version ships the Preview command group)
+### 5.3 Via gcloud (if your SDK version ships the Preview command group)
+
+Do **not** pass `DATABASE_URL` or `GITHUB_APP_PRIVATE_KEY_PEM` inline via `--set-env-vars=` — those would land in shell history. Prefer the file-based form (`--set-env-vars-from-file=env.yaml`, if the Preview command group supports it) or REST 5.2, with the env file created under `umask 077` and deleted after.
 
 ```bash
 gcloud run instances create dsh-ws-demo \
@@ -257,12 +303,14 @@ gcloud run instances create dsh-ws-demo \
   --restart-policy=on-failure \
   --sandbox-launcher \
   --service-account="$SA_EMAIL" \
-  --set-env-vars="WORKSPACE_ID=ws-demo,CHECKPOINT_BUCKET=${BUCKET}"
+  --set-env-vars-from-file=./agent-host.env   # YAML env map, all 13 keys from §5.1, file perms 0600
 ```
+
+> 🚨 **`--restart-policy` must stay `on-failure`** — never `always` (see the warning above / 仕様書 §23).
 
 If `gcloud run instances` is rejected ("Invalid choice"), your SDK predates the Preview command — use the REST call in 5.1.
 
-### 5.3 Verify and stop
+### 5.4 Verify and stop
 
 ```bash
 gcloud auth print-access-token | xargs -I{} curl -s \
@@ -310,37 +358,53 @@ IAP configuration (brand + client were already created by Terraform in Step 2; m
 From a browser/session that goes through IAP:
 
 ```bash
+export DB_PASSWORD="$(gcloud secrets versions access latest --secret=db-password)"  # as in Step 4
+
 # 1. Control plane is alive (through the IAP-secured endpoint / LB URL):
 curl -s "https://<control-plane-host>/healthz"
 # → expect a 200 with the health payload
 
-# 2. Create a workspace (IAP identity headers must be present behind IAP):
+# 2. Create a workspace (IAP identity headers must be present behind IAP).
+#    NOTE: the server GENERATES the workspace id (crypto.randomUUID() in
+#    handlers.ts createWorkspace) and requires repositoryOwner/repositoryName;
+#    you do NOT send an id. baseBranch is optional and defaults to "main".
 curl -s -X POST "https://<control-plane-host>/v1/workspaces" \
   -H "Content-Type: application/json" \
   -H "x-goog-authenticated-user-id: accounts.google.com:<sub>" \
-  -d '{"id":"ws-demo"}'
-# → 201; then open it — this is what triggers instance creation via the adapter:
-curl -s -X POST "https://<control-plane-host>/v1/workspaces/ws-demo/open" \
+  -d '{"repositoryOwner":"<repo-owner>","repositoryName":"<repo-name>","baseBranch":"main"}'
+# → 201 with the workspace DTO { id, ownerId, repositoryOwner, repositoryName, baseBranch, runtimeState, ... }
+WORKSPACE_ID="$(<capture .id from the 201 response above>)"
+
+# 3. Open it — this is what triggers instance creation via the adapter:
+curl -s -X POST "https://<control-plane-host>/v1/workspaces/${WORKSPACE_ID}/open" \
   -H "x-goog-authenticated-user-id: accounts.google.com:<sub>"
 
-# 3. Instance came up in Cloud Run:
+# 4. Instance came up in Cloud Run:
 gcloud run instances list --location="$REGION"   # if the Preview command exists
-# …or GET .../instances/dsh-ws-demo per Step 5.3
+# …or GET .../instances/<instance-id> per Step 5.4
 
-# 4. DB has the workspace row (via cloud-sql-proxy as in Step 4):
-psql "$DATABASE_URL" -c "SELECT id, state FROM workspaces WHERE id = 'ws-demo';"
+# 5. DB has the workspace row (via cloud-sql-proxy as in Step 4).
+#    The DB password never appears on the command line (it would leak via `ps`
+#    and shell history): put it in a 0600 pgpass file and point PGPASSFILE at it.
+umask 077
+PGPASSF="$(mktemp)"; trap 'rm -f "$PGPASSF"' EXIT
+printf '127.0.0.1:5433:dsh:dsh_app:%s\n' "$DB_PASSWORD" > "$PGPASSF"
 
-# 5. Checkpoint bucket exists and is reachable by the agent-host SA:
+PGPASSFILE="$PGPASSF" psql "postgresql://dsh_app@127.0.0.1:5433/dsh" \
+  -v ws="$WORKSPACE_ID" \
+  -c "SELECT id, runtime_state FROM workspaces WHERE id = :'ws';"
+
+# 6. Checkpoint bucket exists and is reachable by the agent-host SA:
 gcloud storage ls "gs://$(terraform -chdir=infra/terraform output -raw checkpoint_bucket_name)"
 ```
 
-Pass criteria: `/healthz` 200; workspace created + opened; an Instance exists for the workspace; the `workspaces` row shows the expected state; no 403 from IAP.
+Pass criteria: `/healthz` 200; workspace created (201, server-generated UUID `id`) + opened; an Instance exists for the workspace; the `workspaces` row shows the expected state; no 403 from IAP.
 
 ---
 
 ## Step 8 — Teardown (stop paying)
 
-Order matters: remove Instance-attached things first, then Terraform.
+Order matters: remove Instance-attached things first, empty the bucket, then Terraform.
 
 ```bash
 # 1. Stop & delete every Cloud Run Instance you (or the control plane) created.
@@ -352,21 +416,42 @@ gcloud run instances delete dsh-ws-demo --location="$REGION" 2>/dev/null || true
 # 2. Delete the control-plane service:
 gcloud run services delete control-plane --region="$REGION" --quiet
 
-# 3. Destroy Terraform-managed resources (SQL, bucket, AR, IAM, secrets, IAP):
+# 3. EMPTY the versioned checkpoint bucket — `terraform destroy` CANNOT delete
+#    a non-empty versioned GCS bucket (lifecycle rules only age out ARCHIVED
+#    versions), so a destroy without this step FAILS and you keep paying.
+#    ⚠️ THIS PERMANENTLY DELETES ALL CHECKPOINTS (live objects + every version).
+#    Export first if you want the data (see the note below the block).
+gcloud storage rm --all-versions -r \
+  "gs://$(terraform -chdir=infra/terraform output -raw checkpoint_bucket_name)"
+
+# 4. Destroy Terraform-managed resources (SQL, bucket, AR, IAM, secrets, IAP):
 terraform -chdir=infra/terraform destroy
 # If the db-password data source fails on destroy (secret version deleted manually), re-run
 # with TF_VAR_db_password set — same escape hatch as the first apply.
 
-# 4. Local state cleanup:
+# 5. Remove the abandoned Service Networking peering (see note below).
+#    The VPC name follows cloudsql.tf: "${var.environment}-dsh-sql-vpc" (default env: dev).
+gcloud services vpc-peerings delete \
+  --service=servicenetworking.googleapis.com \
+  --network="${TF_VAR_environment:-dev}-dsh-sql-vpc" \
+  --project="$PROJECT_ID" --quiet
+
+# 6. Local state cleanup:
 rm -f infra/terraform/terraform.tfstate infra/terraform/terraform.tfstate.backup
 
-# 5. Optional — stop the meter completely (scratch project only):
+# 7. Optional — stop the meter completely (scratch project only):
 gcloud projects delete "$PROJECT_ID"
 #    or unlink billing:
 gcloud billing projects unlink "$PROJECT_ID"
 ```
 
-After `terraform destroy` the GCS bucket and Cloud SQL instance are gone — **checkpoints and sessions are unrecoverable**. If you want the data instead of the savings, skip step 3/5 and keep only paying for Cloud SQL, or export the bucket first.
+Teardown gotchas (all verified against `infra/terraform`):
+
+- **Versioned bucket**: `google_storage_bucket.checkpoints` has versioning enabled; `terraform destroy` fails on a non-empty versioned bucket. That is why step 3 empties it first with `gcloud storage rm --all-versions -r` — the only way the destroy succeeds. Checkpoints and sessions are unrecoverable after it; export the bucket (`gcloud storage cp -r ...`) before step 3 if you want the data instead of the savings.
+- **Service Networking peering is ABANDONED, not destroyed**: `cloudsql.tf` sets `deletion_policy = "ABANDON"` on `google_service_networking_connection.private_vpc_connection`, so `terraform destroy` intentionally leaves the VPC peering (and the peered Private Service Access range) in place — deleting it would break any other SQL instance sharing the peering. Remove it manually with step 5 above (`gcloud services vpc-peerings delete`), which deletes the peering; the reserved global address itself is Terraform-managed and is destroyed normally. (Note: after `terraform destroy` the VPC network is also gone; if destroy already removed it, the peering went with it — verify with `gcloud compute networks peerings list --network=...` and skip step 5 if nothing is listed.)
+- **Cloud SQL instance**: `google_sql_database_instance.main` has no ABANDON override, so destroy DOES delete it — the largest cost line disappears at step 4.
+- **Secret Manager secrets** are destroyed with their versions — you will need to re-add them if you redeploy.
+- **Cloud Run Instances**: never in Terraform state; step 1 is the only thing that stops their billing.
 
 ---
 
