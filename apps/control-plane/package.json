@@ -3,8 +3,15 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Control Plane \u2014 Workspace API & Instance Controller (skeleton)",
+  "description": "Control Plane — Workspace API & Agent Gateway",
   "main": "./src/index.ts",
+  "dependencies": {
+    "@cloud-run-dsh/cloud-run-instance-client": "workspace:*",
+    "@cloud-run-dsh/controller-lease": "workspace:*",
+    "@cloud-run-dsh/session-persistence-postgres": "workspace:*",
+    "@cloud-run-dsh/workspace-checkpoint": "workspace:*",
+    "@cloud-run-dsh/workspace-runtime": "workspace:*"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test src",

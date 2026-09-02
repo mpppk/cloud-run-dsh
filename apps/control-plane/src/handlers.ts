@@ -1,0 +1,366 @@
+// Route handlers — 仕様書 section 24 API surface.
+//
+// Authorization pipeline for every workspace-scoped route:
+//   authenticate (IAP identity -> internal user)
+//     -> workspace membership check (仕様書 section 26 item 7)
+//     -> controller check for controller-only operations (仕様書 section 20)
+
+import type {
+  ControllerLease,
+  ControllerLeaseService,
+} from "@cloud-run-dsh/controller-lease";
+import {
+  LeaseAlreadyHeldError,
+  LeaseExpiredError,
+  LeaseNotFoundError,
+  NotLeaseOwnerError,
+} from "@cloud-run-dsh/controller-lease";
+import type { Session, Workspace } from "@cloud-run-dsh/session-persistence-postgres";
+import { ApiError, badRequest, conflict, notFound } from "./errors.js";
+import { assertMember } from "./membership.js";
+import type { InternalUser } from "./auth.js";
+import type { ControlPlaneDeps } from "./deps.js";
+import {
+  optionalObject,
+  optionalString,
+  parseJsonBody,
+  parseOptionalJsonBody,
+  requireSegment,
+  requireString,
+} from "./validate.js";
+
+export interface RouteContext {
+  readonly request: Request;
+  readonly params: Record<string, string>;
+  readonly url: URL;
+  readonly deps: ControlPlaneDeps;
+  readonly user: InternalUser;
+}
+
+export type RouteHandler = (ctx: RouteContext) => Promise<Response>;
+
+function json(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+/** Loads a workspace or throws 404. */
+export async function loadWorkspace(deps: ControlPlaneDeps, id: string): Promise<Workspace> {
+  const workspace = await deps.repo.getWorkspace(id);
+  if (!workspace) throw notFound(`workspace ${id} not found`);
+  return workspace;
+}
+
+/** Loads a session or throws 404. */
+export async function loadSession(deps: ControlPlaneDeps, id: string): Promise<Session> {
+  const session = await deps.repo.getSession(id);
+  if (!session) throw notFound(`session ${id} not found`);
+  return session;
+}
+
+/**
+ * Loads the session and verifies the caller is a member of its workspace.
+ * (仕様書 section 21: identity + membership before authorization.)
+ */
+export async function loadSessionForMember(
+  deps: ControlPlaneDeps,
+  sessionId: string,
+  userId: string,
+): Promise<Session> {
+  const session = await loadSession(deps, sessionId);
+  await assertMember(deps, session.workspaceId, userId);
+  return session;
+}
+
+/**
+ * Controller enforcement (仕様書 section 20): message send, approval, cancel
+ * and manual checkpoint require the caller to hold the active controller
+ * lease. Observers get 409.
+ */
+export async function requireController(
+  leases: ControllerLeaseService,
+  workspaceId: string,
+  userId: string,
+): Promise<ControllerLease> {
+  const lease = await leases.getActive(workspaceId);
+  if (!lease) {
+    throw conflict("no active controller for this workspace");
+  }
+  if (lease.userId !== userId) {
+    throw conflict("only the controller can perform this operation");
+  }
+  return lease;
+}
+
+// ---------------------------------------------------------------------------
+// Workspaces
+// ---------------------------------------------------------------------------
+
+export const createWorkspace: RouteHandler = async (ctx) => {
+  const body = await parseJsonBody(ctx.request);
+  const repositoryOwner = requireString(body, "repositoryOwner");
+  const repositoryName = requireString(body, "repositoryName");
+  const baseBranch = optionalString(body, "baseBranch") ?? "main";
+  const id = crypto.randomUUID();
+  const workspace = await ctx.deps.repo.createWorkspace({
+    id,
+    ownerId: ctx.user.id,
+    repositoryOwner,
+    repositoryName,
+    baseBranch,
+    runtimeState: "STOPPED",
+  });
+  // The owner is always a member.
+  await ctx.deps.membership.addMember(workspace.id, ctx.user.id);
+  return json(toWorkspaceDto(workspace), 201);
+};
+
+export const getWorkspace: RouteHandler = async (ctx) => {
+  const id = requireSegment(ctx.params.id, "id");
+  const workspace = await loadWorkspace(ctx.deps, id);
+  await assertMember(ctx.deps, workspace.id, ctx.user.id);
+  return json(toWorkspaceDto(workspace));
+};
+
+export const openWorkspace: RouteHandler = async (ctx) => {
+  const id = requireSegment(ctx.params.id, "id");
+  await parseOptionalJsonBody(ctx.request);
+  const workspace = await loadWorkspace(ctx.deps, id);
+  await assertMember(ctx.deps, workspace.id, ctx.user.id);
+  // 実装手順書 section 27: concurrent opens coalesce inside the T8 runtime.
+  const handle = await ctx.deps.runtimes.get(workspace);
+  const state = await handle.open();
+  return json({ workspaceId: workspace.id, state });
+};
+
+export const stopWorkspace: RouteHandler = async (ctx) => {
+  const id = requireSegment(ctx.params.id, "id");
+  await parseOptionalJsonBody(ctx.request);
+  const workspace = await loadWorkspace(ctx.deps, id);
+  await assertMember(ctx.deps, workspace.id, ctx.user.id);
+  const handle = await ctx.deps.runtimes.get(workspace);
+  const state = await handle.stop();
+  return json({ workspaceId: workspace.id, state });
+};
+
+export const listSessions: RouteHandler = async (ctx) => {
+  const id = requireSegment(ctx.params.id, "id");
+  const workspace = await loadWorkspace(ctx.deps, id);
+  await assertMember(ctx.deps, workspace.id, ctx.user.id);
+  const sessions = await ctx.deps.repo.listSessions(workspace.id);
+  return json({ sessions: sessions.map(toSessionDto) });
+};
+
+export const createSession: RouteHandler = async (ctx) => {
+  const id = requireSegment(ctx.params.id, "id");
+  const body = await parseOptionalJsonBody(ctx.request);
+  const metadata = optionalObject(body, "metadata");
+  const workspace = await loadWorkspace(ctx.deps, id);
+  await assertMember(ctx.deps, workspace.id, ctx.user.id);
+  const session = await ctx.deps.repo.createSession({
+    id: crypto.randomUUID(),
+    workspaceId: workspace.id,
+    metadata: metadata ?? {},
+  });
+  return json(toSessionDto(session), 201);
+};
+
+export const manualCheckpoint: RouteHandler = async (ctx) => {
+  const id = requireSegment(ctx.params.id, "id");
+  await parseOptionalJsonBody(ctx.request);
+  const workspace = await loadWorkspace(ctx.deps, id);
+  await assertMember(ctx.deps, workspace.id, ctx.user.id);
+  // Manual checkpoint is controller-only (仕様書 section 20).
+  await requireController(ctx.deps.leases, workspace.id, ctx.user.id);
+  const handle = await ctx.deps.runtimes.get(workspace);
+  await handle.runManualCheckpoint();
+  return json({ workspaceId: workspace.id, checkpointed: true });
+};
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
+
+export const postMessage: RouteHandler = async (ctx) => {
+  const sessionId = requireSegment(ctx.params.id, "id");
+  const body = await parseJsonBody(ctx.request);
+  const content = requireString(body, "content");
+  const session = await loadSessionForMember(ctx.deps, sessionId, ctx.user.id);
+  // Message send is controller-only (仕様書 section 20).
+  await requireController(ctx.deps.leases, session.workspaceId, ctx.user.id);
+  const workspace = await loadWorkspace(ctx.deps, session.workspaceId);
+  const handle = await ctx.deps.runtimes.get(workspace);
+  // The workspace state must accept agent input (仕様書 section 8).
+  handle.assertAgentInputAllowed();
+  // A user message is meaningful activity (仕様書 section 11).
+  handle.recordActivity("user_message");
+  const [event] = await ctx.deps.repo.append(session.id, [
+    {
+      eventType: "user_message",
+      eventTime: ctx.deps.clock.now().getTime(),
+      data: { content },
+    },
+  ]);
+  return json(toEventDto(event!), 201);
+};
+
+export const postApproval: RouteHandler = async (ctx) => {
+  const sessionId = requireSegment(ctx.params.id, "id");
+  const approvalId = requireSegment(ctx.params.approvalId, "approvalId");
+  const body = await parseOptionalJsonBody(ctx.request);
+  const decision = optionalString(body, "decision") ?? "approved";
+  if (decision !== "approved" && decision !== "rejected") {
+    throw badRequest("field 'decision' must be 'approved' or 'rejected'");
+  }
+  const session = await loadSessionForMember(ctx.deps, sessionId, ctx.user.id);
+  // Approval is controller-only (仕様書 section 20).
+  await requireController(ctx.deps.leases, session.workspaceId, ctx.user.id);
+  const workspace = await loadWorkspace(ctx.deps, session.workspaceId);
+  const handle = await ctx.deps.runtimes.get(workspace);
+  // An approval operation is meaningful activity (仕様書 section 11).
+  handle.recordActivity("approval");
+  const [event] = await ctx.deps.repo.append(session.id, [
+    {
+      eventType: "approval",
+      eventTime: ctx.deps.clock.now().getTime(),
+      data: { approvalId, decision },
+    },
+  ]);
+  return json(toEventDto(event!), 201);
+};
+
+export const postCancel: RouteHandler = async (ctx) => {
+  const sessionId = requireSegment(ctx.params.id, "id");
+  await parseOptionalJsonBody(ctx.request);
+  const session = await loadSessionForMember(ctx.deps, sessionId, ctx.user.id);
+  // Cancel is controller-only (仕様書 section 20).
+  await requireController(ctx.deps.leases, session.workspaceId, ctx.user.id);
+  const workspace = await loadWorkspace(ctx.deps, session.workspaceId);
+  const handle = await ctx.deps.runtimes.get(workspace);
+  // An explicit workspace operation is meaningful activity (仕様書 section 11).
+  handle.recordActivity("workspace_operation");
+  const [event] = await ctx.deps.repo.append(session.id, [
+    {
+      eventType: "cancel",
+      eventTime: ctx.deps.clock.now().getTime(),
+      data: { cancelledBy: ctx.user.id },
+    },
+  ]);
+  return json(toEventDto(event!), 201);
+};
+
+// ---------------------------------------------------------------------------
+// Controller lease (仕様書 section 20, 実装手順書 section 26)
+// ---------------------------------------------------------------------------
+
+export const acquireController: RouteHandler = async (ctx) => {
+  const workspaceId = requireSegment(ctx.params.id, "id");
+  await parseOptionalJsonBody(ctx.request);
+  const workspace = await loadWorkspace(ctx.deps, workspaceId);
+  await assertMember(ctx.deps, workspace.id, ctx.user.id);
+  const controllerId = crypto.randomUUID();
+  try {
+    const lease = await ctx.deps.leases.acquire(workspace.id, controllerId, ctx.user.id);
+    return json(toLeaseDto(lease), 200);
+  } catch (e) {
+    if (e instanceof LeaseAlreadyHeldError) {
+      throw conflict(`controller lease already held by ${e.holderControllerId}`);
+    }
+    throw e;
+  }
+};
+
+export const heartbeatController: RouteHandler = async (ctx) => {
+  const workspaceId = requireSegment(ctx.params.id, "id");
+  const body = await parseJsonBody(ctx.request);
+  const controllerId = requireString(body, "controllerId");
+  const workspace = await loadWorkspace(ctx.deps, workspaceId);
+  await assertMember(ctx.deps, workspace.id, ctx.user.id);
+  try {
+    const lease = await ctx.deps.leases.heartbeat(workspace.id, controllerId);
+    return json(toLeaseDto(lease));
+  } catch (e) {
+    if (e instanceof LeaseNotFoundError) {
+      throw notFound(`no controller lease for workspace ${workspace.id}`);
+    }
+    if (e instanceof NotLeaseOwnerError || e instanceof LeaseExpiredError) {
+      throw conflict("controller lease is not owned by this controller");
+    }
+    throw e;
+  }
+};
+
+export const releaseController: RouteHandler = async (ctx) => {
+  const workspaceId = requireSegment(ctx.params.id, "id");
+  const body = await parseJsonBody(ctx.request);
+  const controllerId = requireString(body, "controllerId");
+  const workspace = await loadWorkspace(ctx.deps, workspaceId);
+  await assertMember(ctx.deps, workspace.id, ctx.user.id);
+  try {
+    await ctx.deps.leases.release(workspace.id, controllerId);
+    return json({ released: true });
+  } catch (e) {
+    if (e instanceof LeaseNotFoundError) {
+      throw notFound(`no controller lease for workspace ${workspace.id}`);
+    }
+    if (e instanceof NotLeaseOwnerError) {
+      throw conflict("controller lease is not owned by this controller");
+    }
+    throw e;
+  }
+};
+
+// ---------------------------------------------------------------------------
+// DTOs — responses never expose internals or secrets.
+// ---------------------------------------------------------------------------
+
+function toWorkspaceDto(w: Workspace) {
+  return {
+    id: w.id,
+    ownerId: w.ownerId,
+    repositoryOwner: w.repositoryOwner,
+    repositoryName: w.repositoryName,
+    baseBranch: w.baseBranch,
+    runtimeState: w.runtimeState,
+    createdAt: w.createdAt,
+    updatedAt: w.updatedAt,
+  };
+}
+
+function toSessionDto(s: Session) {
+  return {
+    id: s.id,
+    workspaceId: s.workspaceId,
+    metadata: s.metadata,
+    createdAt: s.createdAt,
+    updatedAt: s.updatedAt,
+  };
+}
+
+function toEventDto(e: {
+  sessionId: string;
+  seq: number;
+  eventType: string;
+  eventTime: number;
+  data: unknown;
+}) {
+  return {
+    sessionId: e.sessionId,
+    seq: e.seq,
+    eventType: e.eventType,
+    eventTime: e.eventTime,
+    data: e.data,
+  };
+}
+
+function toLeaseDto(l: ControllerLease) {
+  return {
+    workspaceId: l.workspaceId,
+    controllerId: l.controllerId,
+    expiresAt: l.expiresAt.toISOString(),
+  };
+}
+
+export { json, ApiError };

@@ -16,6 +16,13 @@
     "apps/control-plane": {
       "name": "@cloud-run-dsh/control-plane",
       "version": "0.0.0",
+      "dependencies": {
+        "@cloud-run-dsh/cloud-run-instance-client": "workspace:*",
+        "@cloud-run-dsh/controller-lease": "workspace:*",
+        "@cloud-run-dsh/session-persistence-postgres": "workspace:*",
+        "@cloud-run-dsh/workspace-checkpoint": "workspace:*",
+        "@cloud-run-dsh/workspace-runtime": "workspace:*",
+      },
     },
     "packages/cloud-run-instance-client": {
       "name": "@cloud-run-dsh/cloud-run-instance-client",
