@@ -147,17 +147,63 @@ export class InMemoryFakeExecutor implements QueryExecutor {
       return Array.from(this.tables.workspaces.values()).map(toWorkspaceRow) as unknown as T[];
     }
     if (lower.startsWith("update workspaces")) {
-      const id = params?.[params.length - 1] as string;
+      const setMatch = normalized.match(/set\s+(.+?)\s+where\s+/i);
+      const whereMatch = normalized.match(/where\s+id\s*=\s*\$(\d+)/i);
+      if (!setMatch || !whereMatch) {
+        throw new Error(`InMemoryFakeExecutor: unhandled UPDATE workspaces SQL: ${normalized}`);
+      }
+      const setClause = setMatch[1]!;
+      const whereParamIdx = parseInt(whereMatch[1]!, 10) - 1;
+      const id = params?.[whereParamIdx] as string;
       const w = this.tables.workspaces.get(id);
       if (!w) throw new Error(`workspace not found: ${id}`);
-      // Simple patch: we parse set clauses via params order defined by repository
-      // Repository calls: update runtime_state, last_activity_at, instance_name, instance_url via explicit sql
-      // So we handle generically: if sql contains runtime_state, second param is value etc.
-      // Easiest: caller passes patch as separate; we just apply in repository fake path.
-      // Fallback: treat as already handled at higher level — but we can parse known patterns:
-      // For generic UPDATE workspaces SET ... WHERE id = $N, we rely on repository's fake-aware executor
-      // Instead, throw if not handled
-      throw new Error("Use repository.updateWorkspace via fake-aware path — raw UPDATE workspaces not supported in this pattern");
+      const assignments = setClause
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const next: Workspace = { ...w };
+      for (const assign of assignments) {
+        if (assign.includes("updated_at")) continue;
+        const eqIdx = assign.indexOf("=");
+        if (eqIdx === -1) continue;
+        const col = assign.slice(0, eqIdx).trim().toLowerCase();
+        const valExpr = assign.slice(eqIdx + 1).trim();
+        const paramMatch = valExpr.match(/\$(\d+)/);
+        if (!paramMatch) continue;
+        const paramIdx = parseInt(paramMatch[1]!, 10) - 1;
+        const val = params?.[paramIdx] as unknown;
+        switch (col) {
+          case "runtime_state":
+            (next as unknown as Record<string, unknown>)["runtimeState"] = val;
+            break;
+          case "last_activity_at":
+            (next as unknown as Record<string, unknown>)["lastActivityAt"] = val;
+            break;
+          case "instance_name":
+            (next as unknown as Record<string, unknown>)["instanceName"] = val;
+            break;
+          case "instance_url":
+            (next as unknown as Record<string, unknown>)["instanceUrl"] = val;
+            break;
+          case "owner_id":
+            (next as unknown as Record<string, unknown>)["ownerId"] = val;
+            break;
+          case "repository_owner":
+            (next as unknown as Record<string, unknown>)["repositoryOwner"] = val;
+            break;
+          case "repository_name":
+            (next as unknown as Record<string, unknown>)["repositoryName"] = val;
+            break;
+          case "base_branch":
+            (next as unknown as Record<string, unknown>)["baseBranch"] = val;
+            break;
+          default:
+            break;
+        }
+      }
+      (next as unknown as Record<string, unknown>)["updatedAt"] = new Date().toISOString();
+      this.tables.workspaces.set(id, next);
+      return [] as T[];
     }
 
     // Sessions
@@ -166,7 +212,17 @@ export class InMemoryFakeExecutor implements QueryExecutor {
       if (this.tables.sessions.has(id)) throw new Error(`duplicate session id: ${id}`);
       const workspaceId = params?.[1] as string;
       if (!this.tables.workspaces.has(workspaceId)) throw new Error(`workspace not found: ${workspaceId}`);
-      const metadata = (params?.[2] as Record<string, unknown>) ?? {};
+      const rawMeta = params?.[2] as unknown;
+      let metadata: Record<string, unknown>;
+      if (typeof rawMeta === "string") {
+        try {
+          metadata = JSON.parse(rawMeta) as Record<string, unknown>;
+        } catch {
+          metadata = {};
+        }
+      } else {
+        metadata = (rawMeta as Record<string, unknown>) ?? {};
+      }
       const row: Session = {
         id,
         workspaceId,

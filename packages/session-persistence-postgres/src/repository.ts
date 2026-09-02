@@ -8,7 +8,6 @@ import type {
   SessionEvent,
   NewSessionEvent,
 } from "./types.js";
-import { InMemoryFakeExecutor } from "./fakeExecutor.js";
 
 function rowToWorkspace(row: Record<string, unknown>): Workspace {
   return {
@@ -103,18 +102,6 @@ export class PostgresSessionPersistenceRepository implements SessionPersistenceR
   }
 
   async updateWorkspace(id: string, patch: UpdateWorkspacePatch): Promise<Workspace> {
-    // Fast path for in-memory fake
-    if (this.executor instanceof InMemoryFakeExecutor) {
-      const current = await this.getWorkspace(id);
-      if (!current) throw new Error(`workspace not found: ${id}`);
-      const nextPatch: Record<string, unknown> = {};
-      if (patch.runtimeState !== undefined) nextPatch["runtimeState"] = patch.runtimeState;
-      if (patch.lastActivityAt !== undefined) nextPatch["lastActivityAt"] = patch.lastActivityAt;
-      if (patch.instanceName !== undefined) nextPatch["instanceName"] = patch.instanceName;
-      if (patch.instanceUrl !== undefined) nextPatch["instanceUrl"] = patch.instanceUrl;
-      return this.executor.__updateWorkspace(id, nextPatch as unknown as Partial<Workspace>);
-    }
-
     // Generic SQL path: build dynamic SET clause
     const sets: string[] = [];
     const params: unknown[] = [];
@@ -161,17 +148,6 @@ export class PostgresSessionPersistenceRepository implements SessionPersistenceR
       `INSERT INTO sessions(id, workspace_id, metadata) VALUES ($1,$2,$3)`,
       [input.id, input.workspaceId, JSON.stringify(input.metadata ?? {})],
     );
-    // Fake stores metadata as object; real pg stores JSONB — normalize on read.
-    // For fake, we need to override JSON string handling: re-read will parse correctly in fake?
-    // Patch fake: if executor is fake, the metadata was JSON.stringified, but fake expects object.
-    // Handle by patching the stored row in fake.
-    if (this.executor instanceof InMemoryFakeExecutor) {
-      const tables = (this.executor as unknown as { __getTables(): { sessions: Map<string, Session> } }).__getTables();
-      const s = tables.sessions.get(input.id);
-      if (s && typeof s.metadata === "string") {
-        (s as unknown as { metadata: Record<string, unknown> }).metadata = JSON.parse(s.metadata as unknown as string);
-      }
-    }
     const s = await this.getSession(input.id);
     if (!s) throw new Error(`failed to create session ${input.id}`);
     return s;

@@ -8,10 +8,6 @@ function newExecutor() {
   return new InMemoryFakeExecutor();
 }
 
-function makeRepo(exec = newExecutor()) {
-  return { exec, repo: new PostgresSessionPersistenceRepository(exec) };
-}
-
 async function setupWorkspaceAndSession(exec = newExecutor()) {
   const repo = new PostgresSessionPersistenceRepository(exec);
   const ws = await repo.createWorkspace({
@@ -161,12 +157,6 @@ describe("session-persistence-postgres", () => {
     await repo.append(session.id, [{ eventType: "a", eventTime: 1, data: {} }]);
     expect((await repo.readEvents(session.id)).length).toBe(1);
 
-    // Simulate failure on second event of a batch by causing the executor to throw
-    // We achieve this by injecting a duplicate seq manually before the append, then let append fail
-    // Easier: use a wrapping executor that throws on the second INSERT
-    let insertCount = 0;
-    const baseExec = repo as unknown as { executor: InMemoryFakeExecutor };
-    // Instead, test via explicit transaction that throws
     const exec = (repo as unknown as { executor: InMemoryFakeExecutor }).executor as InMemoryFakeExecutor;
     // Use a fresh repo with a failing wrapper
     const failingRepo = new PostgresSessionPersistenceRepository({
