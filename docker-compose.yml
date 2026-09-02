@@ -11,7 +11,6 @@
 services:
   postgres:
     image: postgres:16.9-alpine
-    container_name: dsh-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-dsh}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dsh}

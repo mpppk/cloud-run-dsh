@@ -9,7 +9,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { migrate } from "../../infra/migrations/runner.js";
+import { listMigrationFiles, migrate } from "../../infra/migrations/runner.js";
 import type { MigrationExecutor } from "../../infra/migrations/runner.js";
 
 const MIGRATIONS_DIR = join(import.meta.dir, "../../infra/migrations");
@@ -108,8 +108,7 @@ describe.skipIf(!executor)("migrations against live Postgres (docker-compose dev
     const versions = await exec.query<{ version: string }>(
       "SELECT version FROM schema_migrations ORDER BY version",
     );
-    expect(versions).toHaveLength(1);
-    expect(versions[0]!.version).toBe("0001_init.sql");
+    expect(versions.map((r) => r.version)).toEqual(await listMigrationFiles(MIGRATIONS_DIR));
   });
 });
 
