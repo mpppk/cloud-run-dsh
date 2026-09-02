@@ -5,8 +5,8 @@ import {
   ExecutableNotFoundError,
   TimeoutError,
 } from "./errors.js";
-import { validateCwd } from "./argv.js";
-import { OutputCollector, processOutput } from "./process.js";
+import { toStructuredArgv, validateCwd } from "./argv.js";
+import { OutputCollector } from "./process.js";
 import type { ProcessResult } from "./process.js";
 import type { SubprocessSpawnSpec } from "./argv.js";
 
@@ -37,6 +37,29 @@ class Mutex {
       release();
     }
   }
+}
+
+/**
+ * Shared per-workspace lock registry. The "1 active subprocess per workspace"
+ * invariant (spec 15) must hold across ALL runtime instances for the same
+ * workspace, not just within one object — hence a module-level registry keyed
+ * by workspaceId.
+ */
+interface WorkspaceLock {
+  readonly mutex: Mutex;
+  /** Set when a timeout/cancel reset failed: the sandbox may be gone (with the /workspace bind mount). */
+  sandboxUnusable: boolean;
+}
+
+const workspaceLocks = new Map<string, WorkspaceLock>();
+
+function getWorkspaceLock(workspaceId: string): WorkspaceLock {
+  let lock = workspaceLocks.get(workspaceId);
+  if (!lock) {
+    lock = { mutex: new Mutex(), sandboxUnusable: false };
+    workspaceLocks.set(workspaceId, lock);
+  }
+  return lock;
 }
 
 /**
@@ -71,14 +94,19 @@ export interface CloudRunSubprocessRuntimeOptions {
 
 export class CloudRunSubprocessRuntime {
   private readonly manager: SandboxManager;
-  private readonly mutex = new Mutex();
+  private readonly lock: WorkspaceLock;
   private readonly defaultTimeoutMs?: number;
   private readonly secrets: readonly string[];
 
   constructor(opts: CloudRunSubprocessRuntimeOptions) {
     this.manager = opts.manager;
+    this.lock = getWorkspaceLock(opts.manager.getWorkspaceId());
     this.defaultTimeoutMs = opts.defaultTimeoutMs;
     this.secrets = opts.secrets ?? [];
+  }
+
+  getWorkspaceId(): string {
+    return this.manager.getWorkspaceId();
   }
 
   /**
@@ -86,11 +114,19 @@ export class CloudRunSubprocessRuntime {
    * Supports cwd, env, stdin, streamed stdout/stderr, exit code, duration, AbortSignal, timeout.
    */
   async spawn(spec: SpawnOptions): Promise<ProcessResult> {
-    return this.mutex.runExclusive(() => this.spawnInner(spec));
+    return this.lock.mutex.runExclusive(() => this.spawnInner(spec));
   }
 
   private async spawnInner(spec: SpawnOptions): Promise<ProcessResult> {
-    const cwd = validateCwd(spec.cwd || "/workspace");
+    // If a previous reset failed, the sandbox may no longer exist and the
+    // /workspace bind mount is lost. Recreate it up-front (or fail loudly) —
+    // never silently run against a dead sandbox.
+    if (this.lock.sandboxUnusable) {
+      await this.manager.ensureRunning();
+      this.lock.sandboxUnusable = false;
+    }
+    // cwd is required — no silent /workspace fallback.
+    const cwd = validateCwd(spec.cwd);
     const filteredEnv = filterEnv(spec.env as Record<string, string | undefined>);
     const timeoutMs = spec.timeoutMs ?? this.defaultTimeoutMs;
     const start = Date.now();
@@ -102,20 +138,17 @@ export class CloudRunSubprocessRuntime {
       onStderr: spec.onStderr,
     });
 
-    // Build the handle promise
-    let handle: { result: Promise<{ exitCode: number; stdout: string; stderr: string; durationMs: number }> };
-    try {
-      handle = this.manager.exec({
-        command: spec.command,
-        args: spec.args as string[],
-        cwd,
-        env: filteredEnv,
-        stdin: spec.stdin,
-      });
-    } catch (e) {
-      const durationMs = Date.now() - start;
-      throw e;
-    }
+    // Structured argv invariant is enforced here at runtime (spec 26 item 11):
+    // command + args stay separate elements, never a joined shell string.
+    const [command, ...args] = toStructuredArgv(spec.command, spec.args);
+
+    const handle = this.manager.exec({
+      command,
+      args,
+      cwd,
+      env: filteredEnv,
+      stdin: spec.stdin,
+    });
 
     // Setup abort / timeout handling
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -163,12 +196,13 @@ export class CloudRunSubprocessRuntime {
       return collector.finalize(res.exitCode, durationMs, status);
     } catch (e) {
       cleanup();
-      // Timeout/cancel path per spec 17: abort caller -> sandbox delete -> sandbox run -> mark result TIMEOUT/CANCELLED
-      // Perform reset; ignore reset errors for now but await it.
+      // Timeout/cancel path per spec 17: abort caller -> sandbox delete -> sandbox run -> mark result TIMEOUT/CANCELLED.
+      // If reset fails, the sandbox is gone and the /workspace bind mount is lost:
+      // mark it unusable so the next spawn recreates it via ensureRunning (or fails loudly).
       try {
         await this.manager.reset();
       } catch {
-        // swallow reset error — we still need to report timeout/cancelled
+        this.lock.sandboxUnusable = true;
       }
       const durationMs = Date.now() - start;
       if (timedOut || e instanceof TimeoutError) {

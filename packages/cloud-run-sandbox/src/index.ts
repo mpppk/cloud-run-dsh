@@ -15,9 +15,4 @@ export {
   type SandboxManager,
   type SandboxManagerOptions,
 } from "./manager.js";
-
-// Legacy placeholder for backwards compat if needed
-export const PLACEHOLDER_KIND = "cloud-run-sandbox" as const;
-export function createPlaceholder() {
-  return { kind: PLACEHOLDER_KIND, sandboxIdPrefix: "dsh-" as const };
-}
+export { ALLOWED_ENV, FORBIDDEN_ENV_KEYS, filterEnv } from "./env.js";

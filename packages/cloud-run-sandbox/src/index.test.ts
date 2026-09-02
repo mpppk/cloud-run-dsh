@@ -105,6 +105,10 @@ describe("cloud-run-sandbox", () => {
         "a&b",
         "x|y",
         "d$var",
+        "a && b",
+        "line1\nline2",
+        "a; rm -rf /",
+        `he said "hi" and 'bye'`,
       ];
       const argv = buildExecArgv("dsh-ws1", {
         cwd: "/workspace",
@@ -117,10 +121,14 @@ describe("cloud-run-sandbox", () => {
       expect(payload[0]).toBe("echo");
       expect(payload.slice(1)).toEqual(trickyArgs);
 
+      // Each tricky arg stays a SINGLE argv element — no joining occurred
+      for (const arg of trickyArgs) {
+        expect(payload).toContain(arg);
+      }
+      expect(payload.length).toBe(trickyArgs.length + 1);
+
       // Ensure no shell string was built: joining would collapse spaces and change semantics
       const joined = payload.join(" ");
-      // joined string loses structure — but our argv preserves structure, so joining is not used
-      expect(payload.length).toBe(trickyArgs.length + 1);
       expect(joined).not.toBe(payload.join("\x00"));
     });
 
@@ -138,13 +146,17 @@ describe("cloud-run-sandbox", () => {
     test("env values with spaces/special chars survive as single argv element", () => {
       const argv = buildExecArgv("dsh-ws1", {
         cwd: "/workspace",
-        env: { MY_VAR: "hello world; rm -rf /" },
+        env: { MY_VAR: "hello world; rm -rf /", MULTI_LINE: "line1\nline2" },
         command: "env",
         args: [],
       });
-      // Find --env entry
-      const idx = argv.indexOf("--env");
-      expect(argv[idx + 1]).toBe("MY_VAR=hello world; rm -rf /");
+      // Find --env entries
+      const firstIdx = argv.indexOf("--env");
+      expect(argv[firstIdx + 1]).toBe("MY_VAR=hello world; rm -rf /");
+      const secondIdx = argv.indexOf("--env", firstIdx + 1);
+      expect(argv[secondIdx + 1]).toBe("MULTI_LINE=line1\nline2");
+      // Each env value stays a SINGLE argv element — the newline did not split it
+      expect(argv.filter((a) => a === "--env")).toHaveLength(2);
     });
   });
 
@@ -154,6 +166,48 @@ describe("cloud-run-sandbox", () => {
       const mgr = new DefaultSandboxManager({ workspaceId: "ws1", runner });
       await mgr.ensureRunning();
       expect(runner.recorded[0]).toEqual(buildRunArgv("dsh-ws1"));
+    });
+
+    test("exposes workspaceId (used for cross-instance coordination)", () => {
+      const mgr = new DefaultSandboxManager({ workspaceId: "ws1", runner: new FakeRunner() });
+      expect(mgr.getWorkspaceId()).toBe("ws1");
+    });
+
+    test("exec throws when cwd is missing — no silent /workspace default", () => {
+      const runner = new FakeRunner();
+      const mgr = new DefaultSandboxManager({ workspaceId: "ws1", runner });
+      expect(() => mgr.exec({ command: "echo", args: ["hi"], cwd: "" })).toThrow("cwd required");
+      expect(() =>
+        mgr.exec({ command: "echo", args: ["hi"], cwd: undefined as unknown as string }),
+      ).toThrow("cwd required");
+      // Nothing was run against the CLI
+      expect(runner.recorded.length).toBe(0);
+    });
+
+    test("exec enforces the env allowlist — forbidden vars dropped via manager path too (spec 26 item 6)", async () => {
+      const runner = new FakeRunner();
+      runner.nextResult = { exitCode: 0, stdout: "", stderr: "" };
+      const mgr = new DefaultSandboxManager({ workspaceId: "ws1", runner });
+      const handle = mgr.exec({
+        command: "env",
+        args: [],
+        cwd: "/workspace",
+        env: {
+          CI: "1",
+          NODE_ENV: "test",
+          LLM_API_KEY: "sk-secret",
+          DATABASE_URL: "postgres://host/db",
+          GITHUB_APP_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----",
+        },
+      });
+      await handle.result;
+      const argv = runner.recorded[0]!;
+      expect(argv).toContain("CI=1");
+      expect(argv).toContain("NODE_ENV=test");
+      for (const key of ["LLM_API_KEY", "DATABASE_URL", "GITHUB_APP_PRIVATE_KEY"]) {
+        expect(argv.some((a) => a.startsWith(`${key}=`))).toBe(false);
+        expect(argv.some((a) => a.includes(key))).toBe(false);
+      }
     });
 
     test("exec builds structured argv and returns handle", async () => {

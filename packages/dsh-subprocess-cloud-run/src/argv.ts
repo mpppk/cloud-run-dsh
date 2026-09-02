@@ -16,23 +16,25 @@ export interface SubprocessSpawnSpec {
 export function toStructuredArgv(
   command: string,
   args: readonly string[],
-): readonly string[] {
+): [string, ...string[]] {
   if (!command) throw new Error("command required");
   return [command, ...args];
 }
 
 /**
- * Validate cwd is an absolute path inside /workspace.
+ * Validate cwd is an absolute path strictly inside /workspace.
+ * Rejects non-absolute paths, any path outside /workspace, and any path
+ * containing a '..' segment (workspace-path confinement, spec 26 item 2).
  * Returns normalized cwd or throws.
  */
 export function validateCwd(cwd: string): string {
   if (!cwd) throw new Error("cwd required");
   if (!cwd.startsWith("/")) throw new Error(`cwd must be absolute: ${cwd}`);
-  // For MVP we allow any absolute path but ensure it is not empty host root escape.
+  if (cwd !== "/workspace" && !cwd.startsWith("/workspace/")) {
+    throw new Error(`cwd must be inside /workspace: ${cwd}`);
+  }
+  if (cwd.split("/").includes("..")) {
+    throw new Error(`cwd must not contain '..' segments: ${cwd}`);
+  }
   return cwd;
-}
-
-export function assertNoShellJoining(command: string, args: readonly string[]): void {
-  // This function exists to document the invariant: caller must not use argv join with space.
-  // No-op at runtime — tests assert that the structured argv is passed verbatim.
 }

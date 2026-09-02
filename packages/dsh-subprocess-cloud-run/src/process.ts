@@ -83,12 +83,13 @@ export class OutputCollector {
 
   pushStdout(chunk: string): void {
     this.stdoutBuf += chunk;
-    if (this.onStdout) this.onStdout(chunk);
+    // Redact before streaming to callbacks: secrets must never be logged (spec 26 item 12).
+    if (this.onStdout) this.onStdout(redactSecrets(chunk, this.secrets));
   }
 
   pushStderr(chunk: string): void {
     this.stderrBuf += chunk;
-    if (this.onStderr) this.onStderr(chunk);
+    if (this.onStderr) this.onStderr(redactSecrets(chunk, this.secrets));
   }
 
   finalize(exitCode: number | null, durationMs: number, status: ProcessStatus): ProcessResult {

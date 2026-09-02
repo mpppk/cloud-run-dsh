@@ -1,4 +1,5 @@
 import { buildDeleteArgv, buildExecArgv, buildRunArgv } from "./argv.js";
+import { filterEnv } from "./env.js";
 import { toSandboxId } from "./sandboxId.js";
 import type {
   SandboxCliRunner,
@@ -8,6 +9,7 @@ import type {
 } from "./types.js";
 
 export interface SandboxManager {
+  getWorkspaceId(): string;
   ensureRunning(): Promise<void>;
   exec(request: SandboxExecRequest): SubprocessHandle;
   reset(): Promise<void>;
@@ -20,12 +22,18 @@ export interface SandboxManagerOptions {
 }
 
 export class DefaultSandboxManager implements SandboxManager {
+  private readonly workspaceId: string;
   private readonly sandboxId: string;
   private readonly runner: SandboxCliRunner;
 
   constructor(opts: SandboxManagerOptions) {
+    this.workspaceId = opts.workspaceId;
     this.sandboxId = toSandboxId(opts.workspaceId);
     this.runner = opts.runner;
+  }
+
+  getWorkspaceId(): string {
+    return this.workspaceId;
   }
 
   getSandboxId(): string {
@@ -39,11 +47,14 @@ export class DefaultSandboxManager implements SandboxManager {
 
   exec(request: SandboxExecRequest): SubprocessHandle {
     if (!request.command) throw new Error("command required");
-    // cwd defaults to /workspace if not provided? spec says cwd required.
-    const cwd = request.cwd || "/workspace";
+    // cwd is required — never silently default to /workspace (spec 26 item 2).
+    if (!request.cwd) throw new Error("cwd required");
+    // Env allowlist is enforced here too, so callers using the manager directly
+    // cannot bypass it (spec 26 item 6).
+    const env = filterEnv(request.env);
     const argv = buildExecArgv(this.sandboxId, {
-      cwd,
-      env: request.env,
+      cwd: request.cwd,
+      env,
       command: request.command,
       args: request.args,
     });
