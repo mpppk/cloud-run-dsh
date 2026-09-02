@@ -10,8 +10,8 @@
 
 import type { IapIdentity, InternalUser } from "./auth.js";
 import type { ControlPlaneDeps } from "./deps.js";
-export type { WorkspaceRuntimeHandle, ControlPlaneDeps } from "./deps.js";
-export { WorkspaceRuntimeHandleAdapter, RuntimeRegistry } from "./deps.js";
+export type { WorkspaceRuntimeHandle, ControlPlaneDeps, ControlPlaneClock } from "./deps.js";
+export { WorkspaceRuntimeHandleAdapter, RuntimeRegistry, SystemClock } from "./deps.js";
 export {
   authenticate,
   parseIapHeaders,

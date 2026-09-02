@@ -7,6 +7,11 @@
 //
 // SSE heartbeats, the SSE connection and status polling are NOT meaningful
 // activity (仕様書 section 11) — nothing here calls recordActivity.
+//
+// All timing (heartbeat cadence, last-emit tracking) comes from the injected
+// two-method clock (`deps.clock`, see ControlPlaneClock in deps.ts) — never
+// from a bare `Date.now()` — so cadence is deterministically testable with a
+// fake clock.
 
 import type { ControlPlaneDeps } from "./deps.js";
 import { loadSessionForMember } from "./handlers.js";
@@ -54,12 +59,13 @@ export async function handleSessionEvents(
 
   const pollIntervalMs = deps.ssePollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const heartbeatMs = deps.sseHeartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  const clock = deps.clock;
 
   const stream = new ReadableStream<Uint8Array>({
     async start(streamController) {
       const encoder = new TextEncoder();
       let closed = false;
-      let lastEmitMs = Date.now();
+      let lastEmitMs = clock.nowMs();
 
       const write = (chunk: string): void => {
         if (closed) return;
@@ -91,7 +97,7 @@ export async function handleSessionEvents(
         for (const event of events) {
           write(formatSseEvent(event));
           lastSeq = event.seq;
-          lastEmitMs = Date.now();
+          lastEmitMs = clock.nowMs();
         }
       };
 
@@ -102,10 +108,12 @@ export async function handleSessionEvents(
         while (!closed) {
           await Bun.sleep(pollIntervalMs);
           if (closed) break;
-          if (Date.now() - lastEmitMs >= heartbeatMs) {
+          // Heartbeat cadence is derived from the injected clock (MINOR-2/3),
+          // never from a bare Date.now(), so fake clocks control it in tests.
+          if (clock.nowMs() - lastEmitMs >= heartbeatMs) {
             // Heartbeat comment: NOT meaningful activity (仕様書 section 11).
             write(": ping\n\n");
-            lastEmitMs = Date.now();
+            lastEmitMs = clock.nowMs();
           }
           await poll();
         }

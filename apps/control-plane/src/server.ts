@@ -3,7 +3,7 @@
 
 import { authenticate } from "./auth.js";
 import type { ControlPlaneDeps } from "./deps.js";
-import { ApiError, internalError, notFound } from "./errors.js";
+import { ApiError, badRequest, internalError, notFound } from "./errors.js";
 import * as handlers from "./handlers.js";
 import { handleSessionEvents } from "./sse.js";
 import {
@@ -53,7 +53,13 @@ function match(
       const pattern = route.segments[i]!;
       const actual = pathSegments[i]!;
       if (pattern.startsWith(":")) {
-        params[pattern.slice(1)] = decodeURIComponent(actual);
+        // Malformed percent-encoding (e.g. /v1/workspaces/%zz) must yield a
+        // typed 400, never a URIError -> 500 (deliverable 5).
+        try {
+          params[pattern.slice(1)] = decodeURIComponent(actual);
+        } catch {
+          throw badRequest("malformed path segment");
+        }
       } else if (pattern !== actual) {
         matched = false;
         break;

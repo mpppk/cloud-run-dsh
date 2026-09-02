@@ -14,7 +14,6 @@ import type { InstanceRuntime } from "@cloud-run-dsh/cloud-run-instance-client";
 import {
   ControllerLeaseService,
   InMemoryLeaseStore,
-  systemClock,
 } from "@cloud-run-dsh/controller-lease";
 import {
   PostgresSessionPersistenceRepository,
@@ -34,8 +33,10 @@ import {
   createFetchHandler,
   InMemoryMembershipStore,
   RuntimeRegistry,
+  SystemClock,
   toErrorResponse,
   WorkspaceRuntimeHandleAdapter,
+  type ControlPlaneClock,
   type ControlPlaneDeps,
   type WorkspaceRuntimeHandle,
 } from "./index.js";
@@ -233,7 +234,7 @@ function startHarness(
   overrides: Partial<ControlPlaneDeps> = {},
 ): TestHarness {
   const repo = new PostgresSessionPersistenceRepository(new FakeExecutor());
-  const leases = new ControllerLeaseService({ store: new InMemoryLeaseStore(), clock: systemClock });
+  const leases = new ControllerLeaseService({ store: new InMemoryLeaseStore(), clock: new SystemClock() });
   const membership = new InMemoryMembershipStore();
   const handles = new Map<string, FakeHandle>();
   const registry = new RuntimeRegistry((workspace) => {
@@ -252,7 +253,7 @@ function startHarness(
     leases,
     membership,
     runtimes: registry,
-    clock: systemClock,
+    clock: new SystemClock(),
     ssePollIntervalMs: 10,
     sseHeartbeatMs: 60,
     ...overrides,
@@ -535,6 +536,22 @@ describe("workspace and session routes", () => {
   test("unknown route -> 404", async () => {
     const res = await h.fetchAs("alice", "/v1/nonsense", { method: "GET" });
     expect(res.status).toBe(404);
+  });
+
+  test("malformed percent-encoding %zz -> typed 400, never 500", async () => {
+    const res = await h.fetchAs("alice", "/v1/workspaces/%zz", { method: "GET" });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe("bad_request");
+    expect(body.error.message).toContain("malformed path segment");
+  });
+
+  test("truncated percent-encoding %A -> typed 400", async () => {
+    const res = await h.fetchAs("alice", "/v1/workspaces/%A", { method: "GET" });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe("bad_request");
+    expect(body.error.message).toContain("malformed path segment");
   });
 });
 
@@ -1059,5 +1076,151 @@ describe("open/stop composition with the T8 runtime", () => {
   test("unexpected errors map to a generic 500 without internals", () => {
     const res = toErrorResponse(new Error("secret database DSN leaked"));
     expect(res.status).toBe(500);
+  });
+
+  test("real system clock: open() reaching nowMs does not throw (MINOR-2 regression)", async () => {
+    // A real T8 WorkspaceRuntime + IdleManager constructed with the real
+    // SystemClock must reach clock.nowMs() inside open()'s success path
+    // (recordActivity -> IdleManager). A T6 one-method clock would throw
+    // "clock.nowMs is not a function" here.
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      const runtime = makeRealRuntime(ws.id).runtime;
+      h.deps.runtimes.set(ws.id, new WorkspaceRuntimeHandleAdapter(runtime, async () => {}));
+
+      const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/open`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.state).toBe("READY");
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("deps with a one-method T6 clock fail typecheck; runtime still works with SystemClock", () => {
+    // Compile-level guard: ControlPlaneClock demands both methods.
+    const clock: ControlPlaneClock = new SystemClock();
+    expect(typeof clock.now).toBe("function");
+    expect(typeof clock.nowMs).toBe("function");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fake-clock driven SSE heartbeat cadence (MINOR-3)
+// ---------------------------------------------------------------------------
+
+class ManualFakeClock {
+  private ms: number;
+  constructor(startMs: number) {
+    this.ms = startMs;
+  }
+  now(): Date {
+    return new Date(this.ms);
+  }
+  nowMs(): number {
+    return this.ms;
+  }
+  advance(deltaMs: number): void {
+    this.ms += deltaMs;
+  }
+}
+
+describe("SSE heartbeat cadence with an injected fake clock", () => {
+  test("heartbeat fires exactly at heartbeatMs intervals per the fake clock", async () => {
+    const repo = new PostgresSessionPersistenceRepository(new FakeExecutor());
+    const leases = new ControllerLeaseService({ store: new InMemoryLeaseStore() });
+    const membership = new InMemoryMembershipStore();
+    const clock = new ManualFakeClock(1_000_000);
+    const HEARTBEAT_MS = 500;
+
+    const deps = createControlPlaneDeps({
+      resolveUser: async (identity) =>
+        identity.subject === "alice" ? { id: "alice", email: "a@example.com" } : null,
+      repo,
+      leases,
+      membership,
+      runtimes: new RuntimeRegistry(() => {
+        throw new Error("no runtime needed");
+      }),
+      clock,
+      ssePollIntervalMs: 10,
+      sseHeartbeatMs: HEARTBEAT_MS,
+    });
+
+    // Real SystemClock drives the server; the deps clock is the fake above.
+    expect(deps.clock.nowMs()).toBe(1_000_000);
+
+    const workspace = await repo.createWorkspace({
+      id: crypto.randomUUID(),
+      ownerId: "alice",
+      repositoryOwner: "mpppk",
+      repositoryName: "demo",
+      baseBranch: "main",
+      runtimeState: "STOPPED",
+    });
+    await membership.addMember(workspace.id, "alice");
+    const session = await repo.createSession({
+      id: crypto.randomUUID(),
+      workspaceId: workspace.id,
+    });
+
+    const server = Bun.serve({ port: 0, fetch: createFetchHandler(deps) });
+    try {
+      const res = await fetch(
+        `${server.url.origin}/v1/sessions/${session.id}/events`,
+        {
+          headers: {
+            "x-goog-authenticated-user-id": "accounts.google.com:alice",
+            "x-goog-authenticated-user-email": "a@example.com",
+          },
+        },
+      );
+      expect(res.status).toBe(200);
+
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let text = "";
+
+      // Continuous background collector: every resolved read appends to the
+      // buffer, so no chunk is swallowed by an abandoned read race.
+      const collector = (async (): Promise<void> => {
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            text += decoder.decode(value);
+          }
+        } catch {
+          // stream cancelled
+        }
+      })();
+
+      // The fake clock only advances when we advance it, so heartbeats fire
+      // exactly when simulated elapsed time crosses HEARTBEAT_MS boundaries.
+      // 4 x 250ms = 1000ms simulated: pings at 500ms and 1000ms -> exactly 2.
+      for (let i = 0; i < 4; i++) {
+        clock.advance(250);
+        await Bun.sleep(30); // real time for the SSE loop to observe the clock
+      }
+      await Bun.sleep(20);
+      await reader.cancel();
+      await collector;
+
+      // ": stream open" comment is emitted at start; then one heartbeat per
+      // 500ms of simulated time. Four 250ms advances = 1000ms simulated ->
+      // exactly 2 heartbeats (at 500ms and at 1000ms, lastEmitMs resetting
+      // at each ping).
+      const heartbeats = text.split(": ping").length - 1;
+      expect(heartbeats).toBe(2);
+      // The replay/stream-open markers must also be present.
+      expect(text).toContain(": stream open");
+    } finally {
+      server.stop(true);
+    }
   });
 });
