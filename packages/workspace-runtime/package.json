@@ -3,8 +3,12 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Workspace runtime \u2014 state machine & domain types",
+  "description": "Workspace runtime — state machine, idle manager, restore & graceful stop",
   "main": "./src/index.ts",
+  "dependencies": {
+    "@cloud-run-dsh/cloud-run-instance-client": "workspace:*",
+    "@cloud-run-dsh/workspace-checkpoint": "workspace:*"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test src",
