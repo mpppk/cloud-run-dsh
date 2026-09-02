@@ -133,3 +133,98 @@ and watch it appear.
   (`user_message`, `approval`, `checkpoint`, `workspace_operation`).
 
 State is entirely in memory — restarting the server wipes everything.
+
+---
+
+## Docker dev environment
+
+*This section (task B) covers the Docker-based dev environment: Postgres +
+migrations + agent-host DB-backed paths. The section above (task A) covers the
+in-memory control-plane dev server.*
+
+### What works locally
+
+1. **Postgres via docker compose.** `docker compose up -d postgres` starts a
+   pinned `postgres:16.9-alpine` container with a named volume
+   (`dsh-postgres-data`), a `pg_isready` healthcheck, and port `5432`
+   published to localhost. Credentials/dev defaults are `dsh`/`dsh`, database
+   `dsh` — overridable via `POSTGRES_USER` / `POSTGRES_PASSWORD` /
+   `POSTGRES_DB` / `POSTGRES_PORT` env vars (see `.env.example`).
+   - `gen_random_uuid()` (used by the agent-host checkpoint persist path,
+     `apps/agent-host/src/adapters.ts`) is **built into PostgreSQL 13+** as a
+     core function, so the `postgres:16` image supports it with **no extra
+     extension** (`pgcrypto` is not needed).
+2. **Migrations.** `bun run db:migrate` (with `DATABASE_URL` set) runs the
+   existing T4 migration runner (`infra/migrations/runner.ts`) and applies
+   `infra/migrations/*.sql` (e.g. `0001_init.sql`, creating the five T4
+   tables: `workspaces`, `sessions`, `session_events`,
+   `workspace_checkpoints`, `controller_leases`). The runner records applied
+   versions in `schema_migrations` and is idempotent — running it twice is a
+   no-op the second time.
+3. **DB-backed agent-host components against real Postgres.** The Postgres
+   session repository (`packages/session-persistence-postgres` via
+   `createSessionRepository`), the lease store (`BunSqlLeaseStore`), the
+   transactional state store (`SqlTransactionalStateStore`), and the
+   migration runner all run against the compose Postgres using plain SQL over
+   `Bun.SQL` — no GCP/GitHub dependencies involved. (The task-A control-plane
+   dev server above uses in-memory fakes instead; the two local paths are
+   complementary.)
+4. **Verification test.** `tests/integration/migrations-live.test.ts` applies
+   the migrations against a live `DATABASE_URL`, asserts the five T4 tables
+   plus `schema_migrations` exist, and asserts idempotency. It **skips
+   cleanly** when `DATABASE_URL` is unset or unreachable, so `bun test`
+   stays green without Docker.
+
+Typical flow:
+
+```sh
+docker compose up -d postgres          # wait for healthy
+export DATABASE_URL=postgres://dsh:dsh@localhost:5432/dsh
+bun run db:migrate                     # applies 0001_init.sql
+bun test tests/integration/migrations-live.test.ts
+```
+
+### What does NOT work locally
+
+The agent-host is designed for Cloud Run and depends on platform-provided
+primitives that do not exist on a dev machine:
+
+- **Sandbox execution.** The `sandbox` CLI (`SANDBOX_CLI_PATH`, default
+  `/usr/local/gcp/bin/sandbox`) is provided **by Cloud Run** and cannot be
+  installed or faked locally. Do not fabricate a shim and present it as
+  working — the harness would immediately diverge from the platform.
+- **GCS checkpoints.** `FetchGcsClient` + `envGcsTokenProvider` require real
+  Application Default Credentials and a real `CHECKPOINT_BUCKET`.
+- **GitHub App token exchange.** The credential broker needs a real
+  `GITHUB_APP_PRIVATE_KEY_PEM` for the configured `GITHUB_APP_ID`; there is
+  no local stand-in.
+- **Therefore: a full agent-host bootstrap is impossible locally.**
+
+### How far `bun run apps/agent-host/src/index.ts` gets locally
+
+`main()` → `createProductionDependencies()`:
+
+1. **Missing env → immediate exit.** `readAgentHostConfig` requires
+   `WORKSPACE_ID`, `DATABASE_URL`, `CHECKPOINT_BUCKET`,
+   `CHECKPOINT_KEY`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PEM`,
+   `REPOSITORY_OWNER`, `REPOSITORY_NAME`, `BASE_BRANCH`, `CONTROLLER_ID`,
+   `USER_ID`, `INSTANCE_NAME`, `GCP_PROJECT_ID`, `GCP_REGION`. With an empty
+   env it throws `MissingRequiredEnvError` listing the missing keys.
+2. **DB connection.** With `.env.example`-style values (including placeholder
+   markers for the impossible ones), the config parses; `BunSqlQueryExecutor.connect`
+   and `createSessionRepository` connect to the compose Postgres
+   successfully. This is the deepest DB-backed point reachable locally.
+3. **Where it stops.** The composition still constructs the GCS client, the
+   Cloud Run Instance client, and the sandbox runner from env values. The
+   first *actual* failure depends on where those are first used: `host.recover()`
+   reads the workspace from Postgres (works), then the bootstrap/checkpoint
+   paths hit GCS (auth failure) and the lease/broker paths hit GitHub (auth
+   failure), and any sandbox invocation fails because the sandbox CLI binary
+   does not exist locally. In practice the process fails on the first
+   external call after recovery — with `n/a-locally` placeholders it cannot
+   even get a valid bucket/key, so it will not serve meaningful traffic.
+
+In short: locally you can validate everything that touches Postgres
+(schema, repository, leases, state machine) plus the gateway HTTP surface in
+unit tests; you cannot exercise sandbox exec, GCS checkpoints, or GitHub App
+auth — those require a real Cloud Run deployment.

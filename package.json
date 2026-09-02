@@ -10,6 +10,7 @@
   "scripts": {
     "dev:control-plane": "bun apps/control-plane/src/dev.ts",
     "typecheck": "tsc --build",
+    "db:migrate": "bun run infra/migrations/runner.ts",
     "test": "bun test --path-ignore-patterns='**/dist/**'",
     "build": "tsc --build",
     "lint": "tsc --noEmit"

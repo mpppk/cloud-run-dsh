@@ -119,11 +119,14 @@ async function createPgExecutor(databaseUrl: string): Promise<MigrationExecutor 
     };
   } catch {
     // Fallback to Bun's built-in SQL client (Bun.sql) if pg not installed
-    const sql = new (Bun as unknown as { SQL: new (url: string) => unknown }).SQL(databaseUrl) as unknown as {
+    type BunSqlClient = {
       unsafe(q: string, params?: unknown[]): Promise<unknown[]>;
+      begin<T>(fn: (tx: BunSqlClient) => Promise<T>): Promise<T>;
     };
-    // For Bun.sql transactions, we emulate BEGIN/COMMIT via unsafe.
-    const bunWrap = (client: typeof sql): MigrationExecutor => ({
+    const sql = new (Bun as unknown as { SQL: new (url: string) => unknown }).SQL(databaseUrl) as unknown as BunSqlClient;
+    // For Bun.sql transactions we must use sql.begin: Bun rejects manual
+    // BEGIN/COMMIT issued through `unsafe` (ERR_POSTGRES_UNSAFE_TRANSACTION).
+    const bunWrap = (client: BunSqlClient): MigrationExecutor => ({
       async exec(q, params) {
         await client.unsafe(q, params);
       },
@@ -132,20 +135,14 @@ async function createPgExecutor(databaseUrl: string): Promise<MigrationExecutor 
         return rows as Record<string, unknown>[];
       },
       async transaction(fn) {
-        await client.unsafe("BEGIN");
-        try {
-          const result = await fn(bunWrap(client));
-          await client.unsafe("COMMIT");
-          return result;
-        } catch (e) {
-          await client.unsafe("ROLLBACK");
-          throw e;
-        }
+        return client.begin((tx) => fn(bunWrap(tx)));
       },
     });
     return {
       ...bunWrap(sql),
-      async close() {},
+      async close() {
+        await (sql as unknown as { close?(): Promise<void> }).close?.();
+      },
     };
   }
 }
