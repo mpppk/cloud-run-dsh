@@ -7,6 +7,22 @@ const SECRET_PATTERNS: RegExp[] = [
   /ghs_[A-Za-z0-9]{20,}/g,
 ];
 
+/**
+ * Redacts secrets from subprocess output.
+ *
+ * Layers (spec 26 item 12 — secrets must never be logged):
+ *   1. exact string matches from the caller-supplied `secrets` list,
+ *   2. well-known token prefixes (sk-/ghp_/github_pat_/ghs_),
+ *   3. a BROADENED generic pattern for KEY=VALUE assignments whose key is
+ *      named API_KEY, SECRET, TOKEN or PRIVATE_KEY (case-insensitive).
+ *
+ * Bound of the broadening: the generic layer only covers assignments of
+ * keys with those names, up to the next whitespace. Secrets printed in any
+ * other shape (bare values, differently named keys, JSON fields, multi-line)
+ * are NOT guaranteed to be redacted by this layer — callers MUST pass known
+ * secret values via `secrets` for exact-match redaction; treat the generic
+ * layer as defense-in-depth, not a completeness guarantee.
+ */
 export function redactSecrets(
   text: string,
   secrets: readonly string[] = [],

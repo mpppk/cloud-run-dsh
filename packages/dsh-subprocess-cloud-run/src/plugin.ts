@@ -5,6 +5,8 @@ import type { ProcessResult, SpawnOptions } from "./runtime.js";
 export interface SubprocessProvider {
   resolveExecutable(command: string): Promise<string>;
   spawn(spec: SpawnOptions): Promise<ProcessResult>;
+  /** Evicts the per-workspace lock registry entry on teardown. */
+  dispose(): Promise<void>;
 }
 
 export interface PluginOptions {
@@ -23,6 +25,7 @@ export function createCloudRunSubprocessPlugin(opts: PluginOptions): SubprocessP
   return {
     resolveExecutable: (command: string) => resolveExecutable(command, opts.manager),
     spawn: (spec: SpawnOptions) => runtime.spawn(spec),
+    dispose: () => runtime.dispose(),
   };
 }
 

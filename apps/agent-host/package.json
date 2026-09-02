@@ -3,11 +3,22 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Agent Host \u2014 runs inside Cloud Run Instance (skeleton)",
+  "description": "Agent Host — runs inside Cloud Run Instance (composition root, bootstrap, restart recovery)",
   "main": "./src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test src",
     "build": "tsc --build"
+  },
+  "dependencies": {
+    "@cloud-run-dsh/cloud-run-instance-client": "workspace:*",
+    "@cloud-run-dsh/cloud-run-sandbox": "workspace:*",
+    "@cloud-run-dsh/controller-lease": "workspace:*",
+    "@cloud-run-dsh/dsh-subprocess-cloud-run": "workspace:*",
+    "@cloud-run-dsh/github-credential-broker": "workspace:*",
+    "@cloud-run-dsh/observability": "workspace:*",
+    "@cloud-run-dsh/session-persistence-postgres": "workspace:*",
+    "@cloud-run-dsh/workspace-checkpoint": "workspace:*",
+    "@cloud-run-dsh/workspace-runtime": "workspace:*"
   }
 }
