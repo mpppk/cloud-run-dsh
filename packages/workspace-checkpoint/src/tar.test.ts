@@ -104,4 +104,44 @@ describe("ustar tar", () => {
     corrupted[10] ^= 0xff; // flip a byte inside the name field
     expect(() => extractUntrackedTar(corrupted)).toThrow(/checksum/);
   });
+
+  test("accepts GNU-format ustar magic (\"ustar \" + version \" \0\")", () => {
+    // Build a minimal GNU-flavoured ustar header by hand: same layout but
+    // magic "ustar " and version " \0" (what GNU tar writes).
+    const content = new TextEncoder().encode("gnu");
+    const dataBlocks = 512; // one block (padded)
+    const archive = new Uint8Array(512 + dataBlocks + 1024);
+    const header = archive.subarray(0, 512);
+    const enc = (s: string, off: number, len: number) => header.set(new TextEncoder().encode(s).subarray(0, len), off);
+    enc("gnu-file.txt", 0, 100);
+    enc("0000644\0", 100, 8);
+    enc("0000000\0", 108, 8);
+    enc("0000000\0", 116, 8);
+    enc(`0000000000${content.length.toString(8).padStart(3, "0")}`.slice(-11) + "\0", 124, 12);
+    enc("00000000000\0", 136, 12);
+    header.fill(0x20, 148, 156);
+    header[156] = 0x30;
+    enc("ustar ", 257, 6); // GNU magic
+    enc(" \0", 263, 2); // GNU version
+    let sum = 0;
+    for (let i = 0; i < 512; i++) sum += i >= 148 && i < 156 ? 0x20 : header[i]!;
+    const chk = sum.toString(8).padStart(6, "0") + "\0 ";
+    header.set(new TextEncoder().encode(chk), 148);
+    archive.set(content, 512);
+
+    const entries = extractUntrackedTar(archive);
+    expect(entries.length).toBe(1);
+    expect(entries[0]!.path).toBe("gnu-file.txt");
+    expect(new TextDecoder().decode(entries[0]!.content)).toBe("gnu");
+  });
+
+  test("still rejects archives with no ustar magic at all", () => {
+    const junk = new Uint8Array(512 * 3);
+    junk.set(new TextEncoder().encode("X".repeat(100)), 0);
+    // fill a checksum so the magic check is the failing gate
+    let sum = 0;
+    for (let i = 0; i < 512; i++) sum += i >= 148 && i < 156 ? 0x20 : junk[i]!;
+    junk.set(new TextEncoder().encode(sum.toString(8).padStart(6, "0") + "\0 "), 148);
+    expect(() => extractUntrackedTar(junk)).toThrow(/magic/);
+  });
 });

@@ -138,7 +138,8 @@ export function extractUntrackedTar(data: Uint8Array): TarEntry[] {
     const header = data.subarray(offset, offset + BLOCK);
     if (isAllZero(header)) break; // end-of-archive marker
     const magic = new TextDecoder().decode(header.subarray(257, 263));
-    if (magic !== "ustar\0") {
+    // POSIX ustar: "ustar\0" + version "00"; GNU ustar: "ustar " + version " \0".
+    if (magic !== "ustar\0" && magic !== "ustar ") {
       throw new Error("ustar: not a ustar archive (bad magic)");
     }
     const storedChksum = parseOctal(header, 148, 8);

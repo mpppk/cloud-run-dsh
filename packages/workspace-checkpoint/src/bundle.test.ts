@@ -37,6 +37,8 @@ function makeFs(files: Record<string, string>): FileSystem {
     async exists() {
       return true;
     },
+    async unlink() {},
+    async mkdir() {},
   };
 }
 

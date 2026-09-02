@@ -51,6 +51,32 @@ export function resolveWorkspaceEntryPath(workspaceDir: string, entryPath: strin
   return resolved;
 }
 
+/**
+ * Parse `git status --porcelain -uall -z` output.
+ *
+ * -z separates records with NUL, so filenames containing spaces or quotes are
+ * unambiguous, and -uall lists every untracked file individually (never
+ * collapsed to a directory like `?? sub/`).
+ */
+export function parsePorcelainZ(output: string): { index: string; workTree: string; path: string }[] {
+  const records: { index: string; workTree: string; path: string }[] = [];
+  let pos = 0;
+  while (pos < output.length) {
+    const xy = output.slice(pos, pos + 2);
+    if (output[pos + 2] !== " ") {
+      throw new Error(`git status -z parse error: malformed record at offset ${pos}`);
+    }
+    const pathStart = pos + 3;
+    const nul = output.indexOf("\0", pathStart);
+    if (nul === -1) {
+      throw new Error(`git status -z parse error: unterminated record at offset ${pos}`);
+    }
+    records.push({ index: xy[0] ?? "?", workTree: xy[1] ?? "?", path: output.slice(pathStart, nul) });
+    pos = nul + 1;
+  }
+  return records;
+}
+
 export async function restoreWorkspace(opts: RestoreOptions): Promise<void> {
   const { workspaceDir, repoUrl, baseCommit, checkpointKey, storage, git, fs } = opts;
   const tmpDir = opts.tmpDir ?? tmpdir();
@@ -86,7 +112,8 @@ export async function restoreWorkspace(opts: RestoreOptions): Promise<void> {
 
   // 4. Apply patch via git apply --binary, using a temp file OUTSIDE the
   //    workspace so it can never leak into a later checkpoint, and always
-  //    deleted in a finally.
+  //    deleted in a finally. unlink errors are swallowed so they cannot mask
+  //    the original git apply failure.
   if (bundle.patchDiff && bundle.patchDiff.trim().length > 0) {
     const patchPath = posix.join(tmpDir, `workspace-checkpoint-patch-${randomUUID()}.diff`);
     await fs.writeFile(patchPath, new TextEncoder().encode(bundle.patchDiff));
@@ -96,56 +123,70 @@ export async function restoreWorkspace(opts: RestoreOptions): Promise<void> {
         throw new Error(`git apply failed: ${applyResult.stderr}`);
       }
     } finally {
-      await fs.unlink(patchPath);
+      try {
+        await fs.unlink(patchPath);
+      } catch {
+        // swallow: cleanup failure must not mask the real error
+      }
     }
   }
 
-  // 5. Extract untracked tar, rejecting any entry that would escape the workspace
+  // 5. Extract untracked tar. Paths are sanitised FIRST (rejecting absolute,
+  //    `..`-containing, or workspace-escaping entries) and only then is the
+  //    parent directory created, so a malicious entry can never cause a
+  //    directory to be created outside the workspace. mkdir -p handles the
+  //    normal case of an untracked file in a directory absent from the base
+  //    commit.
   if (bundle.untrackedTar.length > 0) {
     const entries = extractUntrackedTar(bundle.untrackedTar);
     for (const entry of entries) {
       const fullPath = resolveWorkspaceEntryPath(workspaceDir, entry.path);
+      const parentDir = posix.dirname(fullPath);
+      if (parentDir && parentDir !== fullPath) {
+        await fs.mkdir(parentDir);
+      }
       await fs.writeFile(fullPath, entry.content);
     }
   }
 
-  // 6. Validate git status against manifest
-  const statusResult = await git.run(["status", "--porcelain"], { cwd: workspaceDir });
+  // 6. Validate git status against manifest. -uall lists untracked files
+  //    individually (no directory collapse) and -z makes filenames with
+  //    spaces/quotes unambiguous.
+  const statusResult = await git.run(["status", "--porcelain", "-uall", "-z"], { cwd: workspaceDir });
   if (statusResult.exitCode !== 0) {
     throw new RestoreValidationError(`git status validation failed: ${statusResult.stderr}`, {
       manifest: bundle.manifest,
     });
   }
-  const statusOutput = statusResult.stdout.trim();
+  const records = parsePorcelainZ(statusResult.stdout);
   const hasPatch = bundle.patchDiff.trim().length > 0;
   const hasUntracked = bundle.untrackedFiles.length > 0;
   const expectsDirty = hasPatch || hasUntracked;
-  const isDirty = statusOutput.length > 0;
+  const isDirty = records.length > 0;
 
   // If manifest says dirty but status is clean, or vice versa, validation fails
   if (expectsDirty && !isDirty) {
     throw new RestoreValidationError("restore validation failed: expected dirty workspace but git status is clean", {
       manifest: bundle.manifest,
-      status: statusOutput,
+      status: records.map((r) => r.path),
     });
   }
   if (!expectsDirty && isDirty) {
     throw new RestoreValidationError("restore validation failed: expected clean workspace but git status shows changes", {
       manifest: bundle.manifest,
-      status: statusOutput,
+      status: records.map((r) => r.path),
     });
   }
 
-  // 7. Cross-check porcelain untracked entries against manifest.untrackedFiles
-  const porcelainUntracked = statusOutput
-    .split("\n")
-    .filter((line) => line.startsWith("?? "))
-    .map((line) => line.slice(3).trim())
-    .filter((p) => p.length > 0);
-  const expected = new Set(bundle.untrackedFiles);
-  const actual = new Set(porcelainUntracked);
-  const extra = [...actual].filter((p) => !expected.has(p));
-  const missing = [...expected].filter((p) => !actual.has(p));
+  // 7. Cross-check untracked entries against manifest.untrackedFiles.
+  //    Paths introduced by the applied patch (files that were staged at
+  //    checkpoint time are captured by `git diff --binary HEAD` but absent
+  //    from `git ls-files --others`) are EXPECTED and do not count as extras.
+  const patchUntracked = hasPatch ? extractPatchNewFiles(bundle.patchDiff) : [];
+  const allowed = new Set<string>([...bundle.untrackedFiles, ...patchUntracked]);
+  const actualUntracked = records.filter((r) => r.index === "?" && r.workTree === "?").map((r) => r.path);
+  const extra = [...new Set(actualUntracked)].filter((p) => !allowed.has(p));
+  const missing = [...new Set(bundle.untrackedFiles)].filter((p) => !actualUntracked.includes(p));
   if (extra.length > 0 || missing.length > 0) {
     throw new RestoreValidationError(
       "restore validation failed: untracked files in git status do not match manifest.untrackedFiles",
@@ -169,4 +210,40 @@ export async function restoreWorkspace(opts: RestoreOptions): Promise<void> {
       }
     }
   }
+}
+
+/**
+ * Extract candidate paths of NEW files created by a unified diff (files staged
+ * at checkpoint time show up in `git diff --binary HEAD` as new-file diffs but
+ * not in `git ls-files --others`).
+ *
+ * git normally prefixes paths with `b/` (and `a/` on the minus side), but the
+ * first component is ambiguous for a repo path that genuinely starts with
+ * `b/`, so both the raw path and the path with its first component stripped
+ * are returned as candidates; the cross-check set simply allows both.
+ */
+export function extractPatchNewFiles(patchDiff: string): string[] {
+  const candidates = new Set<string>();
+  for (const line of patchDiff.split("\n")) {
+    if (!line.startsWith("+++ ")) continue;
+    const raw = line.slice(4).trim();
+    if (raw === "/dev/null") continue;
+    let path = raw;
+    // git C-quotes paths containing special characters ("my file.txt")
+    if (path.startsWith('"') && path.endsWith('"')) {
+      try {
+        path = JSON.parse(path) as string;
+      } catch {
+        path = path.slice(1, -1);
+      }
+    }
+    path = path.replace(/^\//, "");
+    if (path.length === 0) continue;
+    candidates.add(path);
+    const slash = path.indexOf("/");
+    if (slash !== -1 && slash < path.length - 1) {
+      candidates.add(path.slice(slash + 1));
+    }
+  }
+  return [...candidates];
 }

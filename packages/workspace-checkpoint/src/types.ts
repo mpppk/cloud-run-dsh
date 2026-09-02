@@ -33,6 +33,8 @@ export interface FileSystem {
   writeFile(path: string, data: Uint8Array): Promise<void>;
   exists(path: string): Promise<boolean>;
   unlink(path: string): Promise<void>;
+  /** Creates the directory and any missing parents (mkdir -p). */
+  mkdir(path: string): Promise<void>;
 }
 
 export class SystemClock implements Clock {
