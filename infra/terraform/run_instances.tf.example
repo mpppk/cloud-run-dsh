@@ -1,0 +1,17 @@
+# TODO(cloud-run-instances): Cloud Run Instances are Pre-GA and have no
+# stable Terraform resource in hashicorp/google or google-beta as of 2026-09-02.
+#
+# Do NOT fake this with google_cloud_run_v2_service. The control plane's
+# InstanceRuntime adapter (packages/cloud-run-instance-client) calls the
+# REST API directly:
+#   POST /v1/projects/{project}/locations/{region}/instances
+#   POST /v1/projects/{project}/locations/{region}/instances/{id}:start
+#   POST /v1/projects/{project}/locations/{region}/instances/{id}:stop
+#
+# When a resource ships (e.g. google_cloud_run_instance or
+# google_cloud_run_v2_instance), rename this file to run_instances.tf and
+# implement the instance definition. Baseline config per spec §22:
+#   cpu: 4, memory: 8Gi, restartPolicy: ON_FAILURE, sandboxLauncher: true
+#
+# Track provider issues at:
+#   https://github.com/hashicorp/terraform-provider-google/issues
