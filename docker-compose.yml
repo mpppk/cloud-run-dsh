@@ -1,0 +1,32 @@
+# Local data-plane dependencies for cloud-run-dsh (task B: Docker dev environment).
+#
+# Usage:
+#   docker compose up -d postgres
+#   DATABASE_URL=postgres://dsh:dsh@localhost:5432/dsh bun run db:migrate
+#
+# Only the Postgres dependency lives here. The agent-host itself is NOT
+# containerized locally: it requires the Cloud Run-provided sandbox CLI and
+# real GCS/GitHub credentials (see docs/local-development.md).
+
+services:
+  postgres:
+    image: postgres:16.9-alpine
+    container_name: dsh-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-dsh}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dsh}
+      POSTGRES_DB: ${POSTGRES_DB:-dsh}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - dsh-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dsh} -d ${POSTGRES_DB:-dsh}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  dsh-postgres-data:
