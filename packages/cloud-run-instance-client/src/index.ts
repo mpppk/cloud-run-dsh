@@ -208,10 +208,9 @@ export class CloudRunInstanceClient implements InstanceRuntime {
   }
 
   async create(workspace: Workspace): Promise<InstanceInfo> {
-    this.assertValidRestartPolicy();
-
+    const instanceName = workspace.instanceName ?? `dsh-${workspace.id}`;
     const url = `${this.basePath}/instances`;
-    const body = this.buildCreateBody(workspace);
+    const body = this.buildCreateBody(workspace, instanceName);
 
     const res = await this.transport.request({
       method: "POST",
@@ -220,7 +219,7 @@ export class CloudRunInstanceClient implements InstanceRuntime {
       body,
     });
 
-    this.handleErrorStatus(res, workspace.id);
+    this.handleErrorStatus(res, instanceName);
 
     return this.parseInstanceInfo(res.body);
   }
@@ -266,16 +265,12 @@ export class CloudRunInstanceClient implements InstanceRuntime {
     this.handleErrorStatus(res, instanceName);
   }
 
-  private assertValidRestartPolicy(): void {
-    // Spec section 23: `always` has a known Preview issue — must be rejected.
-    if (this.config.restartPolicy === "always") {
-      throw new InvalidRestartPolicyError(this.config.restartPolicy);
-    }
-  }
-
-  private buildCreateBody(workspace: Workspace): Record<string, unknown> {
+  private buildCreateBody(
+    workspace: Workspace,
+    instanceName: string,
+  ): Record<string, unknown> {
     return {
-      name: workspace.instanceName ?? `dsh-${workspace.id}`,
+      name: instanceName,
       workspaceId: workspace.id,
       resources: {
         cpu: this.config.cpu,

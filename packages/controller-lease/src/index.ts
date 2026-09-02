@@ -73,7 +73,69 @@ export interface LeaseTransaction {
 }
 
 export interface LeaseStore {
+  /**
+   * Runs `fn` inside a transaction.
+   *
+   * Isolation contract: the implementation MUST serialise concurrent
+   * transactions — reads inside `fn` must observe a consistent snapshot and
+   * its writes must not be lost against concurrent transactions. A real SQL
+   * store can satisfy this with `SERIALIZABLE` isolation, or with
+   * `SELECT ... FOR UPDATE` row locks under READ COMMITTED.
+   *
+   * Note: `acquire` and `heartbeat` do NOT depend on this contract — they use
+   * the single-statement conditional primitives `upsertIfExpired` /
+   * `extendIfOwner`, which are safe even under READ COMMITTED. Only flows
+   * that intentionally do read-then-write inside `fn` (takeover, release)
+   * rely on the serialisation guaranteed here.
+   */
   transaction<T>(fn: (tx: LeaseTransaction) => Promise<T>): Promise<T>;
+
+  /**
+   * Atomic conditional upsert (single-statement CAS for acquire).
+   *
+   * Inserts `record`, or replaces the existing row for
+   * `record.workspaceId` when that row has already expired as of `now`
+   * (`existing.expiresAt <= now`). Expresses the condition in a single
+   * operation — the shape a real store implements as:
+   *
+   *   INSERT ... ON CONFLICT (workspace_id) DO UPDATE SET ...
+   *   WHERE controller_leases.expires_at <= $now
+   *
+   * Returns the stored row on success (fresh insert or expiry-replace), or
+   * `null` when an unexpired lease is still held. Implementations MUST map
+   * driver-level conflict errors (e.g. a unique violation surfacing from a
+   * concurrent insert) to the `null` return — a raw driver error must never
+   * escape to callers; callers map `null` to `LeaseAlreadyHeldError`.
+   */
+  upsertIfExpired(
+    record: ControllerLeaseRecord,
+    now: Date,
+  ): Promise<ControllerLeaseRecord | null>;
+
+  /**
+   * Atomic conditional extend (single-statement CAS for heartbeat).
+   *
+   * Extends the lease for `workspaceId` to expire at `extendTo` (with
+   * `updatedAt = now`) only when it is currently owned by `controllerId` and
+   * still unexpired as of `now`. Expresses the condition in a single
+   * operation — the shape a real store implements as:
+   *
+   *   UPDATE controller_leases
+   *   SET expires_at = $extendTo, updated_at = $now
+   *   WHERE workspace_id = $workspaceId
+   *     AND controller_id = $controllerId
+   *     AND expires_at > $now
+   *
+   * Returns the updated row, or `null` when the CAS failed (lease missing,
+   * owned by another controller, or expired). A failed CAS MUST NOT write
+   * anything; callers map `null` to the typed heartbeat errors.
+   */
+  extendIfOwner(
+    workspaceId: string,
+    controllerId: string,
+    extendTo: Date,
+    now: Date,
+  ): Promise<ControllerLeaseRecord | null>;
 }
 
 export interface Clock {
@@ -101,68 +163,81 @@ export class ControllerLeaseService {
   /**
    * Acquire a lease for a workspace.
    *
-   * Atomically executes `INSERT ... ON CONFLICT ...` guarded by an expiry
-   * condition inside a transaction: it succeeds only when no lease exists or
-   * the existing lease has expired (expiresAt <= now).
+   * Delegates to the single-statement CAS `upsertIfExpired` (`INSERT ... ON
+   * CONFLICT ... WHERE expires_at <= now`): it succeeds only when no lease
+   * exists or the existing lease has expired (expiresAt <= now). A lost CAS
+   * (an unexpired lease is held) is mapped to `LeaseAlreadyHeldError` — no
+   * raw driver error escapes.
    */
   async acquire(
     workspaceId: string,
     controllerId: string,
     userId: string,
   ): Promise<ControllerLease> {
-    return this.store.transaction(async (tx) => {
-      const existing = await tx.findByWorkspaceId(workspaceId);
-      const now = this.clock.now();
+    const now = this.clock.now();
 
-      if (existing && existing.expiresAt > now) {
-        throw new LeaseAlreadyHeldError(workspaceId, existing.controllerId);
-      }
+    const record: ControllerLeaseRecord = {
+      workspaceId,
+      controllerId,
+      userId,
+      expiresAt: new Date(now.getTime() + LEASE_EXPIRY_MS),
+      updatedAt: now,
+    };
 
-      const lease: ControllerLeaseRecord = {
+    const stored = await this.store.upsertIfExpired(record, now);
+    if (!stored) {
+      const holder = await this.store.transaction((tx) =>
+        tx.findByWorkspaceId(workspaceId),
+      );
+      throw new LeaseAlreadyHeldError(
         workspaceId,
-        controllerId,
-        userId,
-        expiresAt: new Date(now.getTime() + LEASE_EXPIRY_MS),
-        updatedAt: now,
-      };
+        holder?.controllerId ?? "unknown",
+      );
+    }
 
-      if (existing) {
-        await tx.update(lease);
-      } else {
-        await tx.insert(lease);
-      }
-
-      return toLease(lease);
-    });
+    return toLease(stored);
   }
 
   /**
    * Extend the lease expiry for the owning controller.
-   * Rejected if the caller is not the current owner or the lease has expired.
+   *
+   * Delegates to the single-statement CAS `extendIfOwner`
+   * (`UPDATE ... WHERE controller_id = $1 AND expires_at > now`): the extend
+   * is applied only if the caller still owns an unexpired lease at execution
+   * time. A failed CAS never writes, so a stale heartbeat issued after a
+   * takeover cannot overwrite the committed lease or resurrect the demoted
+   * controller; the failure is classified into the typed errors below.
    */
   async heartbeat(workspaceId: string, controllerId: string): Promise<ControllerLease> {
-    return this.store.transaction(async (tx) => {
-      const existing = await tx.findByWorkspaceId(workspaceId);
-      const now = this.clock.now();
+    const now = this.clock.now();
+    const extendTo = new Date(now.getTime() + LEASE_EXPIRY_MS);
 
-      if (!existing) {
-        throw new LeaseNotFoundError(workspaceId);
-      }
-      if (existing.controllerId !== controllerId) {
-        throw new NotLeaseOwnerError(workspaceId, controllerId);
-      }
-      if (existing.expiresAt <= now) {
-        throw new LeaseExpiredError(workspaceId);
-      }
-
-      const updated: ControllerLeaseRecord = {
-        ...existing,
-        expiresAt: new Date(now.getTime() + LEASE_EXPIRY_MS),
-        updatedAt: now,
-      };
-      await tx.update(updated);
+    const updated = await this.store.extendIfOwner(
+      workspaceId,
+      controllerId,
+      extendTo,
+      now,
+    );
+    if (updated) {
       return toLease(updated);
-    });
+    }
+
+    // CAS failed — classify for the typed error only (no write has occurred).
+    const existing = await this.store.transaction((tx) =>
+      tx.findByWorkspaceId(workspaceId),
+    );
+    if (!existing) {
+      throw new LeaseNotFoundError(workspaceId);
+    }
+    if (existing.controllerId !== controllerId) {
+      throw new NotLeaseOwnerError(workspaceId, controllerId);
+    }
+    if (existing.expiresAt <= now) {
+      throw new LeaseExpiredError(workspaceId);
+    }
+    // The CAS failed but the row now looks extendable: the row changed
+    // between the CAS and this read. Fence with NotLeaseOwnerError.
+    throw new NotLeaseOwnerError(workspaceId, controllerId);
   }
 
   async release(workspaceId: string, controllerId: string): Promise<void> {
@@ -314,6 +389,54 @@ export class InMemoryLeaseStore implements LeaseStore {
       // Rollback to snapshot
       this.data = snapshot;
       throw e;
+    } finally {
+      release();
+    }
+  }
+
+  async upsertIfExpired(
+    record: ControllerLeaseRecord,
+    now: Date,
+  ): Promise<ControllerLeaseRecord | null> {
+    const release = await this.mutex.acquire();
+    try {
+      const existing = this.data.get(record.workspaceId);
+      // CAS lost: an unexpired lease is still held (expiresAt == now counts as expired).
+      if (existing && existing.expiresAt > now) {
+        return null;
+      }
+      const stored = { ...record };
+      this.data.set(record.workspaceId, stored);
+      return { ...stored };
+    } finally {
+      release();
+    }
+  }
+
+  async extendIfOwner(
+    workspaceId: string,
+    controllerId: string,
+    extendTo: Date,
+    now: Date,
+  ): Promise<ControllerLeaseRecord | null> {
+    const release = await this.mutex.acquire();
+    try {
+      const existing = this.data.get(workspaceId);
+      // CAS lost: missing, not the owner, or already expired — no write.
+      if (
+        !existing ||
+        existing.controllerId !== controllerId ||
+        existing.expiresAt <= now
+      ) {
+        return null;
+      }
+      const updated: ControllerLeaseRecord = {
+        ...existing,
+        expiresAt: new Date(extendTo),
+        updatedAt: new Date(now),
+      };
+      this.data.set(workspaceId, updated);
+      return { ...updated };
     } finally {
       release();
     }

@@ -212,6 +212,32 @@ describe("cloud-run-instance-client error mapping", () => {
     await expect(client.create({ id: "ws-1" })).rejects.toBeInstanceOf(InstanceAlreadyExistsError);
   });
 
+  test("create 409 error message reports the instance name, not the workspace id", async () => {
+    const transport = new FakeTransport(async () => ({ status: 409, body: { message: "already exists" } }));
+    const client = new CloudRunInstanceClient({ transport, basePath });
+    const err = await client.create({ id: "ws-1" }).catch((e) => e);
+    expect(err).toBeInstanceOf(InstanceAlreadyExistsError);
+    expect((err as Error).message).toContain("dsh-ws-1");
+    expect((err as Error).message).not.toBe("instance already exists: ws-1");
+  });
+
+  test("create 409 error message reports an explicit instanceName when provided", async () => {
+    const transport = new FakeTransport(async () => ({ status: 409, body: { message: "already exists" } }));
+    const client = new CloudRunInstanceClient({ transport, basePath });
+    const err = await client.create({ id: "ws-1", instanceName: "my-instance" }).catch((e) => e);
+    expect(err).toBeInstanceOf(InstanceAlreadyExistsError);
+    expect((err as Error).message).toContain("my-instance");
+    expect((err as Error).message).not.toContain("ws-1");
+  });
+
+  test("create 404 error message reports the instance name, not the workspace id", async () => {
+    const transport = new FakeTransport(async () => ({ status: 404, body: {} }));
+    const client = new CloudRunInstanceClient({ transport, basePath });
+    const err = await client.create({ id: "ws-1" }).catch((e) => e);
+    expect(err).toBeInstanceOf(InstanceNotFoundError);
+    expect((err as Error).message).toContain("dsh-ws-1");
+  });
+
   test("403 maps to PermissionDeniedError", async () => {
     const transport = new FakeTransport(async () => ({ status: 403, body: { message: "permission denied" } }));
     const client = new CloudRunInstanceClient({ transport, basePath });
