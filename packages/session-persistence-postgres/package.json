@@ -1,0 +1,13 @@
+{
+  "name": "@cloud-run-dsh/session-persistence-postgres",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Session persistence via Cloud SQL PostgreSQL (skeleton)",
+  "main": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "build": "tsc --build"
+  }
+}

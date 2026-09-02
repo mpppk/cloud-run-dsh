@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "noEmit": true,
+    "allowImportingTsExtensions": false
+  },
+  "files": [],
+  "references": [
+    { "path": "apps/control-plane" },
+    { "path": "apps/agent-host" },
+    { "path": "packages/cloud-run-instance-client" },
+    { "path": "packages/cloud-run-sandbox" },
+    { "path": "packages/dsh-subprocess-cloud-run" },
+    { "path": "packages/workspace-runtime" },
+    { "path": "packages/workspace-checkpoint" },
+    { "path": "packages/session-persistence-postgres" },
+    { "path": "packages/github-credential-broker" },
+    { "path": "packages/controller-lease" },
+    { "path": "packages/observability" }
+  ]
+}

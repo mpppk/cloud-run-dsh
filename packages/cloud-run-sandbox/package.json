@@ -1,0 +1,13 @@
+{
+  "name": "@cloud-run-dsh/cloud-run-sandbox",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloud Run Sandbox manager \u2014 named Sandbox per workspace",
+  "main": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "build": "tsc --build"
+  }
+}

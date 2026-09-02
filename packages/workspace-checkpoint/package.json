@@ -1,0 +1,13 @@
+{
+  "name": "@cloud-run-dsh/workspace-checkpoint",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Workspace checkpoint \u2014 GCS bundle (skeleton)",
+  "main": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "build": "tsc --build"
+  }
+}
