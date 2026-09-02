@@ -1,5 +1,6 @@
 import type { WorkspaceRuntimeState } from "./state.js";
 import { IllegalTransitionError } from "./state.js";
+import { SystemClock, type Clock } from "@cloud-run-dsh/workspace-checkpoint";
 
 /**
  * Record persisted atomically together with every state transition
@@ -47,15 +48,22 @@ export interface TransactionalStateStore {
  * In-memory implementation of TransactionalStateStore. Transitions are
  * serialized per workspace and illegal transitions are rejected against the
  * CURRENT persisted state (not the caller's optimistic snapshot), mirroring
- * the concurrency semantics of a real SQL transaction.
+ * the concurrency semantics of a real SQL transaction. Persisted writes are
+ * buffered per transaction and appended only on commit, so an aborted
+ * transaction leaves nothing behind (SQL rollback semantics).
  */
 export class InMemoryTransactionalStore implements TransactionalStateStore {
   private readonly states = new Map<string, WorkspaceRuntimeState>();
   private readonly history: TransitionRecord[] = [];
   private readonly persisted: Array<{ record: TransitionRecord; data: unknown }> = [];
   private readonly locks = new Map<string, Promise<void>>();
+  private readonly clock: Clock;
 
-  constructor(initial?: Record<string, WorkspaceRuntimeState>) {
+  constructor(
+    initial?: Record<string, WorkspaceRuntimeState>,
+    clock: Clock = new SystemClock(),
+  ) {
+    this.clock = clock;
     if (initial) {
       for (const [id, state] of Object.entries(initial)) this.states.set(id, state);
     }
@@ -91,18 +99,23 @@ export class InMemoryTransactionalStore implements TransactionalStateStore {
         workspaceId,
         from,
         to,
-        at: new Date(),
+        at: this.clock.now(),
         reason,
       };
+      // Buffer persist writes per transaction; they are appended to the log
+      // only when the transaction commits, so a throwing persist callback
+      // leaves nothing behind (rollback semantics).
+      const pendingWrites: Array<{ record: TransitionRecord; data: unknown }> = [];
       const tx: WorkspaceStateTransaction = {
         record,
         persist: async (data) => {
-          this.persisted.push({ record, data });
+          pendingWrites.push({ record, data });
         },
       };
       if (persist) await persist(tx);
       this.states.set(workspaceId, to);
       this.history.push(record);
+      for (const write of pendingWrites) this.persisted.push(write);
     } finally {
       release();
     }

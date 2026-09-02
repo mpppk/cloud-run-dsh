@@ -2,6 +2,17 @@ import { describe, test, expect } from "bun:test";
 import type { WorkspaceStateTransaction } from "./store.js";
 import { InMemoryTransactionalStore } from "./store.js";
 import { IllegalTransitionError } from "./state.js";
+import type { Clock } from "@cloud-run-dsh/workspace-checkpoint";
+
+class FixedClock implements Clock {
+  constructor(private readonly date: Date) {}
+  now(): Date {
+    return this.date;
+  }
+  nowMs(): number {
+    return this.date.getTime();
+  }
+}
 
 describe("InMemoryTransactionalStore", () => {
   test("load returns null for unknown workspace", async () => {
@@ -41,7 +52,9 @@ describe("InMemoryTransactionalStore", () => {
 
     let caught: unknown = null;
     try {
-      await store.apply("ws-1", "STARTING", "RESTORING", "healthy", async () => {
+      await store.apply("ws-1", "STARTING", "RESTORING", "healthy", async (tx) => {
+        // data written before the failure must NOT survive the abort
+        tx.persist({ x: 1 });
         throw new Error("db write failed");
       });
     } catch (e) {
@@ -52,6 +65,35 @@ describe("InMemoryTransactionalStore", () => {
     expect(await store.load("ws-1")).toBe("STARTING");
     expect(store.getHistory()).toHaveLength(1);
     expect(store.getPersisted()).toHaveLength(0);
+  });
+
+  test("nothing is persisted from an aborted transaction (rollback semantics)", async () => {
+    const store = new InMemoryTransactionalStore();
+    await store.apply("ws-1", "STOPPED", "STARTING", "open");
+    try {
+      await store.apply("ws-1", "STARTING", "RESTORING", "healthy", async (tx) => {
+        await tx.persist({ payload: "doomed" });
+        throw new Error("abort");
+      });
+    } catch {
+      // expected
+    }
+    expect(store.getPersisted()).toHaveLength(0);
+    // the committed transaction's data is still there and intact
+    await store.apply("ws-1", "STARTING", "RESTORING", "healthy", async (tx) => {
+      await tx.persist({ payload: "committed" });
+    });
+    expect(store.getPersisted()).toHaveLength(1);
+    expect(store.getPersisted()[0]!.data).toEqual({ payload: "committed" });
+  });
+
+  test("TransitionRecord.at comes from the injected clock (deterministic timestamps)", async () => {
+    const fixed = new Date("2026-01-01T12:00:00.000Z");
+    const store = new InMemoryTransactionalStore(undefined, new FixedClock(fixed));
+    await store.apply("ws-1", "STOPPED", "STARTING", "open");
+    const record = store.getHistory()[0]!;
+    expect(record.at).toEqual(fixed);
+    expect(record.at.getTime()).toBe(fixed.getTime());
   });
 
   test("apply against a mismatched current state throws IllegalTransitionError", async () => {

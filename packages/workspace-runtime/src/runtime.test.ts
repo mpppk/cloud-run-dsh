@@ -270,14 +270,77 @@ describe("WorkspaceRuntime — graceful stop (実装手順書 section 29)", () =
     ]);
   });
 
-  test("stop from BUSY is allowed", async () => {
+  test("stop from BUSY drains the in-flight agent turn before checkpointing", async () => {
+    const h = makeHarness();
+    await h.runtime.open();
+    h.instance.calls = [];
+    h.steps.calls = [];
+    h.store.clearHistory();
+    await h.runtime.beginAgentTurn();
+
+    const stopPromise = h.runtime.stop();
+    await new Promise((r) => setTimeout(r, 5));
+    expect(h.runtime.getState()).toBe("STOPPING");
+    // the lifecycle checkpoint must NOT run while the turn is in flight
+    expect(h.steps.calls).not.toContain("runLifecycleCheckpoint");
+
+    // the in-flight turn completes cleanly during STOPPING
+    await h.runtime.endAgentTurn();
+    const state = await stopPromise;
+
+    expect(state).toBe("STOPPED");
+    expect(h.runtime.pendingOperationCount()).toBe(0);
+    expect(h.steps.calls).toContain("runLifecycleCheckpoint");
+    expect(h.instance.calls).toEqual(["stop:dsh-ws-1"]);
+    expect(h.idle.isAgentRunning()).toBe(false);
+    expect(h.store.getHistory().map((r) => `${r.from}->${r.to}`)).toEqual([
+      "READY->BUSY",
+      "BUSY->STOPPING",
+      "STOPPING->STOPPED",
+    ]);
+  });
+
+  test("new operations started during STOPPING are refused", async () => {
     const h = makeHarness();
     await h.runtime.open();
     await h.runtime.beginAgentTurn();
+    const stopPromise = h.runtime.stop();
+    await new Promise((r) => setTimeout(r, 5));
+    expect(h.runtime.getState()).toBe("STOPPING");
+
+    await expect(h.runtime.beginAgentTurn()).rejects.toThrow(AgentInputRefusedError);
+    await expect(h.runtime.runSubprocess(async () => "x")).rejects.toThrow(AgentInputRefusedError);
+    await expect(h.runtime.runToolInvocation(async () => "x")).rejects.toThrow(AgentInputRefusedError);
+    await expect(h.runtime.runCheckpoint(async () => "x")).rejects.toThrow(AgentInputRefusedError);
+
+    // refused work leaves no tracked operations behind
+    expect(h.runtime.pendingOperationCount()).toBe(1); // only the agent turn
     await h.runtime.endAgentTurn();
+    await stopPromise;
+    expect(h.runtime.getState()).toBe("STOPPED");
+    expect(h.idle.isSubprocessRunning()).toBe(false);
+    expect(h.idle.isCheckpointRunning()).toBe(false);
+  });
+
+  test("endAgentTurn succeeds during STOPPING without changing the state", async () => {
+    const h = makeHarness();
+    await h.runtime.open();
     await h.runtime.beginAgentTurn();
-    const state = await h.runtime.stop();
-    expect(state).toBe("STOPPED");
+    const stopPromise = h.runtime.stop();
+    await new Promise((r) => setTimeout(r, 5));
+    await h.runtime.endAgentTurn();
+    expect(h.runtime.getState()).toBe("STOPPING");
+    await stopPromise;
+    expect(h.runtime.getState()).toBe("STOPPED");
+  });
+
+  test("endAgentTurn without an active turn is refused", async () => {
+    const h = makeHarness();
+    await h.runtime.open();
+    await expect(h.runtime.endAgentTurn()).rejects.toThrow(InvalidOperationError);
+    await h.runtime.beginAgentTurn();
+    await h.runtime.endAgentTurn();
+    await expect(h.runtime.endAgentTurn()).rejects.toThrow(InvalidOperationError);
   });
 
   test("new agent turns are rejected during STOPPING", async () => {
@@ -297,6 +360,8 @@ describe("WorkspaceRuntime — graceful stop (実装手順書 section 29)", () =
     expect(h.steps.calls).not.toContain("runLifecycleCheckpoint");
     gate.resolve();
     await opPromise;
+    // the agent turn itself is also drained before the checkpoint completes
+    await h.runtime.endAgentTurn();
     await stopPromise;
     expect(h.steps.calls).toContain("runLifecycleCheckpoint");
     expect(h.runtime.getState()).toBe("STOPPED");

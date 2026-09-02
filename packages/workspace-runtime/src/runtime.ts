@@ -72,15 +72,25 @@ export class OperationTracker {
 
   /** Runs `fn` as a tracked operation. */
   async run<T>(fn: () => Promise<T>): Promise<T> {
-    this.pending++;
+    this.begin();
     try {
       return await fn();
     } finally {
-      this.pending--;
-      if (this.pending === 0) {
-        const waiters = this.waiters.splice(0);
-        for (const w of waiters) w();
-      }
+      this.end();
+    }
+  }
+
+  /** Manually opens a tracked operation (e.g. an in-flight agent turn). */
+  begin(): void {
+    this.pending++;
+  }
+
+  /** Manually closes a tracked operation opened with begin(); resolves waiters at zero. */
+  end(): void {
+    this.pending--;
+    if (this.pending === 0) {
+      const waiters = this.waiters.splice(0);
+      for (const w of waiters) w();
     }
   }
 
@@ -103,6 +113,7 @@ export class WorkspaceRuntime {
   private stopPromise: Promise<WorkspaceRuntimeState> | null = null;
   private lastError: unknown = null;
   private idleTimer: ReturnType<typeof setInterval> | null = null;
+  private agentTurnActive = false;
 
   constructor(private readonly deps: WorkspaceRuntimeDeps) {
     this.machine = new WorkspaceStateMachine(deps.workspaceId, deps.store);
@@ -203,28 +214,45 @@ export class WorkspaceRuntime {
       throw new InvalidOperationError("beginAgentTurn", this.machine.getState());
     }
     await this.machine.transition("BUSY", "agent-turn-start");
+    // The turn is a tracked operation so a concurrent stop() drains it
+    // before running the lifecycle checkpoint (実装手順書 section 29).
+    this.agentTurnActive = true;
+    this.operations.begin();
     this.deps.idle.setAgentRunning(true);
     this.deps.idle.recordActivity("agent_turn");
   }
 
-  /** BUSY -> READY. */
+  /**
+   * BUSY -> READY. Also succeeds while STOPPING, where it is exactly the
+   * drain completing (実装手順書 section 29); no state transition is made
+   * because STOPPING has no edge back to READY.
+   */
   async endAgentTurn(): Promise<void> {
-    if (this.machine.getState() !== "BUSY") {
+    if (!this.agentTurnActive) {
       throw new InvalidOperationError("endAgentTurn", this.machine.getState());
     }
-    await this.machine.transition("READY", "agent-turn-complete");
+    const state = this.machine.getState();
+    if (state === "BUSY") {
+      await this.machine.transition("READY", "agent-turn-complete");
+    } else if (state !== "STOPPING") {
+      throw new InvalidOperationError("endAgentTurn", state);
+    }
+    this.agentTurnActive = false;
+    this.operations.end();
     this.deps.idle.setAgentRunning(false);
     this.deps.idle.recordActivity("agent_turn");
   }
 
   /** Runs an agent-driven tool invocation as a meaningful, tracked operation. */
   async runToolInvocation<T>(fn: () => Promise<T>): Promise<T> {
+    this.assertAgentInputAllowed();
     this.deps.idle.recordActivity("tool_invocation");
     return this.operations.run(fn);
   }
 
   /** Runs a subprocess as a meaningful, tracked operation. */
   async runSubprocess<T>(fn: () => Promise<T>): Promise<T> {
+    this.assertAgentInputAllowed();
     this.deps.idle.recordActivity("subprocess");
     this.deps.idle.setSubprocessRunning(true);
     try {
@@ -236,6 +264,7 @@ export class WorkspaceRuntime {
 
   /** Runs a checkpoint as a meaningful, tracked operation. */
   async runCheckpoint<T>(fn: () => Promise<T>): Promise<T> {
+    this.assertAgentInputAllowed();
     this.deps.idle.setCheckpointRunning(true);
     try {
       const result = await this.operations.run(fn);
@@ -272,7 +301,11 @@ export class WorkspaceRuntime {
     }
 
     await this.machine.transition("STOPPING", "graceful-stop");
-    // new agent turns are now refused (STOPPING is not agent-input-allowed)
+    // New agent turns and new agent-driven operations (tool invocation,
+    // subprocess, checkpoint) are now refused: STOPPING is not an
+    // agent-input-allowed state. In-flight work — including an active agent
+    // turn registered by beginAgentTurn — is drained here BEFORE the
+    // lifecycle checkpoint (実装手順書 section 29).
     await this.operations.waitAll();
 
     try {
@@ -282,6 +315,14 @@ export class WorkspaceRuntime {
       this.lastError = e;
       // 実装手順書 section 29: checkpoint failure -> CHECKPOINT_FAILED,
       // Cloud Run stop must NOT be called.
+      //
+      // Recovery decision: we deliberately do NOT auto-recover to READY here.
+      // Agent input stays refused after an aborted stop because the drain was
+      // interrupted mid-way (sandbox still exists, session flush state is
+      // unknown), so the only supported recovery is a full, clean re-open via
+      // open() (CHECKPOINT_FAILED -> STARTING is a legal transition). The
+      // CHECKPOINT_FAILED -> READY table edge exists for future deliberate
+      // recovery wiring but is intentionally not exposed on the runtime.
       await this.machine.transition("CHECKPOINT_FAILED", "lifecycle-checkpoint-failed");
       return this.machine.getState();
     }
