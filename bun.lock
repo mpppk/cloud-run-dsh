@@ -12,6 +12,17 @@
     "apps/agent-host": {
       "name": "@cloud-run-dsh/agent-host",
       "version": "0.0.0",
+      "dependencies": {
+        "@cloud-run-dsh/cloud-run-instance-client": "workspace:*",
+        "@cloud-run-dsh/cloud-run-sandbox": "workspace:*",
+        "@cloud-run-dsh/controller-lease": "workspace:*",
+        "@cloud-run-dsh/dsh-subprocess-cloud-run": "workspace:*",
+        "@cloud-run-dsh/github-credential-broker": "workspace:*",
+        "@cloud-run-dsh/observability": "workspace:*",
+        "@cloud-run-dsh/session-persistence-postgres": "workspace:*",
+        "@cloud-run-dsh/workspace-checkpoint": "workspace:*",
+        "@cloud-run-dsh/workspace-runtime": "workspace:*",
+      },
     },
     "apps/control-plane": {
       "name": "@cloud-run-dsh/control-plane",
