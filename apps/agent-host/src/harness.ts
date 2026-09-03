@@ -1,19 +1,23 @@
 // Harness filesystem composition (仕様書 section 6.2, 実装手順書 section 10).
 //
-// TODO(harness): the real composition must assemble the DeepSeek Harness
-// packages `fs-sandbox` + `fs-observation-policy` + `tool-fs` + `tool-fs-search`
-// with permission mode `workspace-write` and `workspaceRoot=/workspace` behind
-// the HarnessComposition adapter below. The DeepSeek Harness package is NOT
-// installable in this environment, so the composition is defined behind this
-// thin adapter interface and `createFakeHarnessComposition` provides a fake
-// implementation for tests. The fake mirrors the required semantics:
+// The composition assembles the real DeepSeek Harness packages —
+// `@deepseek-ai/dsh-fs-sandbox` + `@deepseek-ai/dsh-fs-observation-policy` +
+// `@deepseek-ai/dsh-tool-fs` + `@deepseek-ai/dsh-tool-fs-search` (published on
+// npm at 0.1.2-rc.1) — with permission mode `workspace-write` and
+// `workspaceRoot=/workspace` behind the adapter interface below. The real
+// assembly lives in harness-real.ts (`createHarnessComposition`) and is what
+// production mounts (see index.ts createProductionDependencies).
+//
+// `createFakeHarnessComposition` remains as the pure in-memory implementation
+// used by unit tests where a real filesystem / subprocess is unwanted. It
+// mirrors the adapter's refusal semantics:
 //   - model-facing write/edit outside the workspace root is REFUSED
 //     (fs-sandbox workspace-write mode),
 //   - read-before-write and stale-write protection
 //     (fs-observation-policy),
 //   - model-facing filesystem + search tools (tool-fs / tool-fs-search).
-// When the Harness package becomes installable, swap the fake for the real
-// composition without touching the adapter surface.
+// Security tests run the harness-bound refusal assertions against BOTH the
+// fake and the real composition (tests/security/harness-composition.security.test.ts).
 
 import type {
   NewSessionEvent,
@@ -152,3 +156,5 @@ export function createFakeHarnessComposition(
 
 /** Re-exported so callers can type session restore payloads without importing internals. */
 export type { NewSessionEvent };
+
+export { createHarnessComposition } from "./harness-real.js";
