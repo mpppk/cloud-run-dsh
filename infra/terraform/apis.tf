@@ -1,5 +1,7 @@
 locals {
   required_apis = toset([
+    "cloudresourcemanager.googleapis.com",
+    "iam.googleapis.com",
     "run.googleapis.com",
     "sqladmin.googleapis.com",
     "secretmanager.googleapis.com",

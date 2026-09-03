@@ -8,7 +8,7 @@ Terraform for the Google Cloud baseline described in 実装手順書 §2 and 仕
 |---|---|
 | `versions.tf` | `terraform >= 1.9`, `google` + `google-beta` providers `~> 6.0` |
 | `variables.tf` | Input variables — see table below |
-| `apis.tf` | Enables 9 required APIs (incl. Service Networking for Cloud SQL private IP) |
+| `apis.tf` | Enables 11 required APIs (incl. IAM, Resource Manager, and Service Networking) |
 | `artifact_registry.tf` | Docker repo for the agent-host image |
 | `cloudsql.tf` | Cloud SQL for PostgreSQL (private IP), database, user |
 | `storage.tf` | GCS checkpoint bucket (uniform access, versioning, lifecycle) |
@@ -168,10 +168,11 @@ After step 2 the password is sourced from Secret Manager again (conditional
 
 ### Enabled APIs
 
-`apis.tf` enables 9 APIs. The 9th is `servicenetworking.googleapis.com`,
-required for `google_service_networking_connection.private_vpc_connection`
-which creates the private IP peering for Cloud SQL. Without it the first
-apply fails.
+`apis.tf` enables 11 APIs. `iam.googleapis.com` and
+`cloudresourcemanager.googleapis.com` are required for IAM and project
+resource operations. `servicenetworking.googleapis.com` is required for
+`google_service_networking_connection.private_vpc_connection`, which creates
+the private IP peering for Cloud SQL. Without it the first apply fails.
 
 ## Verification
 
