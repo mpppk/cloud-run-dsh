@@ -26,6 +26,32 @@ variable "environment" {
   }
 }
 
+variable "ai_agent_service_account_id" {
+  description = "Service account ID used by the local AI agent through gcloud impersonation."
+  type        = string
+  default     = "ai-agent"
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.ai_agent_service_account_id))
+    error_message = "ai_agent_service_account_id must be 6-30 characters, start with a letter, and contain only lowercase letters, numbers, or hyphens."
+  }
+}
+
+variable "ai_agent_impersonators" {
+  description = "IAM members allowed to impersonate the AI-agent service account (for example, [\"user:alice@example.com\"])."
+  type        = list(string)
+  default     = []
+}
+
+variable "ai_agent_project_roles" {
+  description = "Project roles granted to the AI-agent service account. Keep this list minimal for the tasks the agent performs."
+  type        = set(string)
+  default = [
+    "roles/run.admin",
+    "roles/artifactregistry.writer",
+  ]
+}
+
 variable "db_tier" {
   description = "Cloud SQL machine type. See https://cloud.google.com/sql/docs/postgres/instance-settings"
   type        = string

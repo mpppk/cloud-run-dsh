@@ -64,3 +64,5 @@ No business logic / GCP calls in T1 — skeleton only (placeholder exports + smo
 ## Infra
 
 Terraform baseline lives in `infra/terraform` (preferred per AGENTS.md). Apply via `terraform` in that directory.
+
+GCPのAIエージェント用サービスアカウントと `gcloud` Impersonationの設定は、[docs/gcp-ai-agent-impersonation.md](docs/gcp-ai-agent-impersonation.md) に記録しています。

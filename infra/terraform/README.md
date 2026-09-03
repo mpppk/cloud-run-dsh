@@ -12,7 +12,7 @@ Terraform for the Google Cloud baseline described in 実装手順書 §2 and 仕
 | `artifact_registry.tf` | Docker repo for the agent-host image |
 | `cloudsql.tf` | Cloud SQL for PostgreSQL (private IP), database, user |
 | `storage.tf` | GCS checkpoint bucket (uniform access, versioning, lifecycle) |
-| `iam.tf` | Two service accounts + least-privilege bindings |
+| `iam.tf` | Runtime service accounts, AI-agent operator account, and least-privilege bindings |
 | `secrets.tf` | Secret Manager placeholders (no values in code) |
 | `iap.tf` | IAP brand/client + `iap.httpsResourceAccessor` members |
 | `outputs.tf` | Bucket, SQL connection, registry URL, SA emails |
@@ -24,6 +24,9 @@ Terraform for the Google Cloud baseline described in 実装手順書 §2 and 仕
 | `project_id` | string | — | **yes** | GCP project ID. No default — supply via `TF_VAR_project_id` or `terraform.tfvars`. |
 | `region` | string | `asia-northeast1` | no | Default region for regional resources. |
 | `environment` | string | `dev` | no | Environment slug (`dev`/`staging`/`prod`). Used for naming. |
+| `ai_agent_service_account_id` | string | `ai-agent` | no | Service account ID used by the local AI agent through gcloud impersonation. |
+| `ai_agent_impersonators` | list(string) | `[]` | no | Members allowed to impersonate the AI-agent service account. |
+| `ai_agent_project_roles` | set(string) | `roles/run.admin`, `roles/artifactregistry.writer` | no | Project roles granted to the AI-agent service account. Keep this minimal. |
 | `db_tier` | string | `db-custom-1-3840` | no | Cloud SQL machine type. |
 | `db_version` | string | `POSTGRES_16` | no | Postgres engine version. |
 | `db_name` | string | `dsh` | no | Application database name. |
@@ -53,6 +56,71 @@ terraform -chdir=infra/terraform apply
 ```
 
 `backend` is deliberately not configured in this baseline (local state). Add a `backend "gcs" {}` block when a Terraform state bucket is ready.
+
+現在の `cloud-run-dsh` プロジェクトでの設定記録は、[GCP AI-agent access](../../docs/gcp-ai-agent-impersonation.md) を参照してください。
+
+### AI-agent gcloud impersonation
+
+The `ai-agent` service account is an operator identity for local AI-agent
+work. It has no user-managed key. Supply the human or workload members that
+may impersonate it through `TF_VAR_ai_agent_impersonators`, then apply the
+targeted resources before applying the rest of the baseline:
+
+```bash
+export TF_VAR_project_id="cloud-run-dsh"
+export TF_VAR_ai_agent_impersonators='["user:you@example.com"]'
+
+terraform -chdir=infra/terraform init -backend=false
+terraform -chdir=infra/terraform apply \
+  -target=google_service_account.ai_agent \
+  -target=google_project_iam_member.ai_agent_project_roles \
+  -target=google_service_account_iam_member.ai_agent_impersonators \
+  -target=google_service_account_iam_member.ai_agent_act_as_agent_host \
+  -target=google_service_account_iam_member.ai_agent_act_as_control_plane
+
+export AI_AGENT_SA="$(terraform -chdir=infra/terraform output -raw ai_agent_service_account_email)"
+gcloud config set project "$TF_VAR_project_id"
+gcloud config set auth/impersonate_service_account "$AI_AGENT_SA"
+gcloud auth print-access-token >/dev/null
+```
+
+The default project roles allow Cloud Run administration and Artifact
+Registry image pushes. Add further roles only when the agent's workload
+requires them; do not create a service-account key. To clear the local
+impersonation setting, run `gcloud config unset auth/impersonate_service_account`.
+
+> **Note:** the live `TokenCreator` grant on the project was made out-of-band via
+> `gcloud`, and `google_service_account_iam_member.ai_agent_impersonators` is
+> additive — the live member may not be in Terraform state. Capture the actual
+> member through `TF_VAR_ai_agent_impersonators` to bring it under Terraform
+> management and avoid future drift confusion.
+
+### ⚠️ Security posture: impersonating `ai-agent` yields full runtime secrets
+
+**Do not treat this setup as least-privilege.** The effective credential
+ceiling of anyone added to `ai_agent_impersonators` is **every runtime
+credential in the project**. The confirmed escalation path is:
+
+1. Impersonate the `ai-agent` SA (`roles/iam.serviceAccountTokenCreator`).
+2. Use project-level `roles/run.admin` + `roles/artifactregistry.writer`, plus
+   the scoped `actAs` (`roles/iam.serviceAccountUser`) bindings on both runtime
+   SAs, to push an arbitrary container image and deploy a Cloud Run service
+   running **as `agent-host`** (`dev-dsh-agent-host`).
+3. That container can read all three Secret Manager secrets
+   (`github-app-private-key`, `llm-api-key`, `db-password`) and the checkpoint
+   bucket. The same holds when running as `control_plane`.
+
+This is acceptable for a single-owner MVP scratch project, but adding a member
+to `ai_agent_impersonators` is an informed decision — the wording above must
+not overstate the security posture.
+
+`roles/run.developer` is the narrower alternative to `run.admin` (it drops
+Cloud Run service IAM policy management while still allowing create/update of
+services, mirroring the `control_plane_run_admin` note below). However, it
+does **not** close the secret path on its own: a developer can still deploy a
+service running as `agent-host` (given `actAs`), and that identity holds
+`secretAccessor` on all three secrets. Closing the secret path would require
+revisiting the runtime SAs' `secretAccessor` grants.
 
 ## Values that MUST be supplied out-of-band
 
@@ -149,6 +217,7 @@ Cloud SQL uses **private IP only** (`ipv4_enabled = false`, `private_network = <
 
 - `agent-host`: `cloudsql.client`, `storage.objectAdmin` (bucket-scoped) + `legacyBucketReader` (bucket-scoped), `secretmanager.secretAccessor` (three secrets), `logging.logWriter`, `monitoring.metricWriter`.
 - `control-plane`: same plus `run.admin`, `iam.serviceAccountUser` on the agent-host SA, and secret accessor for brokering. `legacyBucketReader` is granted symmetrically to both SAs so both can list checkpoints (agent_host restores, control_plane verifies).
+- `ai-agent`: `run.admin` + `artifactregistry.writer` (project-level, via `ai_agent_project_roles`), `iam.serviceAccountTokenCreator` for members listed in `ai_agent_impersonators` (SA-scoped on the ai-agent SA), and scoped `iam.serviceAccountUser` (`actAs`) on both runtime SAs (`ai_agent_act_as_agent_host`, `ai_agent_act_as_control_plane`). See [AI-agent impersonation](#ai-agent-gcloud-impersonation): impersonating this account yields full runtime secrets.
 
 Bucket-level bindings use `google_storage_bucket_iam_member` (not project-wide `roles/storage.*`). Secret bindings use `google_secret_manager_secret_iam_member` per secret.
 

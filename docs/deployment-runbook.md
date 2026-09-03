@@ -22,7 +22,7 @@ Scope of the Terraform baseline (what you are about to create):
 - Artifact Registry Docker repository `agent-host` — `artifact_registry.tf`
 - Cloud SQL PostgreSQL 16, **private IP only** (own VPC + Service Networking peering), database `dsh`, user `dsh_app` — `cloudsql.tf`
 - GCS checkpoint bucket (uniform access, versioning, ARCHIVED-object 30-day lifecycle) — `storage.tf`
-- Two service accounts (agent-host, control-plane) with least-privilege bindings — `iam.tf`
+- Three service accounts (agent-host, control-plane, and the `ai-agent` operator identity) with least-privilege bindings — `iam.tf`. The `ai-agent` operator identity and its gcloud impersonation setup are documented separately in [`gcp-ai-agent-impersonation.md`](gcp-ai-agent-impersonation.md).
 - Secret Manager placeholders: `github-app-private-key`, `llm-api-key`, `db-password` (no values in code) — `secrets.tf`
 - IAP brand + client + `iap.httpsResourceAccessor` members — `iap.tf`
 
