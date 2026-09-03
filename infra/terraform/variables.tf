@@ -165,3 +165,9 @@ variable "vpc_connector_cidr" {
   type        = string
   default     = "10.201.0.0/28"
 }
+
+variable "db_enable_public_ip" {
+  description = "Assign a public IPv4 to Cloud SQL in addition to the private IP. Required today because Cloud Run Instances have no VPC connectivity, so the Cloud SQL Auth Proxy must dial the public address. authorized_networks stays empty: access is authorized by IAM (roles/cloudsql.client) and an ephemeral client certificate, never by source IP."
+  type        = bool
+  default     = false
+}

@@ -76,9 +76,22 @@ resource "google_sql_database_instance" "main" {
     }
 
     ip_configuration {
-      # Private IP preferred — do not assign a public IPv4.
-      # See comment at top of file for VPC requirements.
-      ipv4_enabled    = false
+      # Private IP is still configured and preferred.
+      #
+      # var.db_enable_public_ip additionally assigns a public IPv4. It exists
+      # because a Cloud Run *Instance* has no VPC connectivity at all — the v2
+      # API drops vpcAccess.networkInterfaces and rejects
+      # vpcAccess.connector with "not supported on resources of kind
+      # 'instance'" — so an Instance cannot reach the private IP.
+      #
+      # `authorized_networks` is deliberately left EMPTY even when the public
+      # IP is on. A Cloud Run Instance egresses from Google's shared address
+      # pool, so any IP allowlist wide enough to admit it is effectively
+      # 0.0.0.0/0. Access is instead authorized by IAM through the Cloud SQL
+      # Auth Proxy (roles/cloudsql.client, granted below), which dials the
+      # public IP with an ephemeral client certificate. An unauthenticated
+      # peer that reaches the address cannot connect.
+      ipv4_enabled    = var.db_enable_public_ip
       private_network = google_compute_network.sql.id
       # SSL is enforced at the instance level via require_ssl = true
       # on the connection; google provider v6 removed require_ssl from
