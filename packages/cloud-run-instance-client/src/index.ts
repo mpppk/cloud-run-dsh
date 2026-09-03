@@ -1,5 +1,17 @@
 // Cloud Run Instance client adapter — GCP SDK / REST isolated to this package
 // Spec sections 22, 23, 26 item 10; Implementation guide sections 5, 6
+//
+// REST surface: Cloud Run Instances API **v2** (verified against the live
+// discovery document on 2026-09-03: `https://run.googleapis.com/$discovery/rest?version=v2`).
+// v1 exposes `projects.locations.instances` with IAM methods only — no CRUD.
+// The API version is decided by the caller via `basePath` (e.g.
+// "projects/P/locations/L" is prefixed with the v2 host by the transport):
+//   list   GET    {basePath}/instances            (create body name is IGNORED; id goes in ?instanceId=)
+//   create POST   {basePath}/instances?instanceId=<id>[&validateOnly=true]
+//   get    GET    {basePath}/instances/<id>
+//   start  POST   {basePath}/instances/<id>:start
+//   stop   POST   {basePath}/instances/<id>:stop
+//   delete DELETE {basePath}/instances/<id>
 
 // ---------------------------------------------------------------------------
 // InstanceRuntime interface (implementation guide section 5 — exact shape)
@@ -30,6 +42,23 @@ export interface InstanceRuntime {
 // ---------------------------------------------------------------------------
 
 export type RestartPolicy = "on-failure" | "never" | "always";
+
+/**
+ * Maps the client's RestartPolicy to the v2 API enum
+ * (`GoogleCloudRunV2Instance.restartPolicy`: RESTART_POLICY_UNSPECIFIED |
+ * ALWAYS | ON_FAILURE | NEVER). `always` is rejected before this mapping ever
+ * runs (spec section 23 — known Preview issue).
+ */
+export function toApiRestartPolicy(policy: RestartPolicy): "ON_FAILURE" | "NEVER" | "ALWAYS" {
+  switch (policy) {
+    case "on-failure":
+      return "ON_FAILURE";
+    case "never":
+      return "NEVER";
+    case "always":
+      return "ALWAYS";
+  }
+}
 
 export interface InstanceConfig {
   /** vCPU count */
@@ -173,16 +202,39 @@ export interface CloudRunInstanceClientOptions {
   basePath: string;
   config?: InstanceConfig;
   profile?: InstanceProfileName;
+  /**
+   * Container image (v2 `containers[].image` — Required by the create API).
+   * e.g. "us-docker.pkg.dev/my-proj/agent-host/agent-host:v1".
+   * Optional here because some call sites only ever get/start/stop an
+   * existing instance (e.g. agent-host recovery); `create()` throws a typed
+   * error when it is missing.
+   */
+  image?: string;
+  /** v2 top-level `serviceAccount` — the SA the instance runs as. */
+  serviceAccount?: string;
+}
+
+export interface CreateOptions {
+  /**
+   * v2 create `validateOnly` query parameter: the request is validated and
+   * default values are filled in, but nothing is persisted or created.
+   * Free dry-run — use it before spending money on a real create.
+   */
+  readonly validateOnly?: boolean;
 }
 
 export class CloudRunInstanceClient implements InstanceRuntime {
   private readonly transport: HttpTransport;
   private readonly basePath: string;
   private readonly config: InstanceConfig;
+  private readonly image: string | undefined;
+  private readonly serviceAccount?: string;
 
   constructor(options: CloudRunInstanceClientOptions) {
     this.transport = options.transport;
     this.basePath = options.basePath.replace(/\/$/, "");
+    this.image = options.image;
+    this.serviceAccount = options.serviceAccount;
 
     // Resolve config: profile takes precedence, else explicit config, else default
     let resolved: InstanceConfig;
@@ -207,9 +259,19 @@ export class CloudRunInstanceClient implements InstanceRuntime {
     return this.config;
   }
 
-  async create(workspace: Workspace): Promise<InstanceInfo> {
+  async create(workspace: Workspace, options?: CreateOptions): Promise<InstanceInfo> {
+    if (!this.image || this.image.trim() === "") {
+      throw new InstanceClientError(
+        "create requires an image (v2 containers[].image) — supply `image` when constructing CloudRunInstanceClient",
+        400,
+      );
+    }
     const instanceName = workspace.instanceName ?? `dsh-${workspace.id}`;
-    const url = `${this.basePath}/instances`;
+    // v2 create: the instance id is a query parameter, not a body field
+    // (GoogleCloudRunV2Instance.name is IGNORED in CreateInstanceRequest).
+    const query = new URLSearchParams({ instanceId: instanceName });
+    if (options?.validateOnly) query.set("validateOnly", "true");
+    const url = `${this.basePath}/instances?${query.toString()}`;
     const body = this.buildCreateBody(workspace, instanceName);
 
     const res = await this.transport.request({
@@ -221,7 +283,7 @@ export class CloudRunInstanceClient implements InstanceRuntime {
 
     this.handleErrorStatus(res, instanceName);
 
-    return this.parseInstanceInfo(res.body);
+    return this.parseCreateResponse(res.body, instanceName);
   }
 
   async start(instanceName: string): Promise<void> {
@@ -265,21 +327,68 @@ export class CloudRunInstanceClient implements InstanceRuntime {
     this.handleErrorStatus(res, instanceName);
   }
 
+  /**
+   * v2 GoogleCloudRunV2Instance create body (live discovery, 2026-09-03):
+   *   - containers[]       (Required; exactly one container)
+   *   - containers[].image (Required)
+   *   - containers[].resources.limits.{cpu,memory}  — cpu/memory are limit
+   *     STRINGS ("4"/"8Gi"), not a top-level `resources` object
+   *   - containers[].sandboxLauncher — lives on the CONTAINER, not the instance
+   *   - containers[].ports[].containerPort
+   *   - restartPolicy      (top-level; API enum ON_FAILURE/NEVER/ALWAYS)
+   *   - serviceAccount     (top-level)
+   * There is no `template` wrapper on Instances (that is the Services/Revisions
+   * shape) and no readOnly fields are ever sent.
+   */
   private buildCreateBody(
-    workspace: Workspace,
-    instanceName: string,
+    _workspace: Workspace,
+    _instanceName: string,
   ): Record<string, unknown> {
-    return {
-      name: instanceName,
-      workspaceId: workspace.id,
+    const container: Record<string, unknown> = {
+      image: this.image,
       resources: {
-        cpu: this.config.cpu,
-        memory: this.config.memory,
+        limits: {
+          cpu: String(this.config.cpu),
+          memory: this.config.memory,
+        },
       },
-      restartPolicy: this.config.restartPolicy,
-      sandboxLauncher: this.config.sandboxLauncher,
-      containerPort: this.config.port,
+      ports: [{ containerPort: this.config.port }],
     };
+    if (this.config.sandboxLauncher) container["sandboxLauncher"] = this.config.sandboxLauncher;
+
+    const body: Record<string, unknown> = {
+      containers: [container],
+      restartPolicy: toApiRestartPolicy(this.config.restartPolicy),
+    };
+    if (this.serviceAccount) body["serviceAccount"] = this.serviceAccount;
+    return body;
+  }
+
+  /**
+   * v2 create returns a GoogleLongrunningOperation, not the Instance. A
+   * pending operation has no instance payload, so the fully-qualified name is
+   * composed from basePath + instanceId (same rule the API uses). When the
+   * operation has completed, the instance is read from `response`.
+   */
+  private parseCreateResponse(body: unknown, instanceName: string): InstanceInfo {
+    if (body && typeof body === "object" && "done" in (body as Record<string, unknown>)) {
+      const op = body as Record<string, unknown>;
+      if (op["done"] === true) {
+        if (op["error"] && typeof op["error"] === "object") {
+          const err = op["error"] as Record<string, unknown>;
+          throw new InstanceClientError(
+            `create failed: ${String(err["message"] ?? JSON.stringify(err))}`,
+            500,
+          );
+        }
+        return this.parseInstanceInfo(op["response"]);
+      }
+      return {
+        name: `${this.basePath}/instances/${instanceName}`,
+        state: "PENDING",
+      };
+    }
+    return this.parseInstanceInfo(body);
   }
 
   private parseInstanceInfo(body: unknown): InstanceInfo {
@@ -288,10 +397,38 @@ export class CloudRunInstanceClient implements InstanceRuntime {
     }
     const obj = body as Record<string, unknown>;
     const name = typeof obj["name"] === "string" ? (obj["name"] as string) : "";
-    const url = typeof obj["url"] === "string" ? (obj["url"] as string) : undefined;
-    const state = typeof obj["state"] === "string" ? (obj["state"] as string) : "UNKNOWN";
+    // v2 exposes traffic URLs as `urls` (string array, readOnly); a literal
+    // `url` string is still honored for test fakes.
+    let url: string | undefined;
+    if (Array.isArray(obj["urls"]) && typeof obj["urls"][0] === "string") {
+      url = obj["urls"][0] as string;
+    } else if (typeof obj["url"] === "string") {
+      url = obj["url"] as string;
+    }
+    const state = this.parseInstanceState(obj);
     if (!name) throw new InstanceClientError("missing instance name in response", 500);
     return { name, url, state };
+  }
+
+  /**
+   * v2 GoogleCloudRunV2Instance has no top-level `state` field; readiness
+   * lives in `terminalCondition.state` (CONDITION_SUCCEEDED | CONDITION_FAILED |
+   * CONDITION_PENDING | CONDITION_RECONCILING). A literal `state` string is
+   * still honored when present (test fakes / future API additions).
+   */
+  private parseInstanceState(obj: Record<string, unknown>): string {
+    const literal = obj["state"];
+    if (typeof literal === "string") return literal;
+    const terminal = obj["terminalCondition"];
+    if (terminal && typeof terminal === "object") {
+      const condState = (terminal as Record<string, unknown>)["state"];
+      if (condState === "CONDITION_SUCCEEDED") return "READY";
+      if (condState === "CONDITION_FAILED") return "FAILED";
+      if (condState === "CONDITION_PENDING" || condState === "CONDITION_RECONCILING") {
+        return "PENDING";
+      }
+    }
+    return "UNKNOWN";
   }
 
   private handleErrorStatus(res: HttpResponse, instanceName: string): void {

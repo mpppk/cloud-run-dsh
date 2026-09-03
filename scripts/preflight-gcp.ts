@@ -8,7 +8,9 @@
  *   3. a project configured + billing enabled
  *   4. the 11 APIs the Terraform baseline enables
  *   5. caller permissions (via read-only probes against each service)
- *   6. infra/terraform fmt/validate
+ *   6. Cloud Run **v2** Instances API reachability (read-only GET of the list
+ *      endpoint; NEVER create — even with validateOnly)
+ *   7. infra/terraform fmt/validate
  *
  * Degrades gracefully: when a check is impossible (unauthenticated, daemon
  * down, SDK component missing) it reports "CANNOT CHECK" with the reason
@@ -227,6 +229,69 @@ function checkPermissions(project: string): void {
   }
 }
 
+// ---------------------------------------------------------------- instances
+
+/**
+ * Read-only reachability probe for the Cloud Run **v2** Instances API.
+ *
+ * The Instances API exists in v2 only (v1 `.../instances` CRUD paths return a
+ * plain HTML 404), so a v2 list is the cheapest way to prove Preview access +
+ * permissions before Step 5 of the runbook. This NEVER calls create — the only
+ * request issued is `GET /v2/{parent}/instances`.
+ *
+ * Classification:
+ *   200       pass — Preview access + run.instances.list permission OK
+ *   403       fail — reachable but denied (IAM / Preview enrollment)
+ *   404       fail — API surface absent for this project (Preview not enabled)
+ *   401/token cannot-check — stale access token, re-run after re-auth
+ *   other     cannot-check / fail depending on the error
+ */
+async function checkInstancesApi(project: string): Promise<void> {
+  const tokenRun = run("gcloud", ["auth", "print-access-token"], { timeoutMs: 30_000 });
+  if (tokenRun.code !== 0 || tokenRun.stdout.trim() === "") {
+    report("instances-api: reachable", "cannot-check",
+      "could not obtain an access token via `gcloud auth print-access-token` (read-only probe)");
+    return;
+  }
+  const token = tokenRun.stdout.trim();
+  const regionRun = run("gcloud", ["config", "get-value", "run/region"]);
+  const region = regionRun.code === 0 && regionRun.stdout.trim() !== ""
+    ? regionRun.stdout.trim()
+    : "asia-northeast1";
+  const url = `https://run.googleapis.com/v2/projects/${project}/locations/${region}/instances`;
+  try {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (res.status === 200) {
+      report("instances-api: reachable", "pass",
+        `GET v2 list returned 200 (region ${region}); Preview access is enabled`);
+      return;
+    }
+    const text = (await res.text()).slice(0, 300);
+    if (res.status === 403) {
+      report("instances-api: reachable", "fail",
+        `GET v2 list returned 403 — permission denied; check roles/run.admin / Preview enrollment: ${text}`);
+      return;
+    }
+    if (res.status === 404) {
+      report("instances-api: reachable", "fail",
+        `GET v2 list returned 404 — the Instances API surface is not enabled for project ${project} (Preview not enrolled?) or the path changed: ${text}`);
+      return;
+    }
+    if (res.status === 401) {
+      report("instances-api: reachable", "cannot-check",
+        `GET v2 list returned 401 — access token rejected; re-run after \`gcloud auth login\``);
+      return;
+    }
+    report("instances-api: reachable", "fail", `GET v2 list returned HTTP ${res.status}: ${text}`);
+  } catch (err) {
+    report("instances-api: reachable", "cannot-check",
+      `network error contacting ${url}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 // ---------------------------------------------------------------- terraform
 
 function checkTerraform(): void {
@@ -261,9 +326,9 @@ function checkTerraform(): void {
 
 // -------------------------------------------------------------------- main
 
-function main(): void {
+async function main(): Promise<void> {
   console.log("== GCP deployment preflight (READ-ONLY) ==");
-  console.log("Probes nothing that mutates. Local-only side effect: terraform init -backend=false downloads providers into infra/terraform/.terraform/.\n");
+  console.log("Probes nothing that mutates. The Instances API check is a read-only GET of the v2 list endpoint (never create). Local-only side effect: terraform init -backend=false downloads providers into infra/terraform/.terraform/.\n");
 
   checkTool("gcloud", ["version"], (out) => (out.trim().split("\n")[0] ?? "").trim());
   checkTool("terraform", ["version"], parseTerraformVersion);
@@ -291,11 +356,14 @@ function main(): void {
     checkBilling(project);
     checkApis(project);
     checkPermissions(project);
+    await checkInstancesApi(project);
   } else {
     for (const name of ["billing: enabled", "apis: enabled"] as const) {
       report(name, "cannot-check", "requires an authenticated gcloud and a configured project");
     }
     report("permissions: service probes", "cannot-check",
+      "requires an authenticated gcloud and a configured project — re-run after `gcloud auth login && gcloud config set project <ID>`");
+    report("instances-api: reachable", "cannot-check",
       "requires an authenticated gcloud and a configured project — re-run after `gcloud auth login && gcloud config set project <ID>`");
   }
 
