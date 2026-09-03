@@ -26,9 +26,11 @@ RUN bun install --frozen-lockfile
 
 # --- build: assemble the workspace -------------------------------------------
 #
-# Typechecking deliberately does NOT run here. It is enforced by CI and by
-# `bunx tsc --build` locally; re-running it during packaging buys nothing and
-# makes the image unbuildable on a cross-architecture host: under qemu
+# Typechecking deliberately does NOT run here. It runs in CI instead
+# (.github/workflows/ci.yml, added together with this change because it was
+# NOT already covered — the repository had no workflows at all). Re-running it
+# during packaging buys nothing and makes the image unbuildable on a
+# cross-architecture host: under qemu
 # (arm64 host -> linux/amd64 image) `bun run typecheck` dies immediately with
 #   ASSERTION FAILED: MemoryExhaustion ... JSC::LocalAllocator::allocateSlowCase
 #   panic(main thread): abort() called   (Bun v1.4.0, exit code 134)
