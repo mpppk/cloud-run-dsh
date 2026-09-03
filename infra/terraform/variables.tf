@@ -154,17 +154,7 @@ variable "db_edition" {
   }
 }
 
-variable "run_subnet_cidr" {
-  description = "CIDR for the Cloud Run Direct VPC egress subnet. Must not overlap the Private Services Access range reserved by google_compute_global_address.sql_private_ip."
-  type        = string
-  default     = "10.200.0.0/24"
-}
 
-variable "vpc_connector_cidr" {
-  description = "Unused /28 for the Serverless VPC Access connector. Must not overlap the Cloud Run subnet or the Private Services Access range."
-  type        = string
-  default     = "10.201.0.0/28"
-}
 
 variable "db_enable_public_ip" {
   description = "Assign a public IPv4 to Cloud SQL in addition to the private IP. Required today because Cloud Run Instances have no VPC connectivity, so the Cloud SQL Auth Proxy must dial the public address. authorized_networks stays empty: access is authorized by IAM (roles/cloudsql.client) and an ephemeral client certificate, never by source IP."

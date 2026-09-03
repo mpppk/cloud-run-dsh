@@ -76,21 +76,25 @@ resource "google_sql_database_instance" "main" {
     }
 
     ip_configuration {
-      # Private IP is still configured and preferred.
+      # Private IP is configured, but a public IPv4 is REQUIRED in practice.
       #
-      # var.db_enable_public_ip additionally assigns a public IPv4. It exists
-      # because a Cloud Run *Instance* has no VPC connectivity at all — the v2
-      # API drops vpcAccess.networkInterfaces and rejects
-      # vpcAccess.connector with "not supported on resources of kind
-      # 'instance'" — so an Instance cannot reach the private IP.
+      # A Cloud Run Instance has no VPC connectivity of any kind: the v2 API
+      # drops vpcAccess.networkInterfaces and rejects vpcAccess.connector with
+      # "not supported on resources of kind 'instance'". Instances reach Cloud
+      # SQL through the built-in integration instead — a volume of type
+      # `cloudSqlInstance` mounted at /cloudsql, authorized by
+      # roles/cloudsql.client on the runtime service account (granted below).
+      # That path needs NO proxy sidecar and NO VPC connector, but it does dial
+      # the instance's public address: with ipv4_enabled = false it fails with
+      # "SFEClient is nil / refresh failed: context deadline exceeded".
+      # Both behaviours were measured against this project on 2026-09-03.
       #
-      # `authorized_networks` is deliberately left EMPTY even when the public
-      # IP is on. A Cloud Run Instance egresses from Google's shared address
-      # pool, so any IP allowlist wide enough to admit it is effectively
-      # 0.0.0.0/0. Access is instead authorized by IAM through the Cloud SQL
-      # Auth Proxy (roles/cloudsql.client, granted below), which dials the
-      # public IP with an ephemeral client certificate. An unauthenticated
-      # peer that reaches the address cannot connect.
+      # `authorized_networks` is deliberately left EMPTY. A Cloud Run Instance
+      # egresses from Google's shared address pool, so any IP allowlist wide
+      # enough to admit it is effectively 0.0.0.0/0 — an allowlist here would
+      # be security theatre. Authorization is IAM plus an ephemeral client
+      # certificate, so reaching the address is not sufficient to connect
+      # (verified: a plain TCP connect from an unlisted host does not open).
       ipv4_enabled    = var.db_enable_public_ip
       private_network = google_compute_network.sql.id
       # SSL is enforced at the instance level via require_ssl = true
