@@ -57,12 +57,16 @@ resource "google_sql_database_instance" "main" {
     tier              = var.db_tier
     availability_type = "ZONAL"
     disk_autoresize   = true
-    disk_type         = "PD_SSD"
+    disk_type         = var.db_disk_type
 
+    # Cost-profile knobs (defaults = production values; see profiles/):
+    # PITR requires automated backups, and retained transaction logs are
+    # meaningless without it, so both are forced off together when backups
+    # are disabled instead of sending an invalid combination to the API.
     backup_configuration {
-      enabled                        = true
-      point_in_time_recovery_enabled = true
-      transaction_log_retention_days = 7
+      enabled                        = var.db_backup_enabled
+      point_in_time_recovery_enabled = var.db_backup_enabled && var.db_point_in_time_recovery_enabled
+      transaction_log_retention_days = var.db_backup_enabled ? var.db_transaction_log_retention_days : null
     }
 
     maintenance_window {
@@ -82,7 +86,7 @@ resource "google_sql_database_instance" "main" {
     }
 
     insights_config {
-      query_insights_enabled = true
+      query_insights_enabled = var.db_query_insights_enabled
     }
 
     user_labels = var.labels

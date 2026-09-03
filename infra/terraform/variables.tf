@@ -58,6 +58,46 @@ variable "db_tier" {
   default     = "db-custom-1-3840"
 }
 
+variable "db_disk_type" {
+  description = "Cloud SQL storage type: PD_SSD (production default) or PD_HDD (Enterprise edition only, cheaper, higher latency)."
+  type        = string
+  default     = "PD_SSD"
+
+  validation {
+    condition     = contains(["PD_SSD", "PD_HDD"], var.db_disk_type)
+    error_message = "db_disk_type must be PD_SSD or PD_HDD."
+  }
+}
+
+variable "db_backup_enabled" {
+  description = "Enable automated Cloud SQL backups. Production default: true. Verification-only profiles may disable (accepts total data loss on instance failure)."
+  type        = bool
+  default     = true
+}
+
+variable "db_point_in_time_recovery_enabled" {
+  description = "Enable point-in-time recovery (requires automated backups). Production default: true; PITR storage bills per GiB of retained WAL."
+  type        = bool
+  default     = true
+}
+
+variable "db_transaction_log_retention_days" {
+  description = "Days of transaction logs retained for PITR (1-7). Production default: 7. Only applied when backups are enabled."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.db_transaction_log_retention_days >= 1 && var.db_transaction_log_retention_days <= 7
+    error_message = "db_transaction_log_retention_days must be between 1 and 7 (Cloud SQL limit)."
+  }
+}
+
+variable "db_query_insights_enabled" {
+  description = "Enable Cloud SQL Query Insights. Production default: true; unnecessary for one-shot verification."
+  type        = bool
+  default     = true
+}
+
 variable "db_version" {
   description = "PostgreSQL engine version for Cloud SQL."
   type        = string

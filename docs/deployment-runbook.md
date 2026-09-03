@@ -487,3 +487,29 @@ This runbook was authored against a machine with **no gcloud credentials and no 
 | Step 8 | `terraform destroy` behavior with real state; Instance stop/delete endpoint names under the Preview API. |
 
 The preflight script (`bun run preflight:gcp`) is likewise only proven in its "unauthenticated / cannot-check" code paths plus the local tool + Terraform validation paths.
+
+---
+
+## Appendix — Minimal cost profile (verification-only) & guaranteed teardown
+
+> **🚨 DESTROY FAILURE = BILLING CONTINUES.** If `terraform destroy` fails — most commonly because the versioned checkpoint bucket still contains objects — Cloud SQL and the bucket KEEP BILLING until you fix it. Empty the bucket first (step 3 below, or the guarded script), then re-run destroy, and verify every resource is gone in the Cloud Console billing report.
+
+For the billing-approval gate (P6) you normally want the **minimal verification profile**, not the production-ish defaults:
+
+```bash
+terraform -chdir=infra/terraform plan  -var-file=profiles/minimal.tfvars
+terraform -chdir=infra/terraform apply -var-file=profiles/minimal.tfvars
+```
+
+What it changes (defaults are untouched — see [`cost.md`](cost.md) for sourced monthly estimates, ≈ $11–12/month at `db-f1-micro`, vs ≈ $67/month at `db-custom-1-3840`, both asia-northeast1):
+
+- `db-f1-micro` (shared-core, SLA-excluded, bring-up verification only; official tier availability: https://cloud.google.com/sql/docs/postgres/machine-series-overview)
+- backups / PITR / Query Insights **disabled**, HDD storage — acceptable only because verification data is disposable
+- teardown billing notes and the ABANDONed Service Networking peering impact on a future re-apply: [`cost.md` — Teardown](cost.md)
+
+For teardown, runbook Step 8 step 3 (empty the versioned bucket) can be executed with the guarded helper script — it refuses to run without `--yes` because it permanently deletes every checkpoint version:
+
+```bash
+bun run teardown:empty-bucket -- --bucket "$(terraform -chdir=infra/terraform output -raw checkpoint_bucket_name)" --yes
+# then: terraform -chdir=infra/terraform destroy
+```
