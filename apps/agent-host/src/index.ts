@@ -6,6 +6,7 @@ import { CloudRunInstanceClient } from "@cloud-run-dsh/cloud-run-instance-client
 import { composeAgentHost } from "./composition.js";
 import type { AgentHostDependencies } from "./composition.js";
 import { readAgentHostConfig } from "./config.js";
+import { createHarnessComposition } from "./harness-real.js";
 import {
   BunSqlLeaseStore,
   BunSqlQueryExecutor,
@@ -46,6 +47,10 @@ export async function createProductionDependencies(
     brokerTransport: fetchHttpTransport,
     leaseStore: new BunSqlLeaseStore(executor),
     stateStore: new SqlTransactionalStateStore(executor),
+    // Real DeepSeek Harness composition (実装手順書 section 10): fs-sandbox +
+    // fs-observation-policy + tool-fs + tool-fs-search, workspace-write on
+    // config.workspaceRoot.
+    harness: await createHarnessComposition(config.workspaceRoot),
   };
 }
 
