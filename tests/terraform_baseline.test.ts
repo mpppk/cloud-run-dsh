@@ -120,7 +120,7 @@ describe("content checks", () => {
     expect(tfContents["variables.tf"]).toMatch(/variable "checkpoint_live_delete_age_days"/);
   });
 
-  test("iam.tf defines runtime accounts and a least-privilege AI-agent operator", () => {
+  test("iam.tf defines runtime accounts and enforces AI-agent operator constraints", () => {
     const c = tfContents["iam.tf"];
     expect(c).toContain("google_service_account");
     expect(c).toContain("agent_host");
@@ -146,6 +146,34 @@ describe("content checks", () => {
     expect(legacyCount).toBe(2);
     expect(c).toContain("agent_host_bucket_legacy_reader");
     expect(c).toContain("control_plane_bucket_legacy_reader");
+  });
+
+  test("AI-agent operator stays within least-privilege guardrails", () => {
+    // No service-account keys anywhere in the baseline (all .tf files, not just iam.tf)
+    expect(allTf).not.toContain("google_service_account_key");
+    // No gcloud-key fallback patterns either
+    expect(allTf).not.toMatch(/service_account_key/);
+
+    // ai_agent_project_roles default must be EXACTLY run.admin + artifactregistry.writer,
+    // so widening the role set fails this test.
+    const vars = tfContents["variables.tf"];
+    const rolesVarBlock = vars.match(/variable "ai_agent_project_roles" \{[\s\S]*?\n\}/);
+    expect(rolesVarBlock).not.toBeNull();
+    const defaultRoles = [...(rolesVarBlock![0].matchAll(/"(roles\/[a-z0-9._-]+)"/g))].map((m) => m[1]);
+    expect([...defaultRoles].sort()).toEqual(["roles/artifactregistry.writer", "roles/run.admin"]);
+
+    // serviceAccountUser for ai-agent must appear only in SA-scoped
+    // google_service_account_iam_member blocks, never project-wide.
+    const iam = tfContents["iam.tf"];
+    const projectIamBlocks = [...iam.matchAll(/resource "google_project_iam_member" "[^"]+" \{[\s\S]*?\n\}/g)];
+    const projectWideSaUser = projectIamBlocks.filter((b) => b[0].includes("serviceAccountUser"));
+    expect(projectWideSaUser.length).toBe(0);
+    const saIamSaUserBlocks = [
+      ...iam.matchAll(/resource "google_service_account_iam_member" "[^"]+" \{[\s\S]*?\n\}/g),
+    ].filter((b) => b[0].includes("roles/iam.serviceAccountUser"));
+    // Exactly three: ai-agent actAs on agent_host + control_plane, and
+    // control_plane actAs on agent_host. All SA-scoped.
+    expect(saIamSaUserBlocks.length).toBe(3);
   });
 
   test("secrets.tf creates 3 secrets without values", () => {

@@ -22,6 +22,35 @@
 Impersonateを行う人またはワークロードには、AIエージェント用SA自身に対して
 `roles/iam.serviceAccountTokenCreator` を付与しています。設定済みのIAM memberは、
 セットアップ時に利用した `gcloud` のアカウントです。
+この付与はTerraformのリソース定義とは別に `gcloud` で直接（out-of-band）行われたため、
+実際に付与されているメンバーがTerraform stateに反映されていない可能性があります。
+将来の混乱を避けるため、実際のメンバーを `TF_VAR_ai_agent_impersonators` に設定して
+Terraform管理下に置いてください。
+
+### ⚠️ 権限の上限（エスカレーション経路）— Impersonation は「フルランタイムシークレット」
+
+**注意: この構成は真の least-privilege ではありません。** `ai_agent_impersonators` に追加された
+メンバーの実効的な権限上限は **「すべてのランタイム認証情報」** です。確認されている
+エスカレーション経路は次のとおりです:
+
+1. `ai-agent` SAをimpersonateする（`roles/iam.serviceAccountTokenCreator`）。
+2. プロジェクトレベルの `roles/run.admin` + `roles/artifactregistry.writer`、および両ランタイムSA
+   （`dev-dsh-agent-host` / `dev-dsh-control-plane`）への `roles/iam.serviceAccountUser`（`actAs`）を
+   使い、任意のコンテナイメージをArtifact Registryへpushして、**`dev-dsh-agent-host` として
+   動作する** Cloud Runサービスをデプロイできる。
+3. そのコンテナはSecret Managerの3つのシークレット（`github-app-private-key`、`llm-api-key`、
+   `db-password`）とチェックポイントバケットをすべて読み取れる。`control_plane` として
+   動作させた場合も同様。
+
+したがって、`ai_agent_impersonators` にメンバーを追加するかどうかは、上記を理解したうえでの
+意思決定です。単一オーナーのMVPスクラッチプロジェクトとしてはこの経路を許容しますが、
+Impersonationの権限を「最小権限」と表現することは避けてください。
+
+`roles/run.developer` は `roles/run.admin` のより狭い代替です（Cloud RunサービスのIAMポリシー
+管理などが不可になる一方、サービスの作成・更新・デプロイは可能）。ただし **`run.developer` に
+切り替えてもシークレット流出経路は閉じません** — `actAs` が残るため `agent-host` として動作する
+サービスをデプロイでき、そのIDは3つのシークレットすべてに対する `secretAccessor` を持つためです。
+シークレット経路を閉じるには、ランタイムSA側の `secretAccessor` 付与の見直しが必要です。
 
 ## gcloudの設定
 

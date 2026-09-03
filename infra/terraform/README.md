@@ -89,6 +89,39 @@ Registry image pushes. Add further roles only when the agent's workload
 requires them; do not create a service-account key. To clear the local
 impersonation setting, run `gcloud config unset auth/impersonate_service_account`.
 
+> **Note:** the live `TokenCreator` grant on the project was made out-of-band via
+> `gcloud`, and `google_service_account_iam_member.ai_agent_impersonators` is
+> additive — the live member may not be in Terraform state. Capture the actual
+> member through `TF_VAR_ai_agent_impersonators` to bring it under Terraform
+> management and avoid future drift confusion.
+
+### ⚠️ Security posture: impersonating `ai-agent` yields full runtime secrets
+
+**Do not treat this setup as least-privilege.** The effective credential
+ceiling of anyone added to `ai_agent_impersonators` is **every runtime
+credential in the project**. The confirmed escalation path is:
+
+1. Impersonate the `ai-agent` SA (`roles/iam.serviceAccountTokenCreator`).
+2. Use project-level `roles/run.admin` + `roles/artifactregistry.writer`, plus
+   the scoped `actAs` (`roles/iam.serviceAccountUser`) bindings on both runtime
+   SAs, to push an arbitrary container image and deploy a Cloud Run service
+   running **as `agent-host`** (`dev-dsh-agent-host`).
+3. That container can read all three Secret Manager secrets
+   (`github-app-private-key`, `llm-api-key`, `db-password`) and the checkpoint
+   bucket. The same holds when running as `control_plane`.
+
+This is acceptable for a single-owner MVP scratch project, but adding a member
+to `ai_agent_impersonators` is an informed decision — the wording above must
+not overstate the security posture.
+
+`roles/run.developer` is the narrower alternative to `run.admin` (it drops
+Cloud Run service IAM policy management while still allowing create/update of
+services, mirroring the `control_plane_run_admin` note below). However, it
+does **not** close the secret path on its own: a developer can still deploy a
+service running as `agent-host` (given `actAs`), and that identity holds
+`secretAccessor` on all three secrets. Closing the secret path would require
+revisiting the runtime SAs' `secretAccessor` grants.
+
 ## Values that MUST be supplied out-of-band
 
 These are never stored in code and must be injected via Secret Manager / env:
@@ -184,6 +217,7 @@ Cloud SQL uses **private IP only** (`ipv4_enabled = false`, `private_network = <
 
 - `agent-host`: `cloudsql.client`, `storage.objectAdmin` (bucket-scoped) + `legacyBucketReader` (bucket-scoped), `secretmanager.secretAccessor` (three secrets), `logging.logWriter`, `monitoring.metricWriter`.
 - `control-plane`: same plus `run.admin`, `iam.serviceAccountUser` on the agent-host SA, and secret accessor for brokering. `legacyBucketReader` is granted symmetrically to both SAs so both can list checkpoints (agent_host restores, control_plane verifies).
+- `ai-agent`: `run.admin` + `artifactregistry.writer` (project-level, via `ai_agent_project_roles`), `iam.serviceAccountTokenCreator` for members listed in `ai_agent_impersonators` (SA-scoped on the ai-agent SA), and scoped `iam.serviceAccountUser` (`actAs`) on both runtime SAs (`ai_agent_act_as_agent_host`, `ai_agent_act_as_control_plane`). See [AI-agent impersonation](#ai-agent-gcloud-impersonation): impersonating this account yields full runtime secrets.
 
 Bucket-level bindings use `google_storage_bucket_iam_member` (not project-wide `roles/storage.*`). Secret bindings use `google_secret_manager_secret_iam_member` per secret.
 
