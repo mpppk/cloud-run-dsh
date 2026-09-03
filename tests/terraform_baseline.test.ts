@@ -120,11 +120,17 @@ describe("content checks", () => {
     expect(tfContents["variables.tf"]).toMatch(/variable "checkpoint_live_delete_age_days"/);
   });
 
-  test("iam.tf defines two service accounts with least privilege and symmetric bucket reader", () => {
+  test("iam.tf defines runtime accounts and a least-privilege AI-agent operator", () => {
     const c = tfContents["iam.tf"];
     expect(c).toContain("google_service_account");
     expect(c).toContain("agent_host");
     expect(c).toContain("control_plane");
+    expect(c).toContain('google_service_account" "ai_agent"');
+    expect(c).toContain("roles/iam.serviceAccountTokenCreator");
+    expect(c).toContain("ai_agent_impersonators");
+    expect(c).toContain("ai_agent_project_roles");
+    expect(c).toContain("ai_agent_act_as_agent_host");
+    expect(c).toContain("ai_agent_act_as_control_plane");
     expect(c).toContain("roles/cloudsql.client");
     expect(c).toContain("roles/storage.objectAdmin");
     expect(c).toContain("roles/secretmanager.secretAccessor");
@@ -164,6 +170,7 @@ describe("content checks", () => {
     expect(c).toContain("sql_connection_name");
     expect(c).toContain("artifact_registry_repository_url");
     expect(c).toContain("service_account");
+    expect(c).toContain("ai_agent_service_account_email");
   });
 
   test("README documents Cloud Run Instances TODO, bootstrap, and run.admin narrow alternative", () => {

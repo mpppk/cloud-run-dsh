@@ -16,6 +16,49 @@ resource "google_service_account" "control_plane" {
   description  = "Identity for the control plane that manages workspace lifecycle and Instance start/stop."
 }
 
+# --- Local AI-agent operator identity --------------------------------------
+#
+# This account is intended for local gcloud/Terraform operations via service
+# account impersonation. It is separate from the runtime identities above so
+# credentials used by the operator are never placed on a Cloud Run workload.
+resource "google_service_account" "ai_agent" {
+  project      = var.project_id
+  account_id   = var.ai_agent_service_account_id
+  display_name = "AI Agent (${var.environment}) — local operator identity"
+  description  = "Operator identity for the AI coding agent. Use gcloud service-account impersonation; do not create a key."
+}
+
+resource "google_project_iam_member" "ai_agent_project_roles" {
+  for_each = var.ai_agent_project_roles
+
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.ai_agent.email}"
+}
+
+resource "google_service_account_iam_member" "ai_agent_impersonators" {
+  for_each = toset(var.ai_agent_impersonators)
+
+  service_account_id = google_service_account.ai_agent.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = each.value
+}
+
+# Cloud Run deployment requires iam.serviceAccounts.actAs on the selected
+# runtime identity. Keep this scoped to the two runtime SAs rather than
+# granting serviceAccountUser project-wide.
+resource "google_service_account_iam_member" "ai_agent_act_as_agent_host" {
+  service_account_id = google_service_account.agent_host.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.ai_agent.email}"
+}
+
+resource "google_service_account_iam_member" "ai_agent_act_as_control_plane" {
+  service_account_id = google_service_account.control_plane.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.ai_agent.email}"
+}
+
 # --- Common roles (both SAs): logging + monitoring -------------------------
 
 resource "google_project_iam_member" "agent_host_logging" {

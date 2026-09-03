@@ -38,6 +38,11 @@ output "control_plane_service_account_email" {
   value       = google_service_account.control_plane.email
 }
 
+output "ai_agent_service_account_email" {
+  description = "AI-agent operator service account email for gcloud impersonation."
+  value       = google_service_account.ai_agent.email
+}
+
 output "iap_brand_name" {
   description = "IAP brand resource name (if created)."
   value       = try(google_iap_brand.brand[0].name, null)

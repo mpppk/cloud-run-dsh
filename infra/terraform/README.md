@@ -12,7 +12,7 @@ Terraform for the Google Cloud baseline described in 実装手順書 §2 and 仕
 | `artifact_registry.tf` | Docker repo for the agent-host image |
 | `cloudsql.tf` | Cloud SQL for PostgreSQL (private IP), database, user |
 | `storage.tf` | GCS checkpoint bucket (uniform access, versioning, lifecycle) |
-| `iam.tf` | Two service accounts + least-privilege bindings |
+| `iam.tf` | Runtime service accounts, AI-agent operator account, and least-privilege bindings |
 | `secrets.tf` | Secret Manager placeholders (no values in code) |
 | `iap.tf` | IAP brand/client + `iap.httpsResourceAccessor` members |
 | `outputs.tf` | Bucket, SQL connection, registry URL, SA emails |
@@ -24,6 +24,9 @@ Terraform for the Google Cloud baseline described in 実装手順書 §2 and 仕
 | `project_id` | string | — | **yes** | GCP project ID. No default — supply via `TF_VAR_project_id` or `terraform.tfvars`. |
 | `region` | string | `asia-northeast1` | no | Default region for regional resources. |
 | `environment` | string | `dev` | no | Environment slug (`dev`/`staging`/`prod`). Used for naming. |
+| `ai_agent_service_account_id` | string | `ai-agent` | no | Service account ID used by the local AI agent through gcloud impersonation. |
+| `ai_agent_impersonators` | list(string) | `[]` | no | Members allowed to impersonate the AI-agent service account. |
+| `ai_agent_project_roles` | set(string) | `roles/run.admin`, `roles/artifactregistry.writer` | no | Project roles granted to the AI-agent service account. Keep this minimal. |
 | `db_tier` | string | `db-custom-1-3840` | no | Cloud SQL machine type. |
 | `db_version` | string | `POSTGRES_16` | no | Postgres engine version. |
 | `db_name` | string | `dsh` | no | Application database name. |
@@ -53,6 +56,38 @@ terraform -chdir=infra/terraform apply
 ```
 
 `backend` is deliberately not configured in this baseline (local state). Add a `backend "gcs" {}` block when a Terraform state bucket is ready.
+
+現在の `cloud-run-dsh` プロジェクトでの設定記録は、[GCP AI-agent access](../../docs/gcp-ai-agent-impersonation.md) を参照してください。
+
+### AI-agent gcloud impersonation
+
+The `ai-agent` service account is an operator identity for local AI-agent
+work. It has no user-managed key. Supply the human or workload members that
+may impersonate it through `TF_VAR_ai_agent_impersonators`, then apply the
+targeted resources before applying the rest of the baseline:
+
+```bash
+export TF_VAR_project_id="cloud-run-dsh"
+export TF_VAR_ai_agent_impersonators='["user:you@example.com"]'
+
+terraform -chdir=infra/terraform init -backend=false
+terraform -chdir=infra/terraform apply \
+  -target=google_service_account.ai_agent \
+  -target=google_project_iam_member.ai_agent_project_roles \
+  -target=google_service_account_iam_member.ai_agent_impersonators \
+  -target=google_service_account_iam_member.ai_agent_act_as_agent_host \
+  -target=google_service_account_iam_member.ai_agent_act_as_control_plane
+
+export AI_AGENT_SA="$(terraform -chdir=infra/terraform output -raw ai_agent_service_account_email)"
+gcloud config set project "$TF_VAR_project_id"
+gcloud config set auth/impersonate_service_account "$AI_AGENT_SA"
+gcloud auth print-access-token >/dev/null
+```
+
+The default project roles allow Cloud Run administration and Artifact
+Registry image pushes. Add further roles only when the agent's workload
+requires them; do not create a service-account key. To clear the local
+impersonation setting, run `gcloud config unset auth/impersonate_service_account`.
 
 ## Values that MUST be supplied out-of-band
 
