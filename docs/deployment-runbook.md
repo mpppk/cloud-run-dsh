@@ -334,9 +334,12 @@ The control plane (`apps/control-plane`) is **not** provisioned by the T2 Terraf
 export CP_SA_EMAIL="$(terraform -chdir=infra/terraform output -raw control_plane_service_account_email)"
 export CP_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-host/control-plane:v1"
 
-# (build the control-plane image analogously to Step 3; the control-plane app has
-#  no dedicated Dockerfile yet — reuse the agent-host pattern with ENTRYPOINT
-#  "bun run apps/control-plane/src/index.ts" or add one in a follow-up task)
+# (build the control-plane image analogously to Step 3:)
+#   docker build -f apps/control-plane/Dockerfile -t "$CP_IMAGE" .
+#  (the production entrypoint is apps/control-plane/src/main.ts; it requires
+#   DATABASE_URL, respects PORT, and serves /healthz + /readyz — see
+#   apps/control-plane/README.md. NOTE: until P11a the runtime registry is a
+#   placeholder, so workspace runtime operations answer 503.)
 gcloud run deploy control-plane \
   --project="$PROJECT_ID" --region="$REGION" \
   --image="$CP_IMAGE" \
@@ -482,7 +485,7 @@ This runbook was authored against a machine with **no gcloud credentials and no 
 | Step 3 | `docker build` of the agent-host image was not run here; the Dockerfile's `bun run typecheck` stage depends on the workspace installing cleanly in-container. |
 | Step 4 | Migration runner against real Cloud SQL (proxy, private-IP path, `DATABASE_URL` with the Cloud SQL connection name) — untested against a live instance; the runner itself is covered by unit tests. |
 | Step 5 | **Highest risk.** The Instance create call (REST field names, `gcloud run instances` availability, sandbox-launcher flag spelling, private-IP `DATABASE_URL` scheme inside the instance) is Preview surface that could not be probed at all without a Preview-enabled project. Verify every field against the current REST reference before running. |
-| Step 6 | Control-plane image build + `gcloud run deploy` + IAP frontend wiring — unexecuted; the control-plane app has no dedicated Dockerfile in this baseline (called out above). |
+| Step 6 | `gcloud run deploy` + IAP frontend wiring — unexecuted (needs a real project). The image itself now builds (see the control-plane Dockerfile) and was verified locally: `docker build` + container start + `/healthz` curl (see the P3 PR verification). Note the runtime registry is a placeholder until P11a — runtime operations answer 503. |
 | Step 7 | Smoke checks — depend on Steps 4–6. |
 | Step 8 | `terraform destroy` behavior with real state; Instance stop/delete endpoint names under the Preview API. |
 

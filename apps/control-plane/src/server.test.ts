@@ -334,6 +334,48 @@ describe("authentication", () => {
   });
 });
 
+describe("readiness endpoint", () => {
+  test("no readiness probe in deps -> ready", async () => {
+    const h = startHarness();
+    try {
+      const res = await fetch(h.url("/readyz"));
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ status: "ready" });
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("honest readiness: a not-ready probe (placeholder runtime registry) -> 503 with reason", async () => {
+    const h = startHarness({
+      readiness: () => ({
+        ready: false,
+        reason: "workspace runtime operations are unavailable: RuntimeRegistry is a placeholder",
+      }),
+    });
+    try {
+      const res = await fetch(h.url("/readyz"));
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body.status).toBe("not_ready");
+      expect(body.reason).toContain("RuntimeRegistry is a placeholder");
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("a ready probe -> 200", async () => {
+    const h = startHarness({ readiness: () => ({ ready: true }) });
+    try {
+      const res = await fetch(h.url("/readyz"));
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ status: "ready" });
+    } finally {
+      h.stop();
+    }
+  });
+});
+
 describe("membership authorization (仕様書 sections 21/26 item 7)", () => {
   let h: TestHarness;
   let workspaceId: string;

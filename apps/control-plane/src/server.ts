@@ -103,6 +103,22 @@ export function createFetchHandler(deps: ControlPlaneDeps): (request: Request) =
         });
       }
 
+      // Readiness endpoint: honestly reflects degraded capability (e.g. the
+      // production runtime registry being a placeholder). Served before auth,
+      // like /healthz — it must be probeable by the platform.
+      if (url.pathname === "/readyz" && request.method === "GET") {
+        const report = deps.readiness?.();
+        if (report && !report.ready) {
+          return new Response(
+            JSON.stringify({ status: "not_ready", reason: report.reason }),
+            { status: 503, headers: { "content-type": "application/json; charset=utf-8" } },
+          );
+        }
+        return new Response(JSON.stringify({ status: "ready" }), {
+          headers: { "content-type": "application/json; charset=utf-8" },
+        });
+      }
+
       const pathSegments = url.pathname.split("/").filter((s) => s.length > 0);
 
       // 1. Authentication: IAP identity -> internal user (仕様書 section 21).

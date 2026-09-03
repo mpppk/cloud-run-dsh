@@ -7,10 +7,12 @@ export type ApiErrorCode =
   | "forbidden"
   | "not_found"
   | "conflict"
+  | "unavailable"
   | "internal";
 
 export class ApiError extends Error {
-  readonly name = "ApiError";
+  // Typed as `string` so subclasses can carry their own name.
+  readonly name: string = "ApiError";
 
   constructor(
     public readonly status: number,
@@ -44,4 +46,9 @@ export function conflict(message: string): ApiError {
 /** 500 responses are generic — no internals leak (仕様書 section 26 item 7). */
 export function internalError(): ApiError {
   return new ApiError(500, "internal", "internal server error");
+}
+
+/** 503: the service is up but a capability is unavailable (e.g. runtime not wired). */
+export function unavailable(message: string): ApiError {
+  return new ApiError(503, "unavailable", message);
 }

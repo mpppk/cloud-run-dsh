@@ -7,3 +7,6 @@ infra
 tests
 *.md
 .github
+.env
+.env.*
+.local
