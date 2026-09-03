@@ -18,7 +18,7 @@ This runbook takes an operator from an **empty Google Cloud project** to a **dep
 
 Scope of the Terraform baseline (what you are about to create):
 
-- 9 APIs enabled (`run`, `sqladmin`, `secretmanager`, `artifactregistry`, `storage`, `iap`, `logging`, `monitoring`, `servicenetworking`) — `apis.tf`
+- 11 APIs enabled (`cloudresourcemanager`, `iam`, `run`, `sqladmin`, `secretmanager`, `artifactregistry`, `storage`, `iap`, `logging`, `monitoring`, `servicenetworking`) — `apis.tf`
 - Artifact Registry Docker repository `agent-host` — `artifact_registry.tf`
 - Cloud SQL PostgreSQL 16, **private IP only** (own VPC + Service Networking peering), database `dsh`, user `dsh_app` — `cloudsql.tf`
 - GCS checkpoint bucket (uniform access, versioning, ARCHIVED-object 30-day lifecycle) — `storage.tf`

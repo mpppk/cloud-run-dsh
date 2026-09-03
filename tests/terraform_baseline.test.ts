@@ -77,9 +77,11 @@ describe("content checks", () => {
     expect(c).toMatch(/variable "iap_members"/);
   });
 
-  test("apis.tf enables 9 apis including servicenetworking", () => {
+  test("apis.tf enables 11 apis including IAM, Resource Manager, and servicenetworking", () => {
     const c = tfContents["apis.tf"];
     for (const api of [
+      "cloudresourcemanager.googleapis.com",
+      "iam.googleapis.com",
       "run.googleapis.com",
       "sqladmin.googleapis.com",
       "secretmanager.googleapis.com",

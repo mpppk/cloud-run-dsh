@@ -6,7 +6,7 @@
  *   1. gcloud / terraform / docker present, with versions
  *   2. gcloud authenticated
  *   3. a project configured + billing enabled
- *   4. the 9 APIs the Terraform baseline enables
+ *   4. the 11 APIs the Terraform baseline enables
  *   5. caller permissions (via read-only probes against each service)
  *   6. infra/terraform fmt/validate
  *
@@ -101,6 +101,8 @@ function parseTerraformVersion(out: string): string {
 // ------------------------------------------------------------- 2-6. gcloud
 
 const REQUIRED_APIS = [
+  "cloudresourcemanager.googleapis.com",
+  "iam.googleapis.com",
   "run.googleapis.com",
   "sqladmin.googleapis.com",
   "secretmanager.googleapis.com",
