@@ -24,12 +24,21 @@ COPY packages/workspace-checkpoint/package.json packages/workspace-checkpoint/pa
 COPY packages/workspace-runtime/package.json packages/workspace-runtime/package.json
 RUN bun install --frozen-lockfile
 
-# --- build: typecheck the workspace ------------------------------------------
+# --- build: assemble the workspace -------------------------------------------
+#
+# Typechecking deliberately does NOT run here. It is enforced by CI and by
+# `bunx tsc --build` locally; re-running it during packaging buys nothing and
+# makes the image unbuildable on a cross-architecture host: under qemu
+# (arm64 host -> linux/amd64 image) `bun run typecheck` dies immediately with
+#   ASSERTION FAILED: MemoryExhaustion ... JSC::LocalAllocator::allocateSlowCase
+#   panic(main thread): abort() called   (Bun v1.4.0, exit code 134)
+# Cloud Run only runs linux/amd64, so every image destined for GCP must be
+# built with `--platform linux/amd64`; keeping the typecheck here would force
+# that build onto a native amd64 machine for no packaging benefit.
 FROM deps AS build
 COPY tsconfig.json tsconfig.base.json ./
 COPY apps ./apps
 COPY packages ./packages
-RUN bun run typecheck
 
 # --- runtime -----------------------------------------------------------------
 FROM oven/bun:1-slim AS runtime

@@ -54,7 +54,11 @@ resource "google_sql_database_instance" "main" {
   deletion_protection = false
 
   settings {
-    tier              = var.db_tier
+    tier = var.db_tier
+    # MUST be explicit. Without it the API defaults this instance to
+    # ENTERPRISE_PLUS, which rejects db-custom-* tiers with
+    # "Invalid Tier (db-custom-1-3840) for (ENTERPRISE_PLUS) Edition".
+    edition           = var.db_edition
     availability_type = "ZONAL"
     disk_autoresize   = true
     disk_type         = "PD_SSD"

@@ -142,3 +142,26 @@ variable "labels" {
   type        = map(string)
   default     = {}
 }
+
+variable "db_edition" {
+  description = "Cloud SQL edition. Must match var.db_tier: db-custom-* tiers require ENTERPRISE; ENTERPRISE_PLUS only accepts db-perf-optimized-N-* tiers. Left implicit the API picks ENTERPRISE_PLUS and rejects db-custom-*."
+  type        = string
+  default     = "ENTERPRISE"
+
+  validation {
+    condition     = contains(["ENTERPRISE", "ENTERPRISE_PLUS"], var.db_edition)
+    error_message = "db_edition must be ENTERPRISE or ENTERPRISE_PLUS."
+  }
+}
+
+variable "run_subnet_cidr" {
+  description = "CIDR for the Cloud Run Direct VPC egress subnet. Must not overlap the Private Services Access range reserved by google_compute_global_address.sql_private_ip."
+  type        = string
+  default     = "10.200.0.0/24"
+}
+
+variable "vpc_connector_cidr" {
+  description = "Unused /28 for the Serverless VPC Access connector. Must not overlap the Cloud Run subnet or the Private Services Access range."
+  type        = string
+  default     = "10.201.0.0/28"
+}
