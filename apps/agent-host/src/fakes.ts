@@ -260,6 +260,10 @@ export function makeConfig(overrides: Partial<AgentHostConfig> = {}): AgentHostC
     gcpRegion: "us-central1",
     sandboxCliPath: "/usr/local/gcp/bin/sandbox",
     allowEgress: true,
+    llmBaseUrl: "https://openrouter.ai/api/v1",
+    llmApiKeyEnv: "OPENROUTER_API_KEY",
+    llmModel: "deepseek/deepseek-v4-flash",
+    llmApprovalPolicy: "ask",
     ...overrides,
   };
 }

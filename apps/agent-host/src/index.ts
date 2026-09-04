@@ -8,6 +8,7 @@ import { composeAgentHost } from "./composition.js";
 import type { AgentHostDependencies } from "./composition.js";
 import { readAgentHostConfig } from "./config.js";
 import { createHarnessComposition } from "./harness-real.js";
+import { HarnessTurnStarter } from "./turn.js";
 import {
   BunSqlLeaseStore,
   BunSqlQueryExecutor,
@@ -39,6 +40,14 @@ export async function createProductionDependencies(
   const executor = await BunSqlQueryExecutor.connect(config.databaseUrl);
   const repository = await createSessionRepository(config.databaseUrl);
 
+  // Real DeepSeek Harness filesystem/search composition (see harness above).
+  const harness = await createHarnessComposition(config.workspaceRoot);
+  // Agent turn starter (issue #21): its own cordis composition (harness base
+  // + agent loop + LLM adapter + approvals) sharing the workspace root and
+  // the session repository. Plugin load never touches the network — the LLM
+  // key is resolved per request — so a missing key fails turns, not boot.
+  const turnStarter = await HarnessTurnStarter.create({ config, repository, logger });
+
   return {
     config,
     git: new ExecGitRunner(),
@@ -57,7 +66,8 @@ export async function createProductionDependencies(
     // Real DeepSeek Harness composition (実装手順書 section 10): fs-sandbox +
     // fs-observation-policy + tool-fs + tool-fs-search, workspace-write on
     // config.workspaceRoot.
-    harness: await createHarnessComposition(config.workspaceRoot),
+    harness,
+    turnStarter,
   };
 }
 

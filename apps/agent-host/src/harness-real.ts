@@ -116,20 +116,16 @@ function mapFsError(error: unknown, path: string, workspaceRoot: string): unknow
 }
 
 /**
- * Assemble the real DeepSeek Harness composition behind the
- * `HarnessComposition` adapter. Mounting is asynchronous (cordis plugin
- * settlement), so this returns a promise; the production entrypoint awaits it
- * in `createProductionDependencies` before composing the host.
- * @param workspaceRoot - the `workspace-write` workspace root (production: /workspace).
+ * Mount the filesystem/search base plugins on `ctx` (issue #21 shared with
+ * the agent-turn composition in turn.ts): sessionProjections, systemPrompt,
+ * tools, sandboxPolicy, fs, fs-observation-policy, subprocess, tool-fs,
+ * tool-fs-search. Service mounting order follows the inject chains (see
+ * createHarnessComposition).
  */
-export async function createHarnessComposition(
-  workspaceRoot: string = "/workspace",
-): Promise<HarnessComposition> {
-  const ctx = new Context();
-
-  // Service mounting order follows the inject chains: sessionProjections ←
-  // sandboxPolicy; systemPrompt ← tools ← tool-fs / tool-fs-search; and
-  // sandboxPolicy ← ctx.fs (SandboxedFileSystem).
+export async function mountHarnessBasePlugins(
+  ctx: Context,
+  workspaceRoot: string,
+): Promise<void> {
   await ctx.plugin(SessionProjectionRegistry);
   await ctx.plugin(SystemPrompt, SystemPrompt.Config({ includeHarnessIdentity: false }));
   await ctx.plugin(ToolRuntime, { mode: "native" });
@@ -148,6 +144,24 @@ export async function createHarnessComposition(
     { inject: toolFsSearchInject, apply: applyToolFsSearch },
     ToolFsSearchConfig({ sampleOverCapGlobResults: false }),
   );
+}
+
+/**
+ * Assemble the real DeepSeek Harness composition behind the
+ * `HarnessComposition` adapter. Mounting is asynchronous (cordis plugin
+ * settlement), so this returns a promise; the production entrypoint awaits it
+ * in `createProductionDependencies` before composing the host.
+ * @param workspaceRoot - the `workspace-write` workspace root (production: /workspace).
+ */
+export async function createHarnessComposition(
+  workspaceRoot: string = "/workspace",
+): Promise<HarnessComposition> {
+  const ctx = new Context();
+
+  // Service mounting order follows the inject chains: sessionProjections ←
+  // sandboxPolicy; systemPrompt ← tools ← tool-fs / tool-fs-search; and
+  // sandboxPolicy ← ctx.fs (SandboxedFileSystem).
+  await mountHarnessBasePlugins(ctx, workspaceRoot);
 
   const fs = ctx.get("fs");
   if (fs === undefined) {
