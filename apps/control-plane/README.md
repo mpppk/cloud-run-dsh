@@ -19,6 +19,10 @@ the two.
 | `AGENT_HOST_DATABASE_URL` | **yes** | — | `DATABASE_URL` injected into created Instances. Must use the Cloud SQL **socket** form (`postgresql://dsh_app:<pw>@/dsh?host=/cloudsql/<conn>`) — Instances reach Cloud SQL through the `cloudSqlInstance` volume, never over TCP. |
 | `GITHUB_APP_ID` | **yes** | — | GitHub App ID injected into created Instances. |
 | `GITHUB_APP_PRIVATE_KEY_PEM` | **yes** | — | GitHub App private key PEM injected into created Instances. Prefer `--set-secrets` at deploy time so it never touches shell history. |
+| `OPENROUTER_API_KEY` | **yes** | — | OpenRouter API key injected into created Instances as `OPENROUTER_API_KEY` (issue #41 — the agent-host resolves it per LLM request via its default `LLM_API_KEY_ENV`). Without it the first turn dies with `MISSING_CREDENTIAL`, so it is required at boot: a missing key fails startup, never a turn. Same secret posture as the PEM — plain env value into Instances, never logged. Prefer `--set-secrets` at deploy time. |
+| `LLM_BASE_URL` | no | agent-host default (`https://openrouter.ai/api/v1`) | Passed through to created Instances only when set. |
+| `LLM_MODEL` | no | agent-host default (`deepseek/deepseek-v4-flash`) | Passed through to created Instances only when set. |
+| `LLM_APPROVAL_POLICY` | no | agent-host default (`ask`) | Passed through to created Instances only when set (`ask` or `never`; anything else fails startup). |
 | `GCP_ACCESS_TOKEN` | no | metadata server | GCP OAuth2 token for the Instances API + GCS. On Cloud Run it is resolved from the metadata server automatically (the control-plane SA needs `roles/run.admin`); set explicitly only for local runs. Production-grade token handling (caching/refresh) is #27. |
 | `PORT` | no | `8080` | Listen port. Cloud Run injects this; the server always listens on `0.0.0.0:$PORT` (実装手順書 section 24). |
 
@@ -42,7 +46,7 @@ export DATABASE_URL=postgres://dsh:dsh@localhost:5432/dsh
 bun run db:migrate
 
 # run the container against the compose Postgres.
-# NOTE: the production entrypoint requires all 9 env keys in the table above
+# NOTE: the production entrypoint requires all 10 env keys in the table above
 # (it fails fast with MissingRequiredEnvError otherwise). For a bare
 # liveness probe, dummy values for the GCP/agent-host keys suffice — but
 # open/stop will then fail against the fake project. Real values come from
@@ -53,6 +57,7 @@ docker run --rm -p 8080:8080 \
   -e AGENT_HOST_IMAGE="demo-image" -e AGENT_HOST_SERVICE_ACCOUNT="demo-sa" \
   -e CHECKPOINT_BUCKET="demo-bucket" -e AGENT_HOST_DATABASE_URL="postgres://demo" \
   -e GITHUB_APP_ID="0" -e GITHUB_APP_PRIVATE_KEY_PEM="demo-pem" \
+  -e OPENROUTER_API_KEY="demo-key" \
   control-plane
 
 curl -s http://localhost:8080/healthz   # {"status":"ok"}

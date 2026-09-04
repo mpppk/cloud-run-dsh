@@ -119,9 +119,21 @@ export function defaultInstanceName(workspace: Pick<Workspace, "id" | "instanceN
 
 /**
  * The 13 agent-host REQUIRED_ENV_KEYS (apps/agent-host/src/config.ts) for one
- * workspace. The exact key set is asserted in tests — dropping one produces an
- * instance whose agent-host crashes at boot with MissingRequiredEnvError, so
+ * workspace, PLUS the LLM key the agent-host resolves per request via its
+ * default LLM_API_KEY_ENV=OPENROUTER_API_KEY (issue #41), PLUS whichever of
+ * the optional LLM_BASE_URL / LLM_MODEL / LLM_APPROVAL_POLICY overrides the
+ * control plane was configured with (absent = agent-host default applies).
+ * The exact key set is asserted in tests — dropping one produces an
+ * instance whose agent-host crashes at boot with MissingRequiredEnvError
+ * (or whose first turn dies with MISSING_CREDENTIAL for the LLM key), so
  * this list must stay in lockstep with the agent-host config.
+ *
+ * Fail-fast (#22 "never fake success"): a blank LLM key throws HERE — before
+ * any Instances API call — so open() rejects without creating anything.
+ * The error names the missing variable only; the key VALUE is never
+ * interpolated into it, and this return value is never logged (the only
+ * consumer is the Instances API create body; no logger in this module takes
+ * it — keep it that way).
  */
 export function buildInstanceEnv(
   config: ControlPlaneConfig,
@@ -129,12 +141,23 @@ export function buildInstanceEnv(
   instanceName: string,
   controllerId: string,
 ): Record<string, string> {
+  if (config.openrouterApiKey.trim() === "") {
+    throw new Error(
+      "cannot build instance env: OPENROUTER_API_KEY is not configured — " +
+        "set it on the control plane so created Instances can call the LLM " +
+        "(refusing to create a credential-less Instance that would fail its first turn)",
+    );
+  }
   return {
     WORKSPACE_ID: workspace.id,
     CHECKPOINT_BUCKET: config.checkpointBucket,
     DATABASE_URL: config.agentHostDatabaseUrl,
     GITHUB_APP_ID: config.githubAppId,
     GITHUB_APP_PRIVATE_KEY_PEM: config.githubAppPrivateKeyPem,
+    OPENROUTER_API_KEY: config.openrouterApiKey,
+    ...(config.llmBaseUrl !== undefined ? { LLM_BASE_URL: config.llmBaseUrl } : {}),
+    ...(config.llmModel !== undefined ? { LLM_MODEL: config.llmModel } : {}),
+    ...(config.llmApprovalPolicy !== undefined ? { LLM_APPROVAL_POLICY: config.llmApprovalPolicy } : {}),
     REPOSITORY_OWNER: workspace.repositoryOwner,
     REPOSITORY_NAME: workspace.repositoryName,
     BASE_BRANCH: workspace.baseBranch,

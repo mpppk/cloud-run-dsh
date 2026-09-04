@@ -31,6 +31,7 @@ function fullEnv(): Record<string, string> {
     AGENT_HOST_DATABASE_URL: "postgresql://x",
     GITHUB_APP_ID: "123",
     GITHUB_APP_PRIVATE_KEY_PEM: "pem",
+    OPENROUTER_API_KEY: "sk-or-v1-test",
   };
 }
 
@@ -55,6 +56,7 @@ describe("readControlPlaneConfig", () => {
       "AGENT_HOST_DATABASE_URL",
       "GITHUB_APP_ID",
       "GITHUB_APP_PRIVATE_KEY_PEM",
+      "OPENROUTER_API_KEY",
     ];
     for (const key of required) {
       const env = fullEnv();
@@ -87,6 +89,51 @@ describe("readControlPlaneConfig", () => {
     expect(config.agentHostDatabaseUrl).toBe("postgresql://x");
     expect(config.githubAppId).toBe("123");
     expect(config.githubAppPrivateKeyPem).toBe("pem");
+    expect(config.openrouterApiKey).toBe("sk-or-v1-test");
+    // Optional LLM overrides default to "agent-host decides".
+    expect(config.llmBaseUrl).toBeUndefined();
+    expect(config.llmModel).toBeUndefined();
+    expect(config.llmApprovalPolicy).toBeUndefined();
+  });
+
+  test("missing OPENROUTER_API_KEY fails boot with the key NAME only (no value to leak)", () => {
+    const env = fullEnv();
+    delete env["OPENROUTER_API_KEY"];
+    try {
+      readControlPlaneConfig(env);
+      expect.unreachable();
+    } catch (e) {
+      expect(e).toBeInstanceOf(MissingRequiredEnvError);
+      expect((e as MissingRequiredEnvError).missing).toEqual(["OPENROUTER_API_KEY"]);
+      expect(String(e)).toContain("OPENROUTER_API_KEY");
+      expect(String(e)).not.toContain("sk-or-v1-test");
+    }
+  });
+
+  test("optional LLM overrides parse through; blanks mean unset; bad policy fails", () => {
+    const config = readControlPlaneConfig({
+      ...fullEnv(),
+      LLM_BASE_URL: "https://llm.example.test/v1",
+      LLM_MODEL: "example/model-x",
+      LLM_APPROVAL_POLICY: "never",
+    });
+    expect(config.llmBaseUrl).toBe("https://llm.example.test/v1");
+    expect(config.llmModel).toBe("example/model-x");
+    expect(config.llmApprovalPolicy).toBe("never");
+
+    const blanked = readControlPlaneConfig({
+      ...fullEnv(),
+      LLM_BASE_URL: "   ",
+      LLM_MODEL: "",
+      LLM_APPROVAL_POLICY: "  ",
+    });
+    expect(blanked.llmBaseUrl).toBeUndefined();
+    expect(blanked.llmModel).toBeUndefined();
+    expect(blanked.llmApprovalPolicy).toBeUndefined();
+
+    expect(() =>
+      readControlPlaneConfig({ ...fullEnv(), LLM_APPROVAL_POLICY: "sometimes" }),
+    ).toThrow(/invalid LLM_APPROVAL_POLICY/);
   });
 
   test("PORT defaults to 8080 (Cloud Run injects PORT in production)", () => {
