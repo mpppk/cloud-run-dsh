@@ -4,6 +4,7 @@ import {
   INSTANCE_PROFILES,
   AVAILABLE_PROFILES,
   configForProfile,
+  toApiRestartPolicy,
   ProfileNotAvailableError,
   InvalidRestartPolicyError,
   InstanceNotFoundError,
@@ -102,45 +103,134 @@ describe("cloud-run-instance-client restartPolicy always rejection", () => {
 
 describe("cloud-run-instance-client request shapes", () => {
   const basePath = "projects/test-proj/locations/us-central1";
+  const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
 
-  test("create request shape", async () => {
+  test("toApiRestartPolicy maps to the v2 API enum", () => {
+    expect(toApiRestartPolicy("on-failure")).toBe("ON_FAILURE");
+    expect(toApiRestartPolicy("never")).toBe("NEVER");
+    expect(toApiRestartPolicy("always")).toBe("ALWAYS");
+  });
+
+  test("create request shape matches v2 GoogleCloudRunV2Instance", async () => {
     const transport = new FakeTransport(async (req) => ({
       status: 200,
-      body: { name: "dsh-ws-1", state: "READY", url: "https://example.run.app" },
+      body: { name: `${basePath}/instances/dsh-ws-123`, done: true, response: { name: `${basePath}/instances/dsh-ws-123`, terminalCondition: { state: "CONDITION_SUCCEEDED" }, urls: ["https://example.run.app"] } },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath });
+    const client = new CloudRunInstanceClient({
+      transport,
+      basePath,
+      image: IMAGE,
+      serviceAccount: "agent-host@test-proj.iam.gserviceaccount.com",
+    });
 
     const info = await client.create({ id: "ws-123" });
 
-    expect(info.name).toBe("dsh-ws-1");
+    expect(info.name).toBe(`${basePath}/instances/dsh-ws-123`);
+    expect(info.state).toBe("READY");
+    expect(info.url).toBe("https://example.run.app");
     const req = transport.lastRequest()!;
     expect(req.method).toBe("POST");
-    expect(req.url).toBe(`${basePath}/instances`);
+    // v2 create: instance id is a QUERY param; body `name` is ignored by the API
+    expect(req.url).toBe(`${basePath}/instances?instanceId=dsh-ws-123`);
     const body = req.body as Record<string, unknown>;
-    expect(body["workspaceId"]).toBe("ws-123");
-    expect(body["name"]).toBe("dsh-ws-123");
-    const resources = body["resources"] as Record<string, unknown>;
-    expect(resources["cpu"]).toBe(4);
-    expect(resources["memory"]).toBe("8Gi");
-    expect(body["restartPolicy"]).toBe("on-failure");
-    expect(body["sandboxLauncher"]).toBe(true);
-    expect(body["containerPort"]).toBe(8080);
+    expect(body["restartPolicy"]).toBe("ON_FAILURE");
+    expect(body["serviceAccount"]).toBe("agent-host@test-proj.iam.gserviceaccount.com");
+    const containers = body["containers"] as Array<Record<string, unknown>>;
+    expect(containers).toHaveLength(1);
+    expect(containers[0]!["image"]).toBe(IMAGE);
+    const resources = containers[0]!["resources"] as Record<string, unknown>;
+    const limits = resources["limits"] as Record<string, unknown>;
+    expect(limits["cpu"]).toBe("4");
+    expect(limits["memory"]).toBe("8Gi");
+    expect(containers[0]!["sandboxLauncher"]).toBe(true);
+    const ports = containers[0]!["ports"] as Array<Record<string, unknown>>;
+    expect(ports[0]!["containerPort"]).toBe(8080);
+    // no v1 leftovers
+    expect(body["template"]).toBeUndefined();
+    expect(body["workspaceId"]).toBeUndefined();
+    expect(body["name"]).toBeUndefined();
+    expect(body["resources"]).toBeUndefined();
+    expect(body["containerPort"]).toBeUndefined();
   });
 
-  test("create uses explicit instanceName when provided", async () => {
+  test("create does not send readOnly fields", async () => {
+    const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    await client.create({ id: "ws-1" });
+    const body = transport.lastRequest()!.body as Record<string, unknown>;
+    const readOnly = [
+      "createTime", "updateTime", "deleteTime", "expireTime", "etag", "generation",
+      "observedGeneration", "uid", "creator", "lastModifier", "reconciling",
+      "conditions", "terminalCondition", "containerStatuses", "urls", "logUri",
+    ];
+    for (const field of readOnly) expect(body[field]).toBeUndefined();
+  });
+
+  test("create appends validateOnly=true when requested", async () => {
+    const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    await client.create({ id: "ws-1" }, { validateOnly: true });
+    expect(transport.lastRequest()!.url).toBe(
+      `${basePath}/instances?instanceId=dsh-ws-1&validateOnly=true`,
+    );
+  });
+
+  test("create without validateOnly never sets the query parameter", async () => {
+    const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    await client.create({ id: "ws-1" });
+    expect(transport.lastRequest()!.url).toBe(`${basePath}/instances?instanceId=dsh-ws-1`);
+  });
+
+  test("create throws a typed error when no image is configured", async () => {
+    const transport = new FakeTransport(async () => ({ status: 200, body: {} }));
+    const client = new CloudRunInstanceClient({ transport, basePath });
+    await expect(client.create({ id: "ws-1" })).rejects.toBeInstanceOf(InstanceClientError);
+    expect(transport.requests).toHaveLength(0);
+  });
+
+  test("create uses explicit instanceName in the instanceId query param", async () => {
+    const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    await client.create({ id: "ws-123", instanceName: "my-instance" });
+    const req = transport.lastRequest()!;
+    expect(req.url).toBe(`${basePath}/instances?instanceId=my-instance`);
+    expect((req.body as Record<string, unknown>)["containers"]).toBeDefined();
+  });
+
+  test("create parses a pending v2 longrunning operation", async () => {
+    const transport = new FakeTransport(async () => ({
+      status: 200,
+      body: { name: "projects/test-proj/locations/us-central1/operations/op-1", done: false },
+    }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const info = await client.create({ id: "ws-1" });
+    expect(info.name).toBe(`${basePath}/instances/dsh-ws-1`);
+    expect(info.state).toBe("PENDING");
+  });
+
+  test("create throws when the completed operation carries an error", async () => {
+    const transport = new FakeTransport(async () => ({
+      status: 200,
+      body: { name: "projects/test-proj/locations/us-central1/operations/op-1", done: true, error: { code: 13, message: "internal boom" } },
+    }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    await expect(client.create({ id: "ws-1" })).rejects.toThrow("internal boom");
+  });
+
+  test("create falls back to parsing an instance body when the transport returns one", async () => {
     const transport = new FakeTransport(async () => ({
       status: 200,
       body: { name: "my-instance", state: "READY" },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath });
-    await client.create({ id: "ws-123", instanceName: "my-instance" });
-    const body = transport.lastRequest()!.body as Record<string, unknown>;
-    expect(body["name"]).toBe("my-instance");
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const info = await client.create({ id: "ws-1" });
+    expect(info.name).toBe("my-instance");
   });
 
   test("start request shape", async () => {
     const transport = new FakeTransport(async () => ({ status: 200, body: {} }));
-    const client = new CloudRunInstanceClient({ transport, basePath });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     await client.start("my-instance");
     const req = transport.lastRequest()!;
     expect(req.method).toBe("POST");
@@ -149,7 +239,7 @@ describe("cloud-run-instance-client request shapes", () => {
 
   test("stop request shape", async () => {
     const transport = new FakeTransport(async () => ({ status: 200, body: {} }));
-    const client = new CloudRunInstanceClient({ transport, basePath });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     await client.stop("my-instance");
     const req = transport.lastRequest()!;
     expect(req.method).toBe("POST");
@@ -161,7 +251,7 @@ describe("cloud-run-instance-client request shapes", () => {
       status: 200,
       body: { name: "my-instance", state: "READY", url: "https://example.run.app" },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     const info = await client.get("my-instance");
     expect(info.name).toBe("my-instance");
     expect(info.state).toBe("READY");
@@ -172,7 +262,7 @@ describe("cloud-run-instance-client request shapes", () => {
 
   test("delete request shape", async () => {
     const transport = new FakeTransport(async () => ({ status: 200, body: {} }));
-    const client = new CloudRunInstanceClient({ transport, basePath });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     await client.delete("my-instance");
     const req = transport.lastRequest()!;
     expect(req.method).toBe("DELETE");
@@ -184,7 +274,7 @@ describe("cloud-run-instance-client request shapes", () => {
       status: 200,
       body: { name: "x", state: "READY" },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     await client.create({ id: "ws-1" });
     await client.get("x");
     await client.start("x");
@@ -194,12 +284,54 @@ describe("cloud-run-instance-client request shapes", () => {
   });
 });
 
+describe("cloud-run-instance-client v2 response parsing", () => {
+  const basePath = "projects/test-proj/locations/us-central1";
+  const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
+
+  test("get derives READY from terminalCondition.state (v2 has no top-level state)", async () => {
+    const transport = new FakeTransport(async () => ({
+      status: 200,
+      body: {
+        name: `${basePath}/instances/my-instance`,
+        terminalCondition: { type: "Ready", state: "CONDITION_SUCCEEDED" },
+        urls: ["https://a.run.app", "https://b.run.app"],
+      },
+    }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const info = await client.get("my-instance");
+    expect(info.state).toBe("READY");
+    expect(info.url).toBe("https://a.run.app");
+  });
+
+  test("get derives FAILED/PENDING from terminalCondition.state", async () => {
+    const transport = new FakeTransport(async () => ({
+      status: 200,
+      body: { name: "x", terminalCondition: { state: "CONDITION_FAILED" } },
+    }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    expect((await client.get("x")).state).toBe("FAILED");
+
+    transport.setHandler(async () => ({
+      status: 200,
+      body: { name: "x", terminalCondition: { state: "CONDITION_RECONCILING" } },
+    }));
+    expect((await client.get("x")).state).toBe("PENDING");
+  });
+
+  test("get returns UNKNOWN when no state signal is present", async () => {
+    const transport = new FakeTransport(async () => ({ status: 200, body: { name: "x" } }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    expect((await client.get("x")).state).toBe("UNKNOWN");
+  });
+});
+
 describe("cloud-run-instance-client error mapping", () => {
   const basePath = "projects/test-proj/locations/us-central1";
+  const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
 
   test("404 maps to InstanceNotFoundError", async () => {
     const transport = new FakeTransport(async () => ({ status: 404, body: { message: "not found" } }));
-    const client = new CloudRunInstanceClient({ transport, basePath });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     await expect(client.get("missing")).rejects.toBeInstanceOf(InstanceNotFoundError);
     await expect(client.start("missing")).rejects.toBeInstanceOf(InstanceNotFoundError);
     await expect(client.stop("missing")).rejects.toBeInstanceOf(InstanceNotFoundError);
@@ -208,13 +340,13 @@ describe("cloud-run-instance-client error mapping", () => {
 
   test("409 maps to InstanceAlreadyExistsError", async () => {
     const transport = new FakeTransport(async () => ({ status: 409, body: { message: "already exists" } }));
-    const client = new CloudRunInstanceClient({ transport, basePath });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     await expect(client.create({ id: "ws-1" })).rejects.toBeInstanceOf(InstanceAlreadyExistsError);
   });
 
   test("create 409 error message reports the instance name, not the workspace id", async () => {
     const transport = new FakeTransport(async () => ({ status: 409, body: { message: "already exists" } }));
-    const client = new CloudRunInstanceClient({ transport, basePath });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     const err = await client.create({ id: "ws-1" }).catch((e) => e);
     expect(err).toBeInstanceOf(InstanceAlreadyExistsError);
     expect((err as Error).message).toContain("dsh-ws-1");
@@ -223,7 +355,7 @@ describe("cloud-run-instance-client error mapping", () => {
 
   test("create 409 error message reports an explicit instanceName when provided", async () => {
     const transport = new FakeTransport(async () => ({ status: 409, body: { message: "already exists" } }));
-    const client = new CloudRunInstanceClient({ transport, basePath });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     const err = await client.create({ id: "ws-1", instanceName: "my-instance" }).catch((e) => e);
     expect(err).toBeInstanceOf(InstanceAlreadyExistsError);
     expect((err as Error).message).toContain("my-instance");
@@ -232,7 +364,7 @@ describe("cloud-run-instance-client error mapping", () => {
 
   test("create 404 error message reports the instance name, not the workspace id", async () => {
     const transport = new FakeTransport(async () => ({ status: 404, body: {} }));
-    const client = new CloudRunInstanceClient({ transport, basePath });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     const err = await client.create({ id: "ws-1" }).catch((e) => e);
     expect(err).toBeInstanceOf(InstanceNotFoundError);
     expect((err as Error).message).toContain("dsh-ws-1");
@@ -240,19 +372,19 @@ describe("cloud-run-instance-client error mapping", () => {
 
   test("403 maps to PermissionDeniedError", async () => {
     const transport = new FakeTransport(async () => ({ status: 403, body: { message: "permission denied" } }));
-    const client = new CloudRunInstanceClient({ transport, basePath });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     await expect(client.get("x")).rejects.toBeInstanceOf(PermissionDeniedError);
   });
 
   test("5xx maps to InstanceClientError", async () => {
     const transport = new FakeTransport(async () => ({ status: 500, body: { message: "internal" } }));
-    const client = new CloudRunInstanceClient({ transport, basePath });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     await expect(client.get("x")).rejects.toBeInstanceOf(InstanceClientError);
   });
 
   test("create 404 also maps correctly", async () => {
     const transport = new FakeTransport(async () => ({ status: 404, body: {} }));
-    const client = new CloudRunInstanceClient({ transport, basePath });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     await expect(client.create({ id: "ws-1" })).rejects.toBeInstanceOf(InstanceNotFoundError);
   });
 });

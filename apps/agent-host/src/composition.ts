@@ -72,7 +72,11 @@ export interface AgentHostDependencies {
   readonly heartbeatScheduler?: IntervalScheduler;
   /** Real: persistent TransactionalStateStore. Test: InMemoryTransactionalStore. */
   readonly stateStore: TransactionalStateStore;
-  /** Optional: DeepSeek Harness composition. Defaults to the fake (see harness.ts TODO). */
+  /**
+   * DeepSeek Harness composition. Production passes the REAL composition
+   * (harness-real.ts, awaited in index.ts createProductionDependencies); when
+   * omitted (unit tests), a pure in-memory fake is used.
+   */
   readonly harness?: HarnessComposition;
   readonly clock?: Clock;
   readonly logger?: Logger;
@@ -112,6 +116,8 @@ export function composeAgentHost(deps: AgentHostDependencies): AgentHost {
   const clock = deps.clock ?? new SystemClock();
   const logger = deps.logger ?? createLogger({ defaultFields: { workspaceId: config.workspaceId } });
   const metrics = deps.metrics ?? new NoOpMetrics();
+  // Tests omit deps.harness and get the in-memory fake; production (index.ts)
+  // awaits createHarnessComposition(config.workspaceRoot) and passes it in.
   const harness = deps.harness ?? createFakeHarnessComposition(config.workspaceRoot);
 
   // GitHub Credential Broker (T7) — host-only secrets via injected provider.

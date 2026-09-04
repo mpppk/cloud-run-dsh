@@ -1,9 +1,13 @@
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
   HarnessPathRefusedError,
   HarnessWriteRefusedError,
   createFakeHarnessComposition,
 } from "./harness.js";
+import { createHarnessComposition } from "./harness-real.js";
 
 describe("fake harness composition", () => {
   test("observation policy is workspace-write on /workspace", () => {
@@ -53,6 +57,95 @@ describe("fake harness composition", () => {
 
   test("restoreSessions records sessions", async () => {
     const harness = createFakeHarnessComposition("/workspace");
+    await harness.restoreSessions({
+      sessions: [
+        {
+          id: "s1",
+          workspaceId: "ws-1",
+          metadata: {},
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      eventsBySession: {},
+    });
+    expect(harness.restoredSessions().map((s) => s.id)).toEqual(["s1"]);
+  });
+});
+
+describe("real harness composition (@deepseek-ai packages, 実装手順書 section 10)", () => {
+  test("observation policy is workspace-write on the configured workspace root", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "dsh-harness-real-"));
+    const harness = await createHarnessComposition(workspaceRoot);
+    expect(harness.observationPolicy.mode).toBe("workspace-write");
+    expect(harness.observationPolicy.workspaceRoot).toBe(workspaceRoot);
+  });
+
+  test("refuses write to /etc/test (outside the workspace root, fs-sandbox fence)", async () => {
+    const harness = await createHarnessComposition("/workspace");
+    expect(
+      harness.filesystem.write("/etc/test", new TextEncoder().encode("x")),
+    ).rejects.toThrow(HarnessPathRefusedError);
+    // The refusal comes from the real fs-sandbox fence (FS_SANDBOX_DENIED),
+    // and no file was created outside the workspace.
+  });
+
+  test("refuses traversal escapes", async () => {
+    const harness = await createHarnessComposition("/workspace");
+    await expect(
+      harness.filesystem.write("../../etc/passwd", new Uint8Array(1)),
+    ).rejects.toThrow(HarnessPathRefusedError);
+    await expect(
+      harness.filesystem.write("/workspace/../../../etc/passwd", new Uint8Array(1)),
+    ).rejects.toThrow(HarnessPathRefusedError);
+    await expect(
+      harness.filesystem.read("/workspace/../secrets.txt"),
+    ).rejects.toThrow(HarnessPathRefusedError);
+  });
+
+  test("read-before-write on existing files (fs-observation-policy)", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "dsh-harness-real-"));
+    const harness = await createHarnessComposition(workspaceRoot);
+    // A file that exists before the harness owner observed it must not be
+    // overwritten without a prior read (real FS_NOT_OBSERVED refusal).
+    writeFileSync(join(workspaceRoot, "notes.txt"), "seed");
+    await expect(
+      harness.filesystem.write("notes.txt", new TextEncoder().encode("v2")),
+    ).rejects.toThrow(HarnessWriteRefusedError);
+    expect(readFileSync(join(workspaceRoot, "notes.txt"), "utf8")).toBe("seed");
+
+    // After a read, the write is allowed.
+    const read = await harness.filesystem.read("notes.txt");
+    expect(new TextDecoder().decode(read)).toBe("seed");
+    await harness.filesystem.write("notes.txt", new TextEncoder().encode("v2"));
+    expect(readFileSync(join(workspaceRoot, "notes.txt"), "utf8")).toBe("v2");
+  });
+
+  test("stale-write protection: externally modified file is refused (real FS_STALE_VERSION)", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "dsh-harness-real-"));
+    const harness = await createHarnessComposition(workspaceRoot);
+    const path = join(workspaceRoot, "stale.txt");
+    await harness.filesystem.write("stale.txt", new TextEncoder().encode("v1"));
+    // A write by another owner invalidates the observed version.
+    writeFileSync(path, "externally modified");
+    await expect(
+      harness.filesystem.write("stale.txt", new TextEncoder().encode("clobber")),
+    ).rejects.toThrow(HarnessWriteRefusedError);
+    // The external content is preserved.
+    expect(readFileSync(path, "utf8")).toBe("externally modified");
+  });
+
+  test("search returns workspace-relative paths (real tool-fs-search grep)", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "dsh-harness-real-"));
+    const harness = await createHarnessComposition(workspaceRoot);
+    await harness.filesystem.write("src/a.txt", new TextEncoder().encode("needle here"));
+    await harness.filesystem.write("src/b.txt", new TextEncoder().encode("nothing"));
+    expect(await harness.search.search("needle")).toEqual(["src/a.txt"]);
+  });
+
+  test("restoreSessions records sessions", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "dsh-harness-real-"));
+    const harness = await createHarnessComposition(workspaceRoot);
     await harness.restoreSessions({
       sessions: [
         {

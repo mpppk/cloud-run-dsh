@@ -1,0 +1,57 @@
+# Automated gates for the workspace.
+#
+# This exists because apps/agent-host/Dockerfile no longer runs `bun run
+# typecheck` during the image build. That step used to be the ONLY automated
+# typecheck in the repository, and it had to go: cross-building the image for
+# linux/amd64 from an arm64 host makes bun abort inside qemu
+# ("ASSERTION FAILED: MemoryExhaustion", exit 134). Removing it without
+# replacing the gate would have left type safety to human discipline alone.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    name: typecheck + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+      - run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bunx tsc --build
+      - name: Tests
+        run: bun test
+
+  terraform:
+    name: terraform fmt + validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - name: Format check
+        run: terraform -chdir=infra/terraform fmt -check -recursive
+      # -backend=false keeps this offline: no credentials, no state, no plan.
+      - name: Validate
+        run: |
+          terraform -chdir=infra/terraform init -backend=false -input=false
+          terraform -chdir=infra/terraform validate
+
+  image:
+    name: agent-host image builds for linux/amd64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Native amd64 runner: this is the build that the arm64 dev host cannot do.
+      - name: Build agent-host
+        run: docker build --platform linux/amd64 -f apps/agent-host/Dockerfile -t agent-host:ci .
