@@ -59,7 +59,24 @@ export interface AgentTurnInput {
 
 export interface TurnStarter {
   startTurn(input: AgentTurnInput): Promise<void>;
+  /**
+   * Cancels the live turn for one session (issue #21 gateway /cancel seam).
+   * With no sessionId, cancels every live turn on this host. Returns how many
+   * live turns were cancelled. Optional so message-only starters keep
+   * compiling; when absent the gateway keeps its historical accept-only
+   * behavior.
+   */
+  cancelTurn?(sessionId?: string): Promise<number>;
+  /**
+   * Resolves one pending approval ask (issue #21 gateway /approvals seam).
+   * Accepts the DSH-issued `approval/asked` id or the tool call id.
+   * Returns true when a known ask was settled.
+   */
+  resolveApproval?(approvalId: string, decision: ApprovalDecision): Promise<boolean>;
 }
+
+/** HTTP-facing approval decision vocabulary (matches the control plane). */
+export type ApprovalDecision = "approved" | "rejected";
 
 export class AgentGateway {
   constructor(private readonly deps: AgentGatewayDeps) {}
@@ -165,12 +182,63 @@ export class AgentGateway {
     }
     // Meaningful activity (仕様書 section 11).
     this.deps.runtime.recordActivity(activity);
+    // Issue #21 turn effects (cancel / approval decision): additive to the
+    // historical accept-only behavior — routes, methods, and status codes are
+    // unchanged. Without a capable starter the response is exactly the old
+    // `{accepted, sessionId, activity}` 202.
+    const turnEffect = await this.applyTurnEffect(request, workspaceId, sessionId, activity);
     this.deps.logger.info("gateway.request.accepted", {
       userId: identity,
       sessionId,
       event_detail: activity,
+      ...turnEffect,
     });
-    return this.json(202, { accepted: true, sessionId, activity });
+    return this.json(202, { accepted: true, sessionId, activity, ...turnEffect });
+  }
+
+  /**
+   * Applies the issue #21 turn effect for approval/cancel inputs. Never
+   * throws: a failing effect is logged and the acceptance stands (the
+   * operation itself was recorded).
+   */
+  private async applyTurnEffect(
+    request: Request,
+    workspaceId: string,
+    sessionId: string | undefined,
+    activity: "approval" | "workspace_operation",
+  ): Promise<Record<string, unknown>> {
+    const starter = this.deps.turnStarter;
+    try {
+      if (activity === "approval" && sessionId !== undefined) {
+        const resolve = starter?.resolveApproval;
+        if (!resolve) return {};
+        const body = await readApprovalBody(request);
+        if (!body) {
+          this.deps.logger.warn("gateway.approval.ignored", {
+            workspaceId,
+            sessionId,
+            reason: "missing or malformed approval body (want {approvalId, decision})",
+          });
+          return {};
+        }
+        const approvalResolved = await resolve.call(starter, body.approvalId, body.decision);
+        return { approvalResolved };
+      }
+      if (activity === "workspace_operation") {
+        const cancel = starter?.cancelTurn;
+        if (!cancel) return {};
+        const turnsCancelled = await cancel.call(starter, sessionId);
+        return { turnsCancelled };
+      }
+    } catch (e) {
+      this.deps.logger.error("gateway.turn_effect.failed", {
+        workspaceId,
+        sessionId,
+        event_detail: activity,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+    return {};
   }
 
   /**
@@ -334,6 +402,36 @@ async function readForwardedBody(
     seq: record["seq"] as number,
     content: record["content"] as string,
   };
+}
+
+/**
+ * Reads the approval-decision body (`{approvalId, decision?}`). Empty bodies
+ * and malformed payloads yield null — the gateway keeps its historical
+ * accept-only 202 in that case (logged by the caller) instead of failing an
+ * operation it already recorded.
+ */
+async function readApprovalBody(
+  request: Request,
+): Promise<{ approvalId: string; decision: ApprovalDecision } | null> {
+  let text: string;
+  try {
+    text = await request.text();
+  } catch {
+    return null;
+  }
+  if (!text.trim()) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const record = parsed as Record<string, unknown>;
+  if (typeof record["approvalId"] !== "string" || record["approvalId"] === "") return null;
+  const decision = record["decision"] === undefined ? "approved" : record["decision"];
+  if (decision !== "approved" && decision !== "rejected") return null;
+  return { approvalId: record["approvalId"] as string, decision };
 }
 
 export type { InvalidOperationError };

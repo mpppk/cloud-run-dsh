@@ -9,6 +9,23 @@ export const DEFAULT_SANDBOX_CLI_PATH = "/usr/local/gcp/bin/sandbox";
 
 export const DEFAULT_PORT = 8080;
 
+export const DEFAULT_LLM_BASE_URL = "https://openrouter.ai/api/v1";
+
+export const DEFAULT_LLM_API_KEY_ENV = "OPENROUTER_API_KEY";
+
+/**
+ * Default wire model id (issue #21). Verified 2026-09-04 against the public
+ * `GET https://openrouter.ai/api/v1/models` catalog: `deepseek/deepseek-v4-flash`
+ * advertises `tools` in supported_parameters, carries a 1M-token context, and
+ * is the cheapest DeepSeek-family tool-calling model on the route
+ * ($0.088/MTok in at catalog time). DeepSeek-native is deliberate: the
+ * `dsh-llm-deepseek` adapter's DeepSeek-specific request fields are most
+ * likely to pass through on a DeepSeek model. Override with LLM_MODEL.
+ */
+export const DEFAULT_LLM_MODEL = "deepseek/deepseek-v4-flash";
+
+export type LlmApprovalPolicy = "ask" | "never";
+
 const REQUIRED_ENV_KEYS = [
   "WORKSPACE_ID",
   "CHECKPOINT_BUCKET",
@@ -59,6 +76,19 @@ export interface AgentHostConfig {
   readonly sandboxCliPath: string;
   /** Sandbox creation egress policy (実装手順書 section 9 uses --allow-egress). */
   readonly allowEgress: boolean;
+  /** OpenAI-compatible chat-completions endpoint base (issue #21). */
+  readonly llmBaseUrl: string;
+  /**
+   * Environment-variable NAME holding the LLM API key (issue #21). Only the
+   * name travels in config — the key value itself is resolved per request
+   * from the process environment (same rule as the adapter's `apiKeyEnv`:
+   * "a literal key is not a configuration value").
+   */
+  readonly llmApiKeyEnv: string;
+  /** Wire model id interpreted by the LLM provider adapter (issue #21). */
+  readonly llmModel: string;
+  /** Default approval policy for sessions without an override (issue #21). */
+  readonly llmApprovalPolicy: LlmApprovalPolicy;
 }
 
 /** Checkpoint object key for a workspace (仕様書 section 7). */
@@ -103,5 +133,22 @@ export function readAgentHostConfig(
     gcpRegion: env["GCP_REGION"]!.trim(),
     sandboxCliPath: env["SANDBOX_CLI_PATH"]?.trim() || DEFAULT_SANDBOX_CLI_PATH,
     allowEgress: env["SANDBOX_ALLOW_EGRESS"]?.trim() !== "false",
+    ...readLlmConfig(env),
   };
+}
+
+function readLlmConfig(
+  env: Readonly<Record<string, string | undefined>>,
+): Pick<AgentHostConfig, "llmBaseUrl" | "llmApiKeyEnv" | "llmModel" | "llmApprovalPolicy"> {
+  const llmBaseUrl = env["LLM_BASE_URL"]?.trim() || DEFAULT_LLM_BASE_URL;
+  const llmApiKeyEnv = env["LLM_API_KEY_ENV"]?.trim() || DEFAULT_LLM_API_KEY_ENV;
+  const llmModel = env["LLM_MODEL"]?.trim() || DEFAULT_LLM_MODEL;
+  if (llmModel === "") {
+    throw new Error("invalid LLM_MODEL: must be a non-empty model id");
+  }
+  const policyRaw = env["LLM_APPROVAL_POLICY"]?.trim() || "ask";
+  if (policyRaw !== "ask" && policyRaw !== "never") {
+    throw new Error(`invalid LLM_APPROVAL_POLICY: ${policyRaw} (want "ask" or "never")`);
+  }
+  return { llmBaseUrl, llmApiKeyEnv, llmModel, llmApprovalPolicy: policyRaw };
 }

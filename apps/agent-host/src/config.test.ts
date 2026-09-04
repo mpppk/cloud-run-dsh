@@ -30,6 +30,11 @@ describe("readAgentHostConfig", () => {
     expect(config.checkpointKey).toBe(defaultCheckpointKey("ws-9"));
     expect(config.sandboxCliPath).toBe("/usr/local/gcp/bin/sandbox");
     expect(config.allowEgress).toBe(true);
+    // Issue #21 LLM defaults: OpenRouter route, env-name credential ref, verified model.
+    expect(config.llmBaseUrl).toBe("https://openrouter.ai/api/v1");
+    expect(config.llmApiKeyEnv).toBe("OPENROUTER_API_KEY");
+    expect(config.llmModel).toBe("deepseek/deepseek-v4-flash");
+    expect(config.llmApprovalPolicy).toBe("ask");
   });
 
   test("missing env throws with the missing key names", () => {
@@ -57,5 +62,22 @@ describe("readAgentHostConfig", () => {
 
   test("invalid PORT is refused", () => {
     expect(() => readAgentHostConfig({ ...validEnv, PORT: "nope" })).toThrow(/invalid PORT/);
+  });
+
+  test("LLM settings honour overrides; bad approval policy is refused", () => {
+    const config = readAgentHostConfig({
+      ...validEnv,
+      LLM_BASE_URL: "https://example.com/v1",
+      LLM_API_KEY_ENV: "MY_KEY",
+      LLM_MODEL: "example/model",
+      LLM_APPROVAL_POLICY: "never",
+    });
+    expect(config.llmBaseUrl).toBe("https://example.com/v1");
+    expect(config.llmApiKeyEnv).toBe("MY_KEY");
+    expect(config.llmModel).toBe("example/model");
+    expect(config.llmApprovalPolicy).toBe("never");
+    expect(() =>
+      readAgentHostConfig({ ...validEnv, LLM_APPROVAL_POLICY: "sometimes" }),
+    ).toThrow(/invalid LLM_APPROVAL_POLICY/);
   });
 });

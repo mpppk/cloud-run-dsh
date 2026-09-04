@@ -27,6 +27,20 @@ class RecordingTurnStarter implements TurnStarter {
   }
 }
 
+/** Issue #21 stub: records the cancel/approval seam calls. */
+class SeamedTurnStarter extends RecordingTurnStarter {
+  cancelled: (string | undefined)[] = [];
+  approvals: { approvalId: string; decision: string }[] = [];
+  async cancelTurn(sessionId?: string): Promise<number> {
+    this.cancelled.push(sessionId);
+    return 1;
+  }
+  async resolveApproval(approvalId: string, decision: "approved" | "rejected"): Promise<boolean> {
+    this.approvals.push({ approvalId, decision });
+    return approvalId !== "unknown";
+  }
+}
+
 const IAP = { "x-goog-authenticated-user-email": "user@example.com" };
 
 async function gatewayWithReadyHost() {
@@ -103,8 +117,7 @@ describe("AgentGateway", () => {
     expect(starter.inputs).toHaveLength(1);
   });
 
-  test("requests without the controller lease are refused with 409", async () => {
-    const th = await gatewayWithReadyHost();
+  test("requests without the controller lease are refused with 409", async () => {    const th = await gatewayWithReadyHost();
     // Release the lease: the gateway must refuse controller-gated actions.
     await th.host.lease.release("ws-1", "ctrl-1");
     const res = await th.host.gateway.handle(
@@ -148,6 +161,56 @@ describe("AgentGateway", () => {
     expect(
       logger.parsed.some((e) => e["event"] === "gateway.turn.not_implemented"),
     ).toBe(true);
+  });
+
+  test("cancel reaches the starter's cancelTurn; approvals resolve by id", async () => {
+    const starter = new SeamedTurnStarter();
+    const th = await composeTestHost({}, { turnStarter: starter });
+    await seedWorkspace(th);
+    await th.host.recover();
+
+    const sessionCancel = await th.host.gateway.handle(
+      request("POST", "/workspaces/ws-1/sessions/s1/cancel", IAP),
+    );
+    expect(sessionCancel.status).toBe(202);
+    expect(await sessionCancel.json()).toMatchObject({ accepted: true, turnsCancelled: 1 });
+
+    const workspaceCancel = await th.host.gateway.handle(
+      request("POST", "/workspaces/ws-1/cancel", IAP),
+    );
+    expect(workspaceCancel.status).toBe(202);
+    expect(await workspaceCancel.json()).toMatchObject({ turnsCancelled: 1 });
+    expect(starter.cancelled).toEqual(["s1", undefined]);
+
+    const approval = await th.host.gateway.handle(
+      request("POST", "/workspaces/ws-1/sessions/s1/approvals", IAP, {
+        approvalId: "ask-1",
+        decision: "rejected",
+      }),
+    );
+    expect(approval.status).toBe(202);
+    expect(await approval.json()).toMatchObject({ accepted: true, approvalResolved: true });
+    expect(starter.approvals).toEqual([{ approvalId: "ask-1", decision: "rejected" }]);
+
+    // Unknown approval ids still 202 (acceptance stands) but report unresolved.
+    const unknownApproval = await th.host.gateway.handle(
+      request("POST", "/workspaces/ws-1/sessions/s1/approvals", IAP, {
+        approvalId: "unknown",
+        decision: "approved",
+      }),
+    );
+    expect(await unknownApproval.json()).toMatchObject({ approvalResolved: false });
+
+    // A body-less approval keeps the historical accept-only 202 shape.
+    const bodyless = await th.host.gateway.handle(
+      request("POST", "/workspaces/ws-1/sessions/s1/approvals", IAP),
+    );
+    expect(bodyless.status).toBe(202);
+    const bodylessJson = (await bodyless.json()) as Record<string, unknown>;
+    expect(bodylessJson).toMatchObject({ accepted: true });
+    expect("approvalResolved" in bodylessJson).toBe(false);
+    // Neither path starts a turn.
+    expect(starter.inputs).toHaveLength(0);
   });
 
   test("the gateway never appends user_message itself (single writer is the control plane)", async () => {
