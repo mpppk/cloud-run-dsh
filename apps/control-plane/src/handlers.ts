@@ -16,7 +16,11 @@ import {
   NotLeaseOwnerError,
 } from "@cloud-run-dsh/controller-lease";
 import type { Session, Workspace } from "@cloud-run-dsh/session-persistence-postgres";
-import { ApiError, badRequest, conflict, notFound } from "./errors.js";
+import { ApiError, badGateway, badRequest, conflict, notFound } from "./errors.js";
+import {
+  AgentHostConflictError,
+  type ForwardMessageArgs,
+} from "./forwarding.js";
 import { assertMember } from "./membership.js";
 import type { InternalUser } from "./auth.js";
 import type { ControlPlaneDeps } from "./deps.js";
@@ -196,6 +200,22 @@ export const postMessage: RouteHandler = async (ctx) => {
   handle.assertAgentInputAllowed();
   // A user message is meaningful activity (仕様書 section 11).
   handle.recordActivity("user_message");
+  // Resolve the forward target BEFORE appending: when the Instance is not
+  // running there is no turn to start, so answering 409 without writing
+  // avoids an orphan `user_message` no turn will ever consume.
+  const forwarder = ctx.deps.messageForwarder;
+  let instanceUrl: string | null = null;
+  if (forwarder) {
+    instanceUrl = await handle.getInstanceUrl();
+    if (!instanceUrl) {
+      throw conflict(
+        `workspace instance is not running — open the workspace first, then retry`,
+      );
+    }
+  }
+  // The control plane is the SOLE writer of `user_message` (issue #22):
+  // the agent-host starts the turn from the forwarded seq/content below
+  // and must not append the event again.
   const [event] = await ctx.deps.repo.append(session.id, [
     {
       eventType: "user_message",
@@ -203,6 +223,36 @@ export const postMessage: RouteHandler = async (ctx) => {
       data: { content },
     },
   ]);
+  if (forwarder && instanceUrl) {
+    const forwardArgs: ForwardMessageArgs = {
+      instanceUrl,
+      workspaceId: workspace.id,
+      sessionId: session.id,
+      seq: event!.seq,
+      content,
+      identity: { id: ctx.user.id, email: ctx.user.email },
+    };
+    try {
+      await forwarder.forward(forwardArgs);
+    } catch (e) {
+      // The host refused for a caller-actionable reason — propagate the 409
+      // (lease, stale state) instead of reporting a gateway failure.
+      if (e instanceof AgentHostConflictError) {
+        throw conflict(e.message);
+      }
+      // The event is recorded but the turn did not start: never fake the
+      // 201. Details go to the structured log; the response stays generic.
+      ctx.deps.logger?.error("control-plane.forward.failed", {
+        workspaceId: workspace.id,
+        sessionId: session.id,
+        seq: event!.seq,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      throw badGateway(
+        "message recorded but the workspace instance did not accept it — the turn did not start",
+      );
+    }
+  }
   return json(toEventDto(event!), 201);
 };
 

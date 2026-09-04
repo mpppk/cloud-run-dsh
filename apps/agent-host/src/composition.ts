@@ -41,7 +41,7 @@ import type { RecoveryResult } from "./recovery.js";
 import { HealthService } from "./health.js";
 import { LeaseHeartbeatLoop } from "./lease-heartbeat.js";
 import type { IntervalScheduler } from "./lease-heartbeat.js";
-import type { AgentGatewayDeps } from "./gateway.js";
+import type { AgentGatewayDeps, TurnStarter } from "./gateway.js";
 import { AgentGateway } from "./gateway.js";
 
 export interface AgentHostDependencies {
@@ -78,6 +78,13 @@ export interface AgentHostDependencies {
    * omitted (unit tests), a pure in-memory fake is used.
    */
   readonly harness?: HarnessComposition;
+  /**
+   * Turn starter for forwarded user messages (issue #22 seam; issue #21
+   * plugs the LLM turn in here). When omitted the gateway answers 503
+   * (turn_not_implemented) for messages so a missing turn never looks
+   * delivered.
+   */
+  readonly turnStarter?: TurnStarter;
   readonly clock?: Clock;
   readonly logger?: Logger;
   readonly metrics?: Metrics;
@@ -195,7 +202,14 @@ export function composeAgentHost(deps: AgentHostDependencies): AgentHost {
     metrics,
   });
 
-  const gatewayDeps: AgentGatewayDeps = { config, health, runtime, lease, logger };
+  const gatewayDeps: AgentGatewayDeps = {
+    config,
+    health,
+    runtime,
+    lease,
+    logger,
+    turnStarter: deps.turnStarter,
+  };
   const gateway = new AgentGateway(gatewayDeps);
 
   // Controller-lease renewal loop (review BLOCKER fix): without it the 45s

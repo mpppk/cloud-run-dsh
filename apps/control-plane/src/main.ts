@@ -22,6 +22,7 @@ import {
   createAuthenticatedInstanceTransport,
   createGcpAccessTokenProvider,
 } from "./prod-adapters.js";
+import { HttpAgentHostForwarder, createIdTokenProvider } from "./forwarding.js";
 import { OwnerMembershipStore } from "./prod-adapters.js";
 import { createProductionRuntimeRegistry } from "./runtime-factory.js";
 
@@ -56,6 +57,15 @@ async function main(): Promise<void> {
     membership: new OwnerMembershipStore(executor),
     runtimes,
     clock,
+    logger,
+    // Issue #22: forward appended user_message events to the workspace
+    // Instance (ID-token auth for invoker IAM). The forwarder makes
+    // postMessage 409 when the Instance has no URL (open first) and 502
+    // when the forward fails after the append (never a fake 201).
+    messageForwarder: new HttpAgentHostForwarder({
+      idTokenProvider: createIdTokenProvider(),
+      logger,
+    }),
   });
 
   logger.info(

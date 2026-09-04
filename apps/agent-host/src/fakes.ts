@@ -273,8 +273,10 @@ import { InMemoryLeaseStore } from "@cloud-run-dsh/controller-lease/testing";
 import { InMemoryTransactionalStore } from "@cloud-run-dsh/workspace-runtime";
 import { PostgresSessionPersistenceRepository } from "@cloud-run-dsh/session-persistence-postgres";
 import { InMemoryFakeExecutor } from "@cloud-run-dsh/session-persistence-postgres/testing";
+import type { Logger } from "@cloud-run-dsh/observability";
 import { composeAgentHost } from "./composition.js";
 import type { AgentHost } from "./composition.js";
+import type { TurnStarter } from "./gateway.js";
 
 export interface TestHost {
   readonly host: AgentHost;
@@ -293,6 +295,7 @@ export interface TestHost {
 
 export async function composeTestHost(
   configOverrides: Partial<AgentHostConfig> = {},
+  extra: { turnStarter?: TurnStarter; logger?: Logger } = {},
 ): Promise<TestHost> {
   const clock = new FakeClock();
   const git = new RecordingGitRunner();
@@ -323,6 +326,8 @@ export async function composeTestHost(
     stateStore: new InMemoryTransactionalStore({}, clock),
     clock,
     heartbeatScheduler: scheduler,
+    turnStarter: extra.turnStarter,
+    logger: extra.logger,
   });
 
   return { host, git, fs, storage, sandboxRunner, instance, leaseStore, executor, repository, clock, scheduler };

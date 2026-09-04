@@ -2,6 +2,13 @@
 // Every collaborator is faked — no real GCP, DB or network.
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { InMemoryLogger } from "@cloud-run-dsh/observability";
+import {
+  AgentHostConflictError,
+  AgentHostForwardError,
+  type ForwardMessageArgs,
+  type MessageForwarder,
+} from "./forwarding.js";
 import {
   AgentInputRefusedError,
   IdleManager,
@@ -208,8 +215,10 @@ class FakeHandle implements WorkspaceRuntimeHandle {
     this.recordActivity("checkpoint");
   }
 
+  instanceUrl: string | null = null;
+
   async getInstanceUrl(): Promise<string | null> {
-    return null;
+    return this.instanceUrl;
   }
 }
 
@@ -1265,6 +1274,186 @@ describe("SSE heartbeat cadence with an injected fake clock", () => {
       expect(text).toContain(": stream open");
     } finally {
       server.stop(true);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Message forwarding to agent-host (issue #22)
+//
+// The control plane stays the SOLE writer of `user_message`: it appends
+// first, then forwards the appended seq/content. The fake forwarder below
+// records the payload but never touches the repo — mirroring the agent-host
+// gateway, which must not append the event again.
+// ---------------------------------------------------------------------------
+
+/** Recording MessageForwarder fake with switchable failure modes. */
+class RecordingForwarder implements MessageForwarder {
+  calls: ForwardMessageArgs[] = [];
+  behavior: "ok" | "conflict" | "forward-error" = "ok";
+
+  async forward(args: ForwardMessageArgs): Promise<{ status: number; turnStarted: boolean }> {
+    this.calls.push(args);
+    if (this.behavior === "conflict") {
+      throw new AgentHostConflictError(
+        "agent-host refused the message (status 409): controller lease not held by this host",
+      );
+    }
+    if (this.behavior === "forward-error") {
+      throw new AgentHostForwardError("workspace instance unreachable at https://ah.test (boom)");
+    }
+    return { status: 202, turnStarted: true };
+  }
+}
+
+describe("message forwarding to agent-host (issue #22)", () => {
+  interface ForwardingSetup {
+    h: TestHarness;
+    workspaceId: string;
+    sessionId: string;
+    handle: FakeHandle;
+    forwarder: RecordingForwarder;
+    logger: InMemoryLogger;
+  }
+
+  async function setupForwarding(instanceUrl: string | null): Promise<ForwardingSetup> {
+    const forwarder = new RecordingForwarder();
+    const logger = new InMemoryLogger();
+    const h = startHarness({ messageForwarder: forwarder, logger });
+    const ws = await h.createWorkspace("alice");
+    const handle = new FakeHandle();
+    handle.instanceUrl = instanceUrl;
+    h.deps.runtimes.set(ws.id, handle);
+    const sessionRes = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(sessionRes.status).toBe(201);
+    const sessionId = ((await sessionRes.json()) as { id: string }).id;
+    const acquire = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/controller/acquire`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(acquire.status).toBe(200);
+    return { h, workspaceId: ws.id, sessionId, handle, forwarder, logger };
+  }
+
+  async function postAsAlice(h: TestHarness, sessionId: string, content: string): Promise<Response> {
+    return h.fetchAs("alice", `/v1/sessions/${sessionId}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content }),
+    });
+  }
+
+  test("running instance: appends once, forwards seq/content, returns 201", async () => {
+    const { h, sessionId, forwarder } = await setupForwarding("https://ah.test");
+    try {
+      const res = await postAsAlice(h, sessionId, "fix the flaky test");
+      expect(res.status).toBe(201);
+      const event = await res.json();
+      expect(event.eventType).toBe("user_message");
+      expect(event.seq).toBe(0);
+
+      // Single writer: exactly one user_message in the DB …
+      const persisted = await h.repo.readEvents(sessionId);
+      expect(persisted).toHaveLength(1);
+      expect(persisted[0]!.eventType).toBe("user_message");
+
+      // … and the forwarder carried the SAME appended seq (a reference, not
+      // a second append — the fake has no repo access, like the gateway).
+      expect(forwarder.calls).toHaveLength(1);
+      expect(forwarder.calls[0]).toMatchObject({
+        instanceUrl: "https://ah.test",
+        sessionId,
+        seq: event.seq,
+        content: "fix the flaky test",
+        identity: { id: "alice", email: "alice@example.com" },
+      });
+      // No duplicate: the DB still holds exactly the one event.
+      expect(await h.repo.readEvents(sessionId)).toHaveLength(1);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("stopped / never-opened instance (no URL): 409 WITHOUT writing an orphan event", async () => {
+    const { h, sessionId, forwarder } = await setupForwarding(null);
+    try {
+      const res = await postAsAlice(h, sessionId, "hello?");
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error.code).toBe("conflict");
+      expect(body.error.message).toContain("not running");
+
+      // No orphan: nothing was appended, nothing was forwarded to.
+      expect(await h.repo.readEvents(sessionId)).toHaveLength(0);
+      expect(forwarder.calls).toHaveLength(0);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("forward failure after the append: 502 (never a fake 201), orphan is traceable", async () => {
+    const { h, sessionId, forwarder, logger } = await setupForwarding("https://ah.test");
+    forwarder.behavior = "forward-error";
+    try {
+      const res = await postAsAlice(h, sessionId, "are you there?");
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body.error.code).toBe("bad_gateway");
+
+      // The event WAS recorded (append happens before the forward) but the
+      // client is told the turn did not start — and the log shows why.
+      // (The observability redactor masks string identifiers, so only the
+      // event name, the numeric seq and the error text are asserted here.)
+      expect(await h.repo.readEvents(sessionId)).toHaveLength(1);
+      const failed = logger.parsed.find((e) => e["event"] === "control-plane.forward.failed");
+      expect(failed).toBeTruthy();
+      expect(failed!["seq"]).toBe(0);
+      expect(typeof failed!["error"]).toBe("string");
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("agent-host conflict (lease/state) propagates as 409, not 502", async () => {
+    const { h, sessionId, forwarder } = await setupForwarding("https://ah.test");
+    forwarder.behavior = "conflict";
+    try {
+      const res = await postAsAlice(h, sessionId, "hello?");
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error.code).toBe("conflict");
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("no forwarder configured (dev/tests): append-only 201, nothing forwarded", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      const sessionRes = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const sessionId = ((await sessionRes.json()) as { id: string }).id;
+      const acquire = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/controller/acquire`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(acquire.status).toBe(200);
+
+      const res = await postAsAlice(h, sessionId, "local dev message");
+      expect(res.status).toBe(201);
+      expect(await h.repo.readEvents(sessionId)).toHaveLength(1);
+    } finally {
+      h.stop();
     }
   });
 });

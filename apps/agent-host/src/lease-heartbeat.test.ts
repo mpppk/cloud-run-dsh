@@ -27,7 +27,10 @@ async function flushTicks(): Promise<void> {
 
 describe("LeaseHeartbeatLoop (review BLOCKER fix)", () => {
   test("agent input still returns 202 several lease lifetimes past recover()", async () => {
-    const th = await composeTestHost();
+    // Messages need a TurnStarter since #22 (otherwise the gateway
+    // honestly answers 503 turn_not_implemented). The lease-renewal
+    // assertion is what matters here, so a trivial starter is injected.
+    const th = await composeTestHost({}, { turnStarter: { startTurn: async () => {} } });
     await seedWorkspace(th);
     await th.host.recover();
     expect(th.host.leaseHeartbeat.running).toBe(true);
