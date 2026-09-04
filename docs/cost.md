@@ -91,10 +91,19 @@ terraform -chdir=infra/terraform apply -var-file=profiles/minimal.tfvars
   (`db_backup_enabled = true`) に戻す。
 - なお `terraform destroy` 自体はバックアップ無効でも動作に影響しない。
 
-<!-- Explicit anchor: profiles/minimal.tfvars links to cost.md#teardown, and the
-     heading slug ("teardown--課金を止めるまでの手順") does not match it. -->
-<a id="teardown"></a>
-## Teardown — 課金を止めるまでの手順
+## Teardown
+
+<!-- The heading text is exactly "Teardown" so its GitHub auto-slug is
+     `#teardown`, matching the links from profiles/minimal.tfvars and
+     scripts/lib/bucket-teardown.ts (docs/cost.md#teardown). A raw
+     <a id="teardown"> anchor is NOT used: GitHub's sanitizer prefixes every
+     id with `user-content-`, so a plain-HTML anchor only resolves through
+     frontend JS, not by the id itself. Auto-heading slugs go through the
+     same user-content- prefix but are the standard, proven GitHub
+     deep-link path (the same one deployment-runbook.md#step-8--teardown-stop-paying
+     relies on). -->
+
+課金を止めるまでの手順:
 
 > **🚨 `terraform destroy` が失敗したまま放置すると課金は止まらない。**
 > 特にチェックポイントバケットは versioning 有効のため、オブジェクト

@@ -21,6 +21,19 @@
 db_tier      = "db-f1-micro"
 db_disk_type = "PD_HDD"
 
+# Public IPv4 MUST stay enabled for this profile (variables.tf default is a
+# deliberate false safety valve; only profiles opt in):
+# - Cloud Run Instances have NO VPC connectivity at all (no connector, no NAT —
+#   `vpcAccess` is rejected/silently dropped on Instances), so the native
+#   `cloudSqlInstance` volume dials the instance's PUBLIC address via /cloudsql.
+#   With ipv4_enabled = false the bring-up fails: `SFEClient is nil` /
+#   `refresh failed: context deadline exceeded` (measured 2026-09-03).
+# - authorized_networks stays empty: an Instance egresses from Google's shared
+#   pool, so any allowlist wide enough to admit it is effectively 0.0.0.0/0.
+#   Authorization is IAM (roles/cloudsql.client) + a short-lived client
+#   certificate, never a source IP.
+db_enable_public_ip = true
+
 # Verification only: total data loss is accepted on instance failure.
 # PITR (+ its WAL storage cost) and Query Insights are pointless here.
 db_backup_enabled                 = false

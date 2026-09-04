@@ -6,7 +6,7 @@
 >
 > | Resource | Approx. on-going cost | Stops costing when |
 > |---|---|---|
-> | Cloud SQL `db-custom-1-3840` (1 vCPU / 3.75 GB, private IP) | **largest line item** (~USD 40–80/month depending on region, plus storage) | instance deleted (Step 8 teardown) |
+> | Cloud SQL `db-custom-1-3840` (1 vCPU / 3.75 GB, private + public IPv4) | **largest line item** (~USD 40–80/month depending on region, plus storage) | instance deleted (Step 8 teardown) |
 > | Cloud Run Instance (4 vCPU / 8 GiB, Pre-GA) | per-second billing while the instance is **running**; cheap only when stopped | instance stopped/deleted |
 > | GCS checkpoint bucket | negligible at MVP scale | bucket deleted |
 > | Artifact Registry | negligible (one image) | repository deleted |
@@ -20,7 +20,7 @@ Scope of the Terraform baseline (what you are about to create):
 
 - 11 APIs enabled (`cloudresourcemanager`, `iam`, `run`, `sqladmin`, `secretmanager`, `artifactregistry`, `storage`, `iap`, `logging`, `monitoring`, `servicenetworking`) — `apis.tf`
 - Artifact Registry Docker repository `agent-host` — `artifact_registry.tf`
-- Cloud SQL PostgreSQL 16 with a private IP (own VPC + Service Networking peering) **plus a public IPv4** (`db_enable_public_ip = true`) — Cloud Run Instances have no VPC connectivity, so the native `cloudSqlInstance` volume path dials the public address (see Step 5); `authorized_networks` stays empty (IAM + short-lived client certificate do the authorization), database `dsh`, user `dsh_app` — `cloudsql.tf`
+- Cloud SQL PostgreSQL 16 with a private IP (own VPC + Service Networking peering) **plus a public IPv4** — Cloud Run Instances have no VPC connectivity, so the native `cloudSqlInstance` volume path dials the public address (see Step 5); `authorized_networks` stays empty (IAM + short-lived client certificate do the authorization), database `dsh`, user `dsh_app` — `cloudsql.tf`. The public IPv4 is **not** a provider default (`variables.tf` keeps `db_enable_public_ip = false` as a safety valve) — you enable it in Step 2.1 via `TF_VAR_db_enable_public_ip=true`, or by using the minimal profile (`profiles/minimal.tfvars`, Appendix), which sets `db_enable_public_ip = true`.
 - GCS checkpoint bucket (uniform access, versioning, ARCHIVED-object 30-day lifecycle) — `storage.tf`
 - Three service accounts (agent-host, control-plane, and the `ai-agent` operator identity) with least-privilege bindings — `iam.tf`. The `ai-agent` operator identity and its gcloud impersonation setup are documented separately in [`gcp-ai-agent-impersonation.md`](gcp-ai-agent-impersonation.md).
 - Secret Manager placeholders: `github-app-private-key`, `llm-api-key`, `db-password` (no values in code) — `secrets.tf`
@@ -105,6 +105,20 @@ export TF_VAR_region="$REGION"
 export TF_VAR_iap_support_email="you@example.com"
 # Members allowed through IAP (empty = nobody can reach the app through IAP)
 export TF_VAR_iap_members='["user:you@example.com"]'
+# Public IPv4 on Cloud SQL — REQUIRED for bring-up. Cloud Run Instances have NO
+# VPC connectivity at all (no connector, no NAT: `vpcAccess.connector` is
+# rejected and `vpcAccess.networkInterfaces` is silently dropped on Instances),
+# so the native `cloudSqlInstance` volume dials the instance's PUBLIC address.
+# With the default `db_enable_public_ip = false` the Instance cannot reach the
+# DB at all (`SFEClient is nil` / `refresh failed: context deadline exceeded`,
+# measured 2026-09-03). Do NOT "harden" this to false: the danger you might
+# imagine from a public IP is already handled — `authorized_networks` stays
+# empty because an Instance egresses from Google's shared pool (any allowlist
+# wide enough to admit it is effectively 0.0.0.0/0), and authorization is IAM
+# (roles/cloudsql.client) + a short-lived client certificate, never a source IP.
+export TF_VAR_db_enable_public_ip=true
+# The minimal verification profile (Appendix) sets the same variable for you:
+#   terraform -chdir=infra/terraform plan -var-file=profiles/minimal.tfvars
 # Optional labels: TF_VAR_labels='{team="dsh",env="dev"}'
 ```
 
@@ -539,6 +553,7 @@ terraform -chdir=infra/terraform apply -var-file=profiles/minimal.tfvars
 What it changes (defaults are untouched — see [`cost.md`](cost.md) for sourced monthly estimates, ≈ $11–12/month at `db-f1-micro`, vs ≈ $67/month at `db-custom-1-3840`, both asia-northeast1):
 
 - `db-f1-micro` (shared-core, SLA-excluded, bring-up verification only; official tier availability: https://cloud.google.com/sql/docs/postgres/machine-series-overview)
+- `db_enable_public_ip = true` — required, not optional: the Instance reaches Cloud SQL only through the public address (see Step 2.1 for the why); `authorized_networks` stays empty (IAM + short-lived client certificate authorize, never source IP)
 - backups / PITR / Query Insights **disabled**, HDD storage — acceptable only because verification data is disposable
 - teardown billing notes and the ABANDONed Service Networking peering impact on a future re-apply: [`cost.md` — Teardown](cost.md)
 

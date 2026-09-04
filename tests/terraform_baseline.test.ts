@@ -119,9 +119,13 @@ describe("content checks", () => {
     // while terraform validate stays green. Anchor the assignment itself
     // (`^\s*` cannot match a `#` comment line), never the comment text.
     expect(c).toMatch(/^\s*edition\s*=\s*var\.db_edition\s*$/m);
-    expect(tfContents["variables.tf"]).toMatch(
-      /variable "db_edition"[\s\S]*?default\s*=\s*"ENTERPRISE"/,
-    );
+    // Scope to the variable block itself: a lazy `[\s\S]*?` from
+    // `variable "db_edition"` could otherwise spill past the closing brace and
+    // match a LATER variable's default, so breaking this variable's default
+    // would go unnoticed (false negative).
+    const editionBlock = tfContents["variables.tf"].match(/variable "db_edition" \{[\s\S]*?\n\}/);
+    expect(editionBlock).not.toBeNull();
+    expect(editionBlock![0]).toMatch(/default\s*=\s*"ENTERPRISE"/);
     // Conditional bootstrap: data source has count and var.db_password handling
     expect(c).toMatch(/count\s*=\s*var\.db_password/);
     expect(tfContents["variables.tf"]).toMatch(/variable "db_password"/);
