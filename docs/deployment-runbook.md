@@ -391,16 +391,68 @@ export CP_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-host/control-plane
 #   cross-architecture host — type safety is enforced by CI and
 #   `bunx tsc --build` instead.)
 #  (the production entrypoint is apps/control-plane/src/main.ts; it requires
-#   DATABASE_URL, respects PORT, and serves /healthz + /readyz — see
-#   apps/control-plane/README.md. NOTE: until P11a the runtime registry is a
-#   placeholder, so workspace runtime operations answer 503.)
+#   the 9 env keys in the table below, respects PORT, and serves /healthz +
+#   /readyz — see apps/control-plane/README.md. The RuntimeRegistry is wired:
+#   POST /v1/workspaces/:id/open creates-or-starts the workspace Instance.)
+#
+# Control-plane environment — mirrors apps/control-plane/src/config.ts.
+# If you add an env key to config.ts, update this table in the same PR.
+# Secret hygiene: the DB password and the PEM never appear in argv or shell
+# history — secrets travel via Secret Manager (--set-secrets) and stdin
+# redirection (herestrings use temp files, not argv). The control-plane SA
+# already holds accessor grants for db-password / github-app-private-key
+# (iam.tf) and run.admin + act-as agent-host (Steps 5/7 need them).
+export SA_EMAIL="$(terraform -chdir=infra/terraform output -raw agent_host_service_account_email)"
+export BUCKET="$(terraform -chdir=infra/terraform output -raw checkpoint_bucket_name)"
+export SQL_CONNECTION="$(terraform -chdir=infra/terraform output -raw sql_connection_name)"
+export DB_PASSWORD="$(gcloud secrets versions access latest --secret=db-password)"
+# Your GitHub App ID (numeric, from the App settings page — not a secret).
+export GH_APP_ID="<github-app-id>"
+
+# The control plane needs its own full DATABASE_URL (TCP form — Cloud Run
+# services reach Cloud SQL over TCP, unlike Instances which use the socket).
+# Store it as a dedicated secret version so the password never lands in argv
+# or the service config (herestring, not argv):
+umask 077
+gcloud secrets create control-plane-database-url --replication-policy=automatic 2>/dev/null || true
+gcloud sql instances describe "$(echo "$SQL_CONNECTION" | cut -d: -f3)" \
+  --format='get(ipAddresses[0].ipAddress)' | {
+  read -r SQL_IP
+  gcloud secrets versions add control-plane-database-url --data-file=- \
+    <<<"postgresql://dsh_app:${DB_PASSWORD}@${SQL_IP}:5432/dsh"
+}
+
+# Plain env vars travel via a 0600 YAML file (--env-vars-file), NOT inline
+# --set-env-vars: AGENT_HOST_DATABASE_URL embeds the DB password, and inline
+# values land in shell history and `ps` output (same rule as Step 5.2).
+umask 077
+CP_ENV="$(mktemp)"; trap 'rm -f "$CP_ENV"' EXIT
+cat > "$CP_ENV" <<EOF
+GCP_PROJECT_ID: "${PROJECT_ID}"
+GCP_REGION: "${REGION}"
+AGENT_HOST_IMAGE: "${IMAGE}"
+AGENT_HOST_SERVICE_ACCOUNT: "${SA_EMAIL}"
+CHECKPOINT_BUCKET: "${BUCKET}"
+AGENT_HOST_DATABASE_URL: "postgresql://dsh_app:${DB_PASSWORD}@/dsh?host=/cloudsql/${SQL_CONNECTION}"
+GITHUB_APP_ID: "${GH_APP_ID}"
+EOF
+
 gcloud run deploy control-plane \
   --project="$PROJECT_ID" --region="$REGION" \
   --image="$CP_IMAGE" \
   --service-account="$CP_SA_EMAIL" \
   --ingress=internal-and-cloud-load-balancing \
-  --no-allow-unauthenticated
+  --no-allow-unauthenticated \
+  --env-vars-file="$CP_ENV" \
+  --set-secrets="DATABASE_URL=control-plane-database-url:latest,GITHUB_APP_PRIVATE_KEY_PEM=github-app-private-key:latest"
 ```
+
+Created Instances receive their environment (including `DATABASE_URL` with the
+DB password) as plain `value` pairs — the same posture as the manual create in
+Step 5.2. Switching to secret references (`valueSource`) once the v2
+Instances API shape for secrets is verified is follow-up work (the typed
+client in `packages/cloud-run-instance-client` only sends plain values
+today).
 
 IAP configuration (brand + client were already created by Terraform in Step 2; members via `var.iap_members`):
 
@@ -539,7 +591,7 @@ This runbook was authored against a machine with **no gcloud credentials and no 
 | Step 3 | `docker build` of the agent-host image was not run here; the Dockerfile's `bun run typecheck` stage depends on the workspace installing cleanly in-container. |
 | Step 4 | Migration runner against real Cloud SQL (proxy, private-IP path, `DATABASE_URL` with the Cloud SQL connection name) — untested against a live instance; the runner itself is covered by unit tests. |
 | Step 5 | **Highest risk.** The create body shape, `validateOnly` dry-run, and the v2 REST paths were verified against the live discovery document and read-only probes on 2026-09-03 (see PR verification: v1 paths return HTML 404, v2 list returns 200). Still unproven: an actual create/start/stop against a live instance (billable), and the `gcloud run instances` Preview command-group availability. |
-| Step 6 | `gcloud run deploy` + IAP frontend wiring — unexecuted (needs a real project). The image itself now builds (see the control-plane Dockerfile) and was verified locally: `docker build` + container start + `/healthz` curl (see the P3 PR verification). Note the runtime registry is a placeholder until P11a — runtime operations answer 503. |
+| Step 6 | `gcloud run deploy` + IAP frontend wiring — unexecuted (needs a real project). The image itself now builds (see the control-plane Dockerfile) and was verified locally: `docker build` + container start + `/healthz` curl (see the P3 PR verification). The RuntimeRegistry is wired (#23): `open` creates-or-starts the workspace Instance, so Step 7.3 exercises it for real. |
 | Step 7 | Smoke checks — depend on Steps 4–6. |
 | Step 8 | `terraform destroy` behavior with real state; Instance stop/delete endpoint names under the Preview API. |
 

@@ -388,3 +388,45 @@ describe("cloud-run-instance-client error mapping", () => {
     await expect(client.create({ id: "ws-1" })).rejects.toBeInstanceOf(InstanceNotFoundError);
   });
 });
+
+describe("cloud-run-instance-client container env", () => {
+  const basePath = "projects/test-proj/locations/us-central1";
+  const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
+
+  function createBodyOf(req: { body?: unknown }): Record<string, unknown> {
+    return req.body as Record<string, unknown>;
+  }
+
+  test("no env option -> containers[0] carries no env key", async () => {
+    const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    await client.create({ id: "ws-1" });
+    const containers = createBodyOf(transport.lastRequest()!)["containers"] as Array<
+      Record<string, unknown>
+    >;
+    expect(containers[0]!["env"]).toBeUndefined();
+  });
+
+  test("env option is emitted as sorted {name, value} pairs on the container", async () => {
+    const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
+    const client = new CloudRunInstanceClient({
+      transport,
+      basePath,
+      image: IMAGE,
+      env: {
+        WORKSPACE_ID: "ws-1",
+        CHECKPOINT_BUCKET: "bucket",
+        DATABASE_URL: "postgresql://x",
+      },
+    });
+    await client.create({ id: "ws-1" });
+    const containers = createBodyOf(transport.lastRequest()!)["containers"] as Array<
+      Record<string, unknown>
+    >;
+    expect(containers[0]!["env"]).toEqual([
+      { name: "CHECKPOINT_BUCKET", value: "bucket" },
+      { name: "DATABASE_URL", value: "postgresql://x" },
+      { name: "WORKSPACE_ID", value: "ws-1" },
+    ]);
+  });
+});

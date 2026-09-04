@@ -69,6 +69,11 @@ export class LoggingWorkspaceRuntimeHandle implements WorkspaceRuntimeHandle {
   async runManualCheckpoint(): Promise<void> {
     this.recordActivity("checkpoint");
   }
+
+  async getInstanceUrl(): Promise<string | null> {
+    // Local dev never creates a real Instance — there is no URL to forward to.
+    return null;
+  }
 }
 
 /** Builds the in-memory dependency composition used by the dev server. */

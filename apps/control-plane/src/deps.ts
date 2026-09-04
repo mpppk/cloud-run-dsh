@@ -63,6 +63,18 @@ export interface WorkspaceRuntimeHandle {
   assertAgentInputAllowed(): void;
   /** Runs a manual checkpoint as a meaningful, tracked operation. */
   runManualCheckpoint(): Promise<void>;
+  /**
+   * Returns the reachable URL of the workspace's Cloud Run Instance, or null
+   * when the workspace has never been opened (or the Instance is unknown).
+   *
+   * CONTRACT FOR #22 (control-plane -> agent-host forwarding): this is the
+   * seam #22 uses to reach the agent-host gateway. It resolves the live URL
+   * from the Instances API when possible and falls back to the last URL
+   * persisted on the workspace row (`workspaces.instance_url`, written on
+   * every successful open). Prefer this over reading the DB directly — the
+   * live lookup survives Instance recreation (which changes the URL).
+   */
+  getInstanceUrl(): Promise<string | null>;
 }
 
 /**
@@ -80,6 +92,12 @@ export class WorkspaceRuntimeHandleAdapter implements WorkspaceRuntimeHandle {
     private readonly runtime: WorkspaceRuntime,
     /** Per-workspace checkpoint work composed from the T5 checkpoint bundle. */
     private readonly checkpointFn: () => Promise<void>,
+    /**
+     * Resolves the workspace's Instance URL for #22 forwarding. Optional so
+     * existing call sites (route tests with stub handles) keep working; the
+     * production factory always supplies it. Defaults to null.
+     */
+    private readonly instanceUrlProvider?: () => Promise<string | null>,
   ) {}
 
   open(): Promise<string> {
@@ -104,6 +122,10 @@ export class WorkspaceRuntimeHandleAdapter implements WorkspaceRuntimeHandle {
 
   runManualCheckpoint(): Promise<void> {
     return this.runtime.runCheckpoint(this.checkpointFn);
+  }
+
+  getInstanceUrl(): Promise<string | null> {
+    return this.instanceUrlProvider?.() ?? Promise.resolve(null);
   }
 }
 

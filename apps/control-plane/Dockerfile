@@ -13,10 +13,16 @@
 #
 # Runtime configuration (injected via environment by Cloud Run — no secrets
 # are baked into the image):
-#   PORT          — listen port (Cloud Run injects 8080; default below)
-#   DATABASE_URL  — Postgres/Cloud SQL connection string (REQUIRED)
-# See apps/control-plane/README.md for the full contract, including the
-# not-yet-wired runtime registry (P11a).
+#   PORT                        — listen port (Cloud Run injects 8080; default below)
+#   DATABASE_URL                — Postgres/Cloud SQL connection string (REQUIRED)
+#   GCP_PROJECT_ID / GCP_REGION — where workspace Instances are created (REQUIRED)
+#   AGENT_HOST_IMAGE            — agent-host image for created Instances (REQUIRED)
+#   AGENT_HOST_SERVICE_ACCOUNT  — SA that created Instances run as (REQUIRED)
+#   CHECKPOINT_BUCKET           — GCS checkpoint bucket (REQUIRED)
+#   AGENT_HOST_DATABASE_URL     — DB URL injected into Instances, Cloud SQL
+#                                 socket form (REQUIRED)
+#   GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY_PEM — injected into Instances (REQUIRED)
+# See apps/control-plane/README.md for the full contract.
 
 # --- deps: install workspace dependencies -----------------------------------
 FROM oven/bun:1 AS deps

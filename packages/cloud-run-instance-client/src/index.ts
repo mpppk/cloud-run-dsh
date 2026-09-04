@@ -212,6 +212,15 @@ export interface CloudRunInstanceClientOptions {
   image?: string;
   /** v2 top-level `serviceAccount` — the SA the instance runs as. */
   serviceAccount?: string;
+  /**
+   * Container environment variables (v2 `containers[].env`, a list of
+   * `{name, value}` pairs). The control plane passes the agent-host's
+   * required keys (WORKSPACE_ID, CHECKPOINT_BUCKET, DATABASE_URL, ...) here
+   * when it creates an instance; call sites that only get/start/stop an
+   * existing instance omit it. Entries are emitted sorted by name so request
+   * shapes are stable across runs.
+   */
+  env?: Record<string, string>;
 }
 
 export interface CreateOptions {
@@ -229,12 +238,14 @@ export class CloudRunInstanceClient implements InstanceRuntime {
   private readonly config: InstanceConfig;
   private readonly image: string | undefined;
   private readonly serviceAccount?: string;
+  private readonly env: Record<string, string>;
 
   constructor(options: CloudRunInstanceClientOptions) {
     this.transport = options.transport;
     this.basePath = options.basePath.replace(/\/$/, "");
     this.image = options.image;
     this.serviceAccount = options.serviceAccount;
+    this.env = { ...(options.env ?? {}) };
 
     // Resolve config: profile takes precedence, else explicit config, else default
     let resolved: InstanceConfig;
@@ -335,6 +346,7 @@ export class CloudRunInstanceClient implements InstanceRuntime {
    *     STRINGS ("4"/"8Gi"), not a top-level `resources` object
    *   - containers[].sandboxLauncher — lives on the CONTAINER, not the instance
    *   - containers[].ports[].containerPort
+   *   - containers[].env    (optional; `{name, value}` pairs sorted by name)
    *   - restartPolicy      (top-level; API enum ON_FAILURE/NEVER/ALWAYS)
    *   - serviceAccount     (top-level)
    * There is no `template` wrapper on Instances (that is the Services/Revisions
@@ -355,6 +367,10 @@ export class CloudRunInstanceClient implements InstanceRuntime {
       ports: [{ containerPort: this.config.port }],
     };
     if (this.config.sandboxLauncher) container["sandboxLauncher"] = this.config.sandboxLauncher;
+    const envNames = Object.keys(this.env).sort();
+    if (envNames.length > 0) {
+      container["env"] = envNames.map((name) => ({ name, value: this.env[name] }));
+    }
 
     const body: Record<string, unknown> = {
       containers: [container],
