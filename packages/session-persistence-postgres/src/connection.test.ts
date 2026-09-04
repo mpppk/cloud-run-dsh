@@ -8,13 +8,20 @@
 //   carries a password (this is the Cloud Logging leak).
 
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { SQL } from "bun";
 import {
+  BUN_SQL_ENV_URL_KEYS,
   BunSqlConnectionError,
+  createBunSqlClient,
   DatabaseUrlParseError,
   describeConnectionTarget,
   isSocketTarget,
   resolveBunSqlTarget,
   toBunSqlConnectionError,
+  withIsolatedBunSqlEnv,
 } from "./connection.js";
 
 // A stand-in secret: every redaction assertion below checks THIS value never
@@ -270,5 +277,180 @@ describe("describeConnectionTarget + toBunSqlConnectionError", () => {
     const url = `postgres://dsh:${SECRET}@localhost:5432/dsh`;
     const text = describeConnectionTarget(url);
     expectPasswordFree(text);
+  });
+});
+
+describe("Bun.SQL environment isolation (issue #45)", () => {
+  // Production shape: Cloud Run injects the socket DSN itself as
+  // DATABASE_URL. Bun parses env URLs even for options-object calls, and
+  // this exact string is unparseable as a WHATWG URL (empty host), so
+  // `new SQL({ path, ... })` throws ERR_INVALID_URL unless the env is
+  // hidden. Every test below sets this (or an equivalent poison value) and
+  // requires construction to succeed — without the test env, the bug is
+  // invisible, which is why #45 escaped to production.
+  const PROD_SOCKET_DSN = `postgresql://dsh_app:${SECRET}@/dsh?host=/cloudsql/proj:region:inst`;
+
+  function snapshotEnv(): Map<string, string | undefined> {
+    const m = new Map<string, string | undefined>();
+    for (const key of BUN_SQL_ENV_URL_KEYS) m.set(key, process.env[key]);
+    return m;
+  }
+
+  function restoreEnv(snap: Map<string, string | undefined>): void {
+    for (const [key, value] of snap) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+
+  function clearAllUrlKeys(): void {
+    for (const key of BUN_SQL_ENV_URL_KEYS) delete process.env[key];
+  }
+
+  async function closeQuietly(client: unknown): Promise<void> {
+    try {
+      await (client as { close: () => Promise<unknown> }).close();
+    } catch {
+      // Construction is what under test; close failures are irrelevant.
+    }
+  }
+
+  test("socket options construct with DATABASE_URL set to the production socket DSN", async () => {
+    const snap = snapshotEnv();
+    const socketDir = mkdtempSync(join(tmpdir(), "bunsql-sock-"));
+    try {
+      clearAllUrlKeys();
+      process.env["DATABASE_URL"] = PROD_SOCKET_DSN;
+      const target = resolveBunSqlTarget(PROD_SOCKET_DSN);
+      if (!isSocketTarget(target)) expect.unreachable();
+      const client = createBunSqlClient(
+        { ...target, path: socketDir },
+        SQL as unknown as new (
+          target: string | Record<string, unknown>,
+        ) => Record<string, unknown>,
+      ) as unknown as { options: Record<string, unknown> };
+      expect((client.options as Record<string, unknown>)["path"]).toBe(socketDir);
+      expect((client.options as Record<string, unknown>)["database"]).toBe("dsh");
+      expect((client.options as Record<string, unknown>)["username"]).toBe("dsh_app");
+      await closeQuietly(client);
+      // Restored even on success.
+      expect(process.env["DATABASE_URL"]).toBe(PROD_SOCKET_DSN);
+    } finally {
+      restoreEnv(snap);
+    }
+  });
+
+  test("every known URL key is isolated (one poisoned key at a time)", async () => {
+    const snap = snapshotEnv();
+    const socketDir = mkdtempSync(join(tmpdir(), "bunsql-sock-all-"));
+    try {
+      for (const key of BUN_SQL_ENV_URL_KEYS) {
+        clearAllUrlKeys();
+        // The socket DSN is unparseable as a URL (throws); a bare token
+        // pollutes/hijacks silently (hostname/adapter). Either poison must
+        // be invisible inside the isolated constructor.
+        process.env[key] = PROD_SOCKET_DSN;
+        const client = createBunSqlClient(
+          { path: socketDir, username: "u", password: "p", database: "d" },
+          SQL as unknown as new (
+            target: string | Record<string, unknown>,
+          ) => Record<string, unknown>,
+        ) as unknown as { options: Record<string, unknown> };
+        expect((client.options as Record<string, unknown>)["path"]).toBe(socketDir);
+        await closeQuietly(client);
+        expect(process.env[key]).toBe(PROD_SOCKET_DSN);
+      }
+    } finally {
+      restoreEnv(snap);
+    }
+  });
+
+  test("fake ctor observes a stripped environment (version-independent proof)", () => {
+    const snap = snapshotEnv();
+    try {
+      clearAllUrlKeys();
+      process.env["DATABASE_URL"] = PROD_SOCKET_DSN;
+      process.env["POSTGRES_URL"] = "postgres://poison/poison";
+      process.env["MYSQL_URL"] = "mysql://poison/poison";
+      process.env["SQLITE_URL"] = "file:///poison.db";
+      const seen: Record<string, string | undefined> = {};
+      class RecordingSql {
+        constructor(_target: unknown) {
+          for (const key of BUN_SQL_ENV_URL_KEYS) seen[key] = process.env[key];
+        }
+      }
+      createBunSqlClient({ path: "/x", username: "u", password: "p", database: "d" }, RecordingSql);
+      for (const key of BUN_SQL_ENV_URL_KEYS) expect(seen[key]).toBeUndefined();
+      // ...and the outer environment is untouched.
+      expect(process.env["DATABASE_URL"]).toBe(PROD_SOCKET_DSN);
+      expect(process.env["POSTGRES_URL"]).toBe("postgres://poison/poison");
+    } finally {
+      restoreEnv(snap);
+    }
+  });
+
+  test("environment is restored even when construction throws", () => {
+    const snap = snapshotEnv();
+    try {
+      clearAllUrlKeys();
+      process.env["DATABASE_URL"] = "sentinel-before";
+      delete process.env["SQLITE_URL"];
+      class ThrowingSql {
+        constructor(_target: unknown) {
+          // Keys must already be hidden when the ctor body runs...
+          expect(process.env["DATABASE_URL"]).toBeUndefined();
+          // ...including keys the caller never set (fn-created keys must
+          // not leak out either).
+          process.env["SQLITE_URL"] = "created-inside";
+          throw new Error("ctor boom");
+        }
+      }
+      expect(() =>
+        createBunSqlClient({ path: "/x", username: "u", password: "p", database: "d" }, ThrowingSql),
+      ).toThrow("ctor boom");
+      expect(process.env["DATABASE_URL"]).toBe("sentinel-before");
+      expect(process.env["SQLITE_URL"]).toBeUndefined();
+    } finally {
+      restoreEnv(snap);
+    }
+  });
+
+  test("withIsolatedBunSqlEnv restores after a throwing callback", () => {
+    const snap = snapshotEnv();
+    try {
+      clearAllUrlKeys();
+      process.env["DATABASE_URL"] = "keep-me";
+      expect(() =>
+        withIsolatedBunSqlEnv(() => {
+          expect(process.env["DATABASE_URL"]).toBeUndefined();
+          throw new Error("boom");
+        }),
+      ).toThrow("boom");
+      expect(process.env["DATABASE_URL"]).toBe("keep-me");
+    } finally {
+      restoreEnv(snap);
+    }
+  });
+
+  test("TCP string still constructs with DATABASE_URL set (local / compose safety)", async () => {
+    const snap = snapshotEnv();
+    try {
+      clearAllUrlKeys();
+      process.env["DATABASE_URL"] = PROD_SOCKET_DSN;
+      const tcp = "postgres://dsh:pw-no-slash@localhost:5432/dsh";
+      const target = resolveBunSqlTarget(tcp);
+      expect(target).toBe(tcp);
+      const client = createBunSqlClient(
+        target,
+        SQL as unknown as new (
+          target: string | Record<string, unknown>,
+        ) => Record<string, unknown>,
+      ) as unknown as { options: Record<string, unknown> };
+      expect((client.options as Record<string, unknown>)["hostname"]).toBe("localhost");
+      await closeQuietly(client);
+      expect(process.env["DATABASE_URL"]).toBe(PROD_SOCKET_DSN);
+    } finally {
+      restoreEnv(snap);
+    }
   });
 });

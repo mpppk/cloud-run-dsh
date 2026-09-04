@@ -312,6 +312,37 @@ describe("BunSqlQueryExecutor.connect", () => {
     expect("input" in err!).toBe(false);
     expect("cause" in err!).toBe(false);
   });
+
+  test("socket connect hides ambient DATABASE_URL from the SQL ctor (issue #45)", async () => {
+    const poison = `postgresql://dsh_app:${CONNECT_SECRET}@/dsh?host=/cloudsql/p:r:i`;
+    const prev = process.env["DATABASE_URL"];
+    process.env["DATABASE_URL"] = poison;
+    try {
+      seen.length = 0;
+      let observed: string | undefined = "not-observed";
+      class RecordingSql extends StubSql {
+        constructor(target: BunSqlConnectionTarget) {
+          super(target);
+          observed = process.env["DATABASE_URL"];
+        }
+      }
+      await BunSqlQueryExecutor.connect(
+        `postgresql://dsh_app:${CONNECT_SECRET}@/dsh?host=/cloudsql/p:r:i`,
+        RecordingSql,
+      );
+      expect(observed).toBeUndefined();
+      expect(seen[0]).toEqual({
+        path: "/cloudsql/p:r:i",
+        username: "dsh_app",
+        password: CONNECT_SECRET,
+        database: "dsh",
+      });
+      expect(process.env["DATABASE_URL"]).toBe(poison);
+    } finally {
+      if (prev === undefined) delete process.env["DATABASE_URL"];
+      else process.env["DATABASE_URL"] = prev;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
