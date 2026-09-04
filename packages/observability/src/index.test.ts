@@ -258,6 +258,36 @@ describe("observability", () => {
     );
   });
 
+  test("r36/BLOCKER-hex64: context-limited SHA rescue (real hex secrets redacted, commit SHAs survive)", () => {
+    // Python secrets.token_hex(32) real output: 64-char hex in free text
+    // MUST be redacted (was passing through via the unconditional hex-40/64 exclusion).
+    const hex64 = "625636386d8d6cff17fd2c37ba055ae206d9b53f589f4f1311f19abac2bee5cf";
+    const outFree = redactValue(`token is ${hex64} here`) as string;
+    expect(outFree).not.toContain(hex64);
+    expect(outFree).toContain("[REDACTED]");
+
+    // Same secret under an unknown (non-secret-like) key: shape must catch it.
+    const outObj = redactValue({ foo: hex64 }) as Record<string, unknown>;
+    expect(outObj["foo"]).toBe("[REDACTED]");
+
+    // token_hex(20) real output: 40-char hex (old-style GitHub token shape).
+    const hex40 = "35bad8143c8813c45ca9841750209525f5177ab2";
+    const out40 = redactValue(`token is ${hex40} here`) as string;
+    expect(out40).not.toContain(hex40);
+    expect(out40).toContain("[REDACTED]");
+
+    // Boundary pinning: off-length hex was already redacted and must stay so
+    // (only exact 40/64 ever reached the SHA rescue path).
+    const hex32 = "625636386d8d6cff17fd2c37ba055ae";
+    expect(redactValue(`token is ${hex32} here`) as string).toContain("[REDACTED]");
+
+    // Commit context survives: the existing "commit <sha>" contract.
+    const sha40 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b";
+    expect(redactValue(`commit ${sha40} deployed`) as string).toContain(sha40);
+    const sha64 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    expect(redactValue(`commit ${sha64} done`) as string).toContain(sha64);
+  });
+
   test("r36/BLOCKER-2: OpenRouter sk-or-v1 keys are redacted", () => {
     const orKey = "sk-or-v1-0123456789abcdef0123456789abcdef0123456789abcdef";
     const out = redactValue(`key ${orKey} leaked`) as string;

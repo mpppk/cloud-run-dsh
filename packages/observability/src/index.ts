@@ -83,19 +83,42 @@ const SECRET_ASSIGNMENT_RE =
  * identifiers, so candidates matching an identifier shape mechanically
  * distinguishable from secrets are excluded:
  * - strict PascalCase (`RuntimeNotWiredError` survives),
- * - hex-only 40 / 64 chars (commit SHAs survive),
  * - lowercase snake_case (event names survive).
+ * Hex-only 40 / 64 char candidates (commit SHAs vs. `secrets.token_hex`
+ * output — informationally indistinguishable by shape) are NOT excluded
+ * unconditionally; they go through context-limited SHA rescue instead (see
+ * SHA_CONTEXT_RE / redactString): they survive only when a commit-ish word
+ * appears within ±SHA_CONTEXT_RADIUS chars, otherwise they are redacted.
  * Everything else that is 20+ chars with 2+ character classes and Shannon
  * entropy > 3.0 is treated as a secret.
+ *
+ * Known residual risks (MINOR, accepted — leak-averse over precision):
+ * 1. Free-text `pwd=hunter2` / `db_pw=hunter2` pass through: the
+ *    SECRET_ASSIGNMENT_RE key table has no `pwd`/`pw` entry (object form is
+ *    covered via isProbablySecretKey). Adding bare `PW` is NOT acceptable —
+ *    it false-positives on words like `upward` — so any fix needs boundaries.
+ * 2. `AbCdEfGhIjKlMnOpQrStUv` (alternating case, 22 chars, entropy > 3)
+ *    matches STRICT_PASCAL_CASE_RE and survives. Real secrets in exactly
+ *    this shape are negligible, but the exclusion wins over entropy here.
+ * 3. `a1b2c3d4e5_f6g7h8i9j0_k1l2m3n4o5` (lower+digit+underscore grouped)
+ *    matches SNAKE_CASE_RE and survives. Same negligible-but-known caveat.
  */
 export const HIGH_ENTROPY_TOKEN_RE = /[A-Za-z0-9_\-]{20,}/g;
 
 // Strict PascalCase with 2+ humps: RuntimeNotWiredError, PascalCaseIdentifierExample.
 const STRICT_PASCAL_CASE_RE = /^[A-Z][a-z]+([A-Z][a-z0-9]+)+$/;
 // Commit SHAs: hex-only 40 chars (SHA-1) / 64 chars (SHA-256).
+// NOTE: matched candidates are NOT unconditionally excluded — see
+// SHA_CONTEXT_RE: only candidates with a commit-ish word nearby survive.
 const COMMIT_SHA_RE = /^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$/;
 // Lowercase snake_case event names: my_event_name_with_long_description.
 const SNAKE_CASE_RE = /^[a-z][a-z0-9]*(_[a-z0-9]+)+$/;
+// Context-limited SHA rescue: a hex-40/64 candidate survives only when one of
+// these words appears within ±SHA_CONTEXT_RADIUS chars. Leak-averse default:
+// `{sha: "<hex>"}` (key name only, no nearby keyword in the string value) is
+// still redacted — a cosmetic false positive, accepted over silent leakage.
+const SHA_CONTEXT_RADIUS = 40;
+const SHA_CONTEXT_RE = /\b(commit|sha|revision|digest|checksum|hash)\b/i;
 
 function shannonEntropy(str: string): number {
   const freq = new Map<string, number>();
@@ -111,8 +134,10 @@ function shannonEntropy(str: string): number {
 function isHighEntropyToken(token: string): boolean {
   if (token.length < 20) return false;
   // #29 identifier exclusions — mechanically distinguishable from secrets.
+  // NOTE: COMMIT_SHA_RE is intentionally NOT excluded here. Hex-40/64 is
+  // indistinguishable from random hex secrets by shape, so it is decided by
+  // the caller (redactString) via context-limited SHA rescue instead.
   if (STRICT_PASCAL_CASE_RE.test(token)) return false;
-  if (COMMIT_SHA_RE.test(token)) return false;
   if (SNAKE_CASE_RE.test(token)) return false;
   const hasLower = /[a-z]/.test(token);
   const hasUpper = /[A-Z]/.test(token);
@@ -133,7 +158,18 @@ function redactString(input: string): string {
   // secret names, keeping the key (and surrounding quotes) for log readability.
   out = out.replace(SECRET_ASSIGNMENT_RE, "$1$2$3$4$5[REDACTED]");
   // Final net: marker-less high-entropy secrets, minus #29 identifier shapes.
-  out = out.replace(HIGH_ENTROPY_TOKEN_RE, (m) => (isHighEntropyToken(m) ? REDACTED : m));
+  // Offset-aware: hex-40/64 candidates get context-limited SHA rescue —
+  // they survive only with a commit-ish word within ±SHA_CONTEXT_RADIUS
+  // chars, otherwise they fall through to the entropy check (random hex has
+  // 2 classes + entropy > 3.0, so it is redacted).
+  out = out.replace(HIGH_ENTROPY_TOKEN_RE, (m, offset: number, full: string) => {
+    if (COMMIT_SHA_RE.test(m)) {
+      const start = Math.max(0, offset - SHA_CONTEXT_RADIUS);
+      const end = Math.min(full.length, offset + m.length + SHA_CONTEXT_RADIUS);
+      if (SHA_CONTEXT_RE.test(full.slice(start, end))) return m;
+    }
+    return isHighEntropyToken(m) ? REDACTED : m;
+  });
   return out;
 }
 
