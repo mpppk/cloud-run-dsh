@@ -20,9 +20,23 @@ Cloud Run Instances + Cloud Run Sandboxes + DeepSeek Harness — AI Coding Agent
   - `controller-lease` — single-writer lease (15s heartbeat / 45s expiry, atomic takeover).
   - `observability` — structured logging & metrics (`workspace.*`, `sandbox.*`, `subprocess.*`).
 
-Durable state: GitHub (canonical), Cloud SQL (metadata/sessions/checkpoints), GCS (checkpoint bundles). Local filesystem is ephemeral.
+Durable state: GitHub (canonical), Cloud SQL (metadata/sessions/checkpoints), GCS (checkpoint bundles).
 
-See `docs/` — System Spec v1.0 & Implementation Guide v1.0 (Japanese).
+### Documents
+
+| Document | What it covers |
+|---|---|
+| [`docs/architecture.md`](docs/architecture.md) | **Start here.** The architecture as measured on GCP: components and how they map to the diagram, the open-workspace sequence with per-step implementation status, network and security model, and the create-and-verify procedure. |
+| [`docs/bringup-report.md`](docs/bringup-report.md) | The 2026-09-03 bring-up: what was proven on GCP, what was not, and 11 gotchas with their evidence. |
+| [`docs/deployment-runbook.md`](docs/deployment-runbook.md) | The full deployment runbook (canonical). |
+| [`docs/cost.md`](docs/cost.md) | Cost breakdown and the minimal profile. |
+| [`docs/local-development.md`](docs/local-development.md) | Local dev server and docker-compose. |
+| [`docs/gcp-ai-agent-impersonation.md`](docs/gcp-ai-agent-impersonation.md) | The `ai-agent` operator identity and its escalation path. |
+| `docs/システム仕様書 v1.0`, `docs/実装手順書 v1.0` | Original spec and implementation guide (Japanese). |
+
+> **Status:** the platform and the sandbox run on GCP; the agent itself does not exist yet.
+> There is no LLM client in the repository, and control-plane and agent-host do not talk to each other.
+> See [#31](https://github.com/mpppk/cloud-run-dsh/issues/31) for the remaining work.
 
 ## Monorepo
 
