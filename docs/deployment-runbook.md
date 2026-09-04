@@ -218,7 +218,10 @@ export SQL_CONNECTION_NAME="$(terraform -chdir=infra/terraform output -raw sql_c
 cloud-sql-proxy "$SQL_CONNECTION_NAME" --port 5433 &
 
 export DB_PASSWORD="$(gcloud secrets versions access latest --secret=db-password)"
-export DATABASE_URL="postgresql://dsh_app:${DB_PASSWORD}@127.0.0.1:5433/dsh"
+# Percent-encoded: base64 secrets routinely contain "/" (see the Bun.SQL
+# socket note in 5.1 — the same rule applies to every DATABASE_URL).
+export DB_PASSWORD_URLENC="$(bun -e 'console.log(encodeURIComponent(process.argv[1]))' "$DB_PASSWORD")"
+export DATABASE_URL="postgresql://dsh_app:${DB_PASSWORD_URLENC}@127.0.0.1:5433/dsh"
 
 bun run infra/migrations/runner.ts
 kill %1   # stop the proxy
@@ -253,7 +256,7 @@ Baseline configuration (仕様書 §22 / 実装手順書 §6): `cpu: 4`, `memory
 |---|---|---|
 | 1 | `WORKSPACE_ID` | The workspace the instance serves (the control plane passes the workspace UUID created in Step 7). |
 | 2 | `CHECKPOINT_BUCKET` | Terraform output `checkpoint_bucket_name`. |
-| 3 | `DATABASE_URL` | `postgresql://dsh_app:<db-password>@/dsh?host=/cloudsql/<sql_connection_name>` — the Instance reaches Cloud SQL through its `cloudSqlInstance` volume mounted at `/cloudsql` (no Auth Proxy sidecar, no VPC connector; only the runtime SA needs `roles/cloudsql.client`, and the instance must have a public IPv4 — see Step 5.2). Password from Secret Manager `db-password` (Step 4). |
+| 3 | `DATABASE_URL` | `postgresql://dsh_app:<url-encoded-db-password>@/dsh?host=/cloudsql/<sql_connection_name>` — the Instance reaches Cloud SQL through its `cloudSqlInstance` volume mounted at `/cloudsql` (no Auth Proxy sidecar, no VPC connector; only the runtime SA needs `roles/cloudsql.client`, and the instance must have a public IPv4 — see Step 5.2). Password from Secret Manager `db-password` (Step 4), percent-encoded as below. |
 | 4 | `GITHUB_APP_ID` | Your GitHub App settings page. |
 | 5 | `GITHUB_APP_PRIVATE_KEY_PEM` | The GitHub App private key PEM (multi-line — keep the file-based env mechanism below). |
 | 6 | `REPOSITORY_OWNER` | Same repo owner you created the workspace with (Step 7). |
@@ -266,6 +269,24 @@ Baseline configuration (仕様書 §22 / 実装手順書 §6): `cpu: 4`, `memory
 | 13 | `GCP_REGION` | `$REGION`. |
 
 Optional (not required, have defaults in `config.ts`): `PORT` (8080), `WORKSPACE_ROOT` (`/workspace`), `CHECKPOINT_KEY`, `SANDBOX_CLI_PATH`, `SANDBOX_ALLOW_EGRESS`, plus the LLM settings below.
+
+> **Bun.SQL socket note (#42):** Bun.SQL rejects Unix-socket DSNs passed as
+> URL strings outright (`TypeError: Invalid URL` — and the thrown error
+> echoes the full DSN, password included, into logs). The agent-host and the
+> control plane therefore never hand this string to Bun directly:
+> `BunSqlQueryExecutor.connect()` (shared helper in
+> `@cloud-run-dsh/session-persistence-postgres`) detects the absolute-path
+> `host` parameter and connects via the options object `{ path, username,
+> password, database }` instead. Keep the value in the
+> `postgresql://user:pass@/dsh?host=/cloudsql/<conn>` shape — only the
+> client-side translation changed, not the env contract. One encoding rule:
+> percent-encode the password before embedding it (`openssl rand -base64`
+> secrets routinely contain `/`, which is a path separator in a URL):
+>
+> ```bash
+> export DB_PASSWORD_URLENC="$(bun -e 'console.log(encodeURIComponent(process.argv[1]))' "$DB_PASSWORD")"
+> # ... then use "postgresql://dsh_app:${DB_PASSWORD_URLENC}@/dsh?host=/cloudsql/${SQL_CONNECTION}"
+> ```
 
 #### 5.1.1 Agent-host LLM settings (issue #21)
 
@@ -307,6 +328,9 @@ export SA_EMAIL="$(terraform -chdir=infra/terraform output -raw agent_host_servi
 export BUCKET="$(terraform -chdir=infra/terraform output -raw checkpoint_bucket_name)"
 export SQL_CONNECTION="$(terraform -chdir=infra/terraform output -raw sql_connection_name)"
 export DB_PASSWORD="$(gcloud secrets versions access latest --secret=db-password)"
+# Percent-encoded for embedding in a DATABASE_URL (see the Bun.SQL socket
+# note in 5.1 — base64 secrets routinely contain "/").
+export DB_PASSWORD_URLENC="$(bun -e 'console.log(encodeURIComponent(process.argv[1]))' "$DB_PASSWORD")"
 
 # Build the request body in a 0600 temp file (secrets never touch shell history or ps)
 umask 077
@@ -322,7 +346,7 @@ cat > "$BODY" <<EOF
     "env": [
       { "name": "WORKSPACE_ID",  "value": "<workspace-id, e.g. the UUID from Step 7>" },
       { "name": "CHECKPOINT_BUCKET", "value": "${BUCKET}" },
-      { "name": "DATABASE_URL",  "value": "postgresql://dsh_app:${DB_PASSWORD}@/dsh?host=/cloudsql/${SQL_CONNECTION}" },
+      { "name": "DATABASE_URL",  "value": "postgresql://dsh_app:${DB_PASSWORD_URLENC}@/dsh?host=/cloudsql/${SQL_CONNECTION}" },
       { "name": "GITHUB_APP_ID", "value": "<github-app-id>" },
       { "name": "GITHUB_APP_PRIVATE_KEY_PEM", "value": "<pem, with \n escapes>" },
       { "name": "REPOSITORY_OWNER", "value": "<repo-owner>" },
@@ -444,6 +468,9 @@ export SA_EMAIL="$(terraform -chdir=infra/terraform output -raw agent_host_servi
 export BUCKET="$(terraform -chdir=infra/terraform output -raw checkpoint_bucket_name)"
 export SQL_CONNECTION="$(terraform -chdir=infra/terraform output -raw sql_connection_name)"
 export DB_PASSWORD="$(gcloud secrets versions access latest --secret=db-password)"
+# Percent-encoded for embedding in a DATABASE_URL (see the Bun.SQL socket
+# note in 5.1 — base64 secrets routinely contain "/").
+export DB_PASSWORD_URLENC="$(bun -e 'console.log(encodeURIComponent(process.argv[1]))' "$DB_PASSWORD")"
 # Your GitHub App ID (numeric, from the App settings page — not a secret).
 export GH_APP_ID="<github-app-id>"
 
@@ -457,7 +484,7 @@ gcloud sql instances describe "$(echo "$SQL_CONNECTION" | cut -d: -f3)" \
   --format='get(ipAddresses[0].ipAddress)' | {
   read -r SQL_IP
   gcloud secrets versions add control-plane-database-url --data-file=- \
-    <<<"postgresql://dsh_app:${DB_PASSWORD}@${SQL_IP}:5432/dsh"
+    <<<"postgresql://dsh_app:${DB_PASSWORD_URLENC}@${SQL_IP}:5432/dsh"
 }
 
 # Plain env vars travel via a 0600 YAML file (--env-vars-file), NOT inline
@@ -471,7 +498,7 @@ GCP_REGION: "${REGION}"
 AGENT_HOST_IMAGE: "${IMAGE}"
 AGENT_HOST_SERVICE_ACCOUNT: "${SA_EMAIL}"
 CHECKPOINT_BUCKET: "${BUCKET}"
-AGENT_HOST_DATABASE_URL: "postgresql://dsh_app:${DB_PASSWORD}@/dsh?host=/cloudsql/${SQL_CONNECTION}"
+AGENT_HOST_DATABASE_URL: "postgresql://dsh_app:${DB_PASSWORD_URLENC}@/dsh?host=/cloudsql/${SQL_CONNECTION}"
 GITHUB_APP_ID: "${GH_APP_ID}"
 EOF
 

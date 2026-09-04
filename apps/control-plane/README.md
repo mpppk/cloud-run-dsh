@@ -16,7 +16,7 @@ the two.
 | `AGENT_HOST_IMAGE` | **yes** | — | Agent-host container image for created Instances (v2 `containers[].image`), e.g. `${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-host/agent-host:v1`. |
 | `AGENT_HOST_SERVICE_ACCOUNT` | **yes** | — | Service account that created Instances run as (v2 top-level `serviceAccount`). |
 | `CHECKPOINT_BUCKET` | **yes** | — | GCS checkpoint bucket (Terraform output `checkpoint_bucket_name`). Also injected into Instances. |
-| `AGENT_HOST_DATABASE_URL` | **yes** | — | `DATABASE_URL` injected into created Instances. Must use the Cloud SQL **socket** form (`postgresql://dsh_app:<pw>@/dsh?host=/cloudsql/<conn>`) — Instances reach Cloud SQL through the `cloudSqlInstance` volume, never over TCP. |
+| `AGENT_HOST_DATABASE_URL` | **yes** | — | `DATABASE_URL` injected into created Instances. Must use the Cloud SQL **socket** form (`postgresql://dsh_app:<pw>@/dsh?host=/cloudsql/<conn>`) — Instances reach Cloud SQL through the `cloudSqlInstance` volume, never over TCP. The app translates this to the Bun.SQL options object (`{ path, username, password, database }`); Bun rejects socket DSNs passed as URL strings (#42). Percent-encode non-unreserved characters in the password. |
 | `GITHUB_APP_ID` | **yes** | — | GitHub App ID injected into created Instances. |
 | `GITHUB_APP_PRIVATE_KEY_PEM` | **yes** | — | GitHub App private key PEM injected into created Instances. Prefer `--set-secrets` at deploy time so it never touches shell history. |
 | `OPENROUTER_API_KEY` | **yes** | — | OpenRouter API key injected into created Instances as `OPENROUTER_API_KEY` (issue #41 — the agent-host resolves it per LLM request via its default `LLM_API_KEY_ENV`). Without it the first turn dies with `MISSING_CREDENTIAL`, so it is required at boot: a missing key fails startup, never a turn. Same secret posture as the PEM — plain env value into Instances, never logged. Prefer `--set-secrets` at deploy time. |
@@ -99,5 +99,6 @@ Known follow-ups (not placeholders — tracked issues):
 
 `src/prod-adapters.ts` mirrors the production SQL adapters from
 `apps/agent-host/src/adapters.ts` (`BunSqlQueryExecutor`, `BunSqlLeaseStore`)
-against the same Cloud SQL schema. Extracting them into a shared package is a
-deliberate follow-up.
+against the same Cloud SQL schema. Connection-string handling is shared, not
+mirrored: both executors resolve through the
+`@cloud-run-dsh/session-persistence-postgres` connection helper (#42).

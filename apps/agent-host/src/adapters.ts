@@ -34,6 +34,11 @@ import type {
 import type { Logger } from "@cloud-run-dsh/observability";
 import type { QueryExecutor as SessionQueryExecutor } from "@cloud-run-dsh/session-persistence-postgres";
 import { PostgresSessionPersistenceRepository } from "@cloud-run-dsh/session-persistence-postgres";
+import {
+  resolveBunSqlTarget,
+  toBunSqlConnectionError,
+} from "@cloud-run-dsh/session-persistence-postgres";
+import type { BunSqlConnectionTarget } from "@cloud-run-dsh/session-persistence-postgres";
 
 // ---------------------------------------------------------------------------
 // Host process environment — explicit allowlist, never wholesale inheritance
@@ -640,14 +645,36 @@ interface UnsafeSqlClient {
   close(): Promise<void> | undefined;
 }
 
-type SqlClientCtor = new (url: string) => UnsafeSqlClient;
+type SqlClientCtor = new (target: BunSqlConnectionTarget) => UnsafeSqlClient;
 
 export class BunSqlQueryExecutor implements SessionQueryExecutor {
   private constructor(private readonly client: UnsafeSqlClient) {}
 
-  static async connect(databaseUrl: string): Promise<BunSqlQueryExecutor> {
-    const mod = (await import("bun")) as unknown as { SQL: SqlClientCtor };
-    return new BunSqlQueryExecutor(new mod.SQL(databaseUrl));
+  /**
+   * Connects to TCP (local / docker compose) or Cloud SQL Unix sockets —
+   * mirrors apps/control-plane/src/prod-adapters.ts. The configured string
+   * is resolved through the shared `resolveBunSqlTarget()` first:
+   * socket-form values (`?host=/cloudsql/<conn>`) become the `{ path,
+   * username, password, database }` options object Bun.SQL requires, while
+   * TCP URLs pass through unchanged. `new SQL()` throws are re-wrapped so
+   * the password never reaches the exception (issue #42).
+   *
+   * The optional `sqlCtor` is a test seam for asserting the resolved target
+   * without opening a real connection.
+   */
+  static async connect(
+    databaseUrl: string,
+    sqlCtor?: SqlClientCtor,
+  ): Promise<BunSqlQueryExecutor> {
+    const target = resolveBunSqlTarget(databaseUrl);
+    const Ctor =
+      sqlCtor ??
+      (await import("bun") as unknown as { SQL: SqlClientCtor }).SQL;
+    try {
+      return new BunSqlQueryExecutor(new Ctor(target));
+    } catch (e) {
+      throw toBunSqlConnectionError(e, target);
+    }
   }
 
   async exec(query: string, params?: unknown[]): Promise<void> {
