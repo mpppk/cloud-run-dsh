@@ -26,9 +26,9 @@ Scope of the Terraform baseline (what you are about to create):
 - Secret Manager placeholders: `github-app-private-key`, `llm-api-key`, `db-password` (no values in code) — `secrets.tf`
 - IAP brand + client + `iap.httpsResourceAccessor` members — `iap.tf`
 
-**NOT** in Terraform (documented in `run_instances.tf.example` and `README.md`):
+**NOT** in Terraform (deliberately — see [ADR-0001](adr/0001-instances-outside-terraform.md)):
 
-- **Cloud Run Instances** — Pre-GA, no Terraform resource exists. Created in Step 5 outside Terraform.
+- **Cloud Run Instances** — runtime-managed by the control plane, not Terraform ([#28](https://github.com/mpppk/cloud-run-dsh/issues/28): decided to keep them out even once a provider resource ships, so per-workspace short-lived Instances don't pollute `terraform plan` with drift). Created in Step 5 outside Terraform.
 - **The control-plane Cloud Run service** — deployed in Step 6 with `gcloud`.
 
 ---
@@ -226,12 +226,12 @@ Alternative for private-network environments: run the same command from a VM ins
 
 ## Step 5 — Create the Cloud Run Instance **outside Terraform** (Pre-GA ⚠️)
 
-> **This is the most fragile step in the runbook.** Cloud Run Instances have no Terraform resource (`run_instances.tf.example` is the standing TODO — do **not** fake it with `google_cloud_run_v2_service`, the Instance API is a different surface). The create/start/stop/delete REST paths and gcloud flags below are **Preview surface and can change without notice** (paths verified against v2 on 2026-09-03; re-verify before every deploy). Per 仕様書 §29: **check the Cloud Run Instances Known Issues page and release notes before EVERY deploy** — a Preview API breaking change can invalidate this step (and the runtime adapter in `packages/cloud-run-instance-client`).
+> **This is the most fragile step in the runbook.** Cloud Run Instances are deliberately kept outside Terraform ([ADR-0001](adr/0001-instances-outside-terraform.md) — do **not** fake them with `google_cloud_run_v2_service`, the Instance API is a different surface, and do not reintroduce a `run_instances.tf` even if a provider resource ships). The create/start/stop/delete REST paths and gcloud flags below are **Preview surface and can change without notice** (paths verified against v2 on 2026-09-03; re-verify before every deploy). Per 仕様書 §29: **check the Cloud Run Instances Known Issues page and release notes before EVERY deploy** — a Preview API breaking change can invalidate this step (and the runtime adapter in `packages/cloud-run-instance-client`).
 >
 > References to monitor before each deploy:
 > - REST reference (**v2** — the Instances CRUD surface exists in v2 only; the v1 discovery exposes IAM methods only): `https://cloud.google.com/run/docs/reference/rest/v2/projects.locations.instances`
 > - Known Issues / release notes for Cloud Run Instances (Preview)
-> - `https://github.com/hashicorp/terraform-provider-google/issues` — for when a `google_cloud_run_instance` resource ships; once it does, promote `run_instances.tf.example` → `run_instances.tf` and delete this manual step.
+> - `https://github.com/hashicorp/terraform-provider-google/issues` — to track the Instances API surface, not to Terraform-ize it (per ADR-0001 Instances stay runtime-managed).
 
 Baseline configuration (仕様書 §22 / 実装手順書 §6): `cpu: 4`, `memory: 8Gi`, `restartPolicy: ON_FAILURE`, `sandboxLauncher: true`, port `8080`, run as the agent-host service account.
 

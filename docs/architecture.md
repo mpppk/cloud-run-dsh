@@ -265,9 +265,12 @@ Cloud Run 側からここを通る経路は無い。サブネットも VPC コ�
 | 検索 | 許可 | tool-fs-search。argv 固定でフラグ注入不可 |
 | 任意コマンドの実行 | 到達不能 | アダプタは filesystem と search のシームのみ公開 |
 
-> `/tmp` が書けるのは upstream の `workspace-write` の挙動である。仕様書とアダプタのコメントは
-> 「ワークスペースルート外への書き込みは拒否される」と書いているが、この記述は正確ではない
-> （[#30](https://github.com/mpppk/cloud-run-dsh/issues/30)）。
+> `/tmp` が書けるのは upstream の `workspace-write` の定義である。
+> ワークスペース外の**永続的な**書き込みは拒否されるうえ、Instance は短命で
+> プロセス終了時に `/tmp` ごと消えるため、封じ込めは成立している。
+> 仕様書 §6.2 とアダプタのコメントも実態に合わせて訂正済み
+> （[#30](https://github.com/mpppk/cloud-run-dsh/issues/30) で判断・対応）。
+> 測定の詳細は [立ち上げ作業報告](./bringup-report.md) の G8 を参照。
 
 ### 資格情報の扱い
 
@@ -325,6 +328,15 @@ agent-host と control-plane の2つ。いずれも bun ベースの多段ビル
 ローカル state（backend 未設定）。ADC 無しで動かせる — `GOOGLE_OAUTH_ACCESS_TOKEN` に
 アクセストークンを入れればよい。DB パスワードは Secret Manager から読むが、初回のみ
 `var.db_password` で与える二段構えになっている。
+
+**Terraform が持つのは静的な土台まで。Cloud Run Instances は管理外と決めている。**
+Instance はワークスペースごとの短命リソースで、control-plane が実行時に create / delete
+するため、宣言的管理に載せると `terraform plan` が恒常的に drift で汚れる。
+API 有効化・Cloud SQL・GCS・Secret・IAM・サービスアカウントが Terraform の境界であり、
+Instance のライフサイクルは control-plane の `InstanceRuntime` アダプタと
+[deployment-runbook](./deployment-runbook.md) Step 5 が担う。
+判断の経緯は [ADR-0001](./adr/0001-instances-outside-terraform.md) に記録している
+（[#28](https://github.com/mpppk/cloud-run-dsh/issues/28) で決定済み）。
 
 ---
 

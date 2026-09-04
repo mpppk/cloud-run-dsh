@@ -12,7 +12,12 @@
 // used by unit tests where a real filesystem / subprocess is unwanted. It
 // mirrors the adapter's refusal semantics:
 //   - model-facing write/edit outside the workspace root is REFUSED
-//     (fs-sandbox workspace-write mode),
+//     (fs-sandbox workspace-write mode), EXCEPT the platform temp area
+//     (/tmp — but not /var/tmp), which upstream workspace-write permits by
+//     definition (仕様書 section 6.2, #30; verified on a live Instance).
+//     The fake does not reproduce the /tmp exception (it confines every path
+//     to the workspace root via resolveInsideWorkspace); the real composition
+//     in harness-real.ts is the source of truth for the /tmp behavior.
 //   - read-before-write and stale-write protection
 //     (fs-observation-policy),
 //   - model-facing filesystem + search tools (tool-fs / tool-fs-search).
