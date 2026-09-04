@@ -73,6 +73,15 @@ export interface TurnStarter {
    * Returns true when a known ask was settled.
    */
   resolveApproval?(approvalId: string, decision: ApprovalDecision): Promise<boolean>;
+  /**
+   * Rehydrates one live agent per persisted session id (issue #39 recovery
+   * seam, driven by restoreHarness — NOT by the gateway). Returns the ids
+   * actually resumed. Rejects on failure: the caller surfaces it instead of
+   * falling back to create, so unrestorable history can never look like a
+   * fresh session. Optional so message-only starters keep compiling; when
+   * absent the recovery restores harness metadata only (logged).
+   */
+  resumeSessions?(sessionIds: readonly string[]): Promise<{ resumed: string[] }>;
 }
 
 /** HTTP-facing approval decision vocabulary (matches the control plane). */

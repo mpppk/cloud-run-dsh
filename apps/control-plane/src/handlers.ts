@@ -269,8 +269,27 @@ export const postApproval: RouteHandler = async (ctx) => {
   await requireController(ctx.deps.leases, session.workspaceId, ctx.user.id);
   const workspace = await loadWorkspace(ctx.deps, session.workspaceId);
   const handle = await ctx.deps.runtimes.get(workspace);
+  // The workspace state must accept agent input (仕様書 section 8).
+  handle.assertAgentInputAllowed();
   // An approval operation is meaningful activity (仕様書 section 11).
   handle.recordActivity("approval");
+  // Resolve the forward target BEFORE appending (issue #39, same rule as
+  // postMessage): when the Instance is not running there is no live turn to
+  // decide, so answering 409 without writing avoids an orphan `approval` no
+  // turn will ever consume.
+  const forwarder = ctx.deps.messageForwarder;
+  let instanceUrl: string | null = null;
+  if (forwarder) {
+    instanceUrl = await handle.getInstanceUrl();
+    if (!instanceUrl) {
+      throw conflict(
+        `workspace instance is not running — open the workspace first, then retry`,
+      );
+    }
+  }
+  // The control plane is the SOLE writer of `approval`: the agent-host
+  // resolves the decision from the forwarded approvalId/decision below and
+  // must not append the event again.
   const [event] = await ctx.deps.repo.append(session.id, [
     {
       eventType: "approval",
@@ -278,6 +297,37 @@ export const postApproval: RouteHandler = async (ctx) => {
       data: { approvalId, decision },
     },
   ]);
+  if (forwarder && instanceUrl) {
+    try {
+      await forwarder.forwardApproval({
+        instanceUrl,
+        workspaceId: workspace.id,
+        sessionId: session.id,
+        approvalId,
+        decision,
+        identity: { id: ctx.user.id, email: ctx.user.email },
+      });
+    } catch (e) {
+      // The host refused for a caller-actionable reason — propagate the 409
+      // (lease, stale state) instead of reporting a gateway failure.
+      if (e instanceof AgentHostConflictError) {
+        throw conflict(e.message);
+      }
+      // The event is recorded but the decision did not reach the turn: never
+      // fake the 201. Details go to the structured log; the response stays
+      // generic.
+      ctx.deps.logger?.error("control-plane.forward.failed", {
+        kind: "approval",
+        workspaceId: workspace.id,
+        sessionId: session.id,
+        approvalId,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      throw badGateway(
+        "approval recorded but the workspace instance did not accept it — the decision did not reach the turn",
+      );
+    }
+  }
   return json(toEventDto(event!), 201);
 };
 
@@ -289,8 +339,25 @@ export const postCancel: RouteHandler = async (ctx) => {
   await requireController(ctx.deps.leases, session.workspaceId, ctx.user.id);
   const workspace = await loadWorkspace(ctx.deps, session.workspaceId);
   const handle = await ctx.deps.runtimes.get(workspace);
+  // The workspace state must accept agent input (仕様書 section 8).
+  handle.assertAgentInputAllowed();
   // An explicit workspace operation is meaningful activity (仕様書 section 11).
   handle.recordActivity("workspace_operation");
+  // Resolve the forward target BEFORE appending (issue #39, same rule as
+  // postMessage): when the Instance is not running there is no live turn to
+  // interrupt, so answering 409 without writing avoids an orphan `cancel`.
+  const forwarder = ctx.deps.messageForwarder;
+  let instanceUrl: string | null = null;
+  if (forwarder) {
+    instanceUrl = await handle.getInstanceUrl();
+    if (!instanceUrl) {
+      throw conflict(
+        `workspace instance is not running — open the workspace first, then retry`,
+      );
+    }
+  }
+  // The control plane is the SOLE writer of `cancel`: the agent-host cancels
+  // the live turn from the forwarded session below and must not append again.
   const [event] = await ctx.deps.repo.append(session.id, [
     {
       eventType: "cancel",
@@ -298,6 +365,33 @@ export const postCancel: RouteHandler = async (ctx) => {
       data: { cancelledBy: ctx.user.id },
     },
   ]);
+  if (forwarder && instanceUrl) {
+    try {
+      await forwarder.forwardCancel({
+        instanceUrl,
+        workspaceId: workspace.id,
+        sessionId: session.id,
+        identity: { id: ctx.user.id, email: ctx.user.email },
+      });
+    } catch (e) {
+      // The host refused for a caller-actionable reason — propagate the 409
+      // (lease, stale state) instead of reporting a gateway failure.
+      if (e instanceof AgentHostConflictError) {
+        throw conflict(e.message);
+      }
+      // The event is recorded but the turn was not interrupted: never fake
+      // the 201. Details go to the structured log; the response stays generic.
+      ctx.deps.logger?.error("control-plane.forward.failed", {
+        kind: "cancel",
+        workspaceId: workspace.id,
+        sessionId: session.id,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      throw badGateway(
+        "cancel recorded but the workspace instance did not accept it — the turn was not interrupted",
+      );
+    }
+  }
   return json(toEventDto(event!), 201);
 };
 

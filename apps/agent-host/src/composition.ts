@@ -185,6 +185,8 @@ export function composeAgentHost(deps: AgentHostDependencies): AgentHost {
       sandboxManager,
       harness,
       repository: deps.repository,
+      turnStarter: deps.turnStarter,
+      logger,
     }),
     idle,
   });

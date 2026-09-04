@@ -218,8 +218,7 @@ describe("HarnessTurnStarter", () => {
     releaseGate();
   });
 
-  test("a live approval ask pends until resolveApproval settles it", async () => {
-    const fx = await makeStarter();
+  test("a live approval ask pends until resolveApproval settles it", async () => {    const fx = await makeStarter();
     const sessionId = "sess-approval-1";
     await fx.seedSession(sessionId);
     let releaseGate!: () => void;
@@ -278,5 +277,136 @@ describe("HarnessTurnStarter", () => {
         (e) => e.eventType === "assistant/message" && JSON.stringify(e.data).includes("approved-flow"),
       );
     }, 10_000, "turn completion after approval");
+  });
+});
+
+describe("HarnessTurnStarter.resumeSessions (issue #39)", () => {
+  /** A fresh starter sharing the SAME repository: simulates a new process after restart. */
+  async function restartStarter(fx: TurnFixture): Promise<{
+    starter: HarnessTurnStarter;
+    adapter: ScriptedFakeAdapter;
+  }> {
+    const adapter = new ScriptedFakeAdapter();
+    const starter = await HarnessTurnStarter.create({
+      config: makeConfig({ workspaceRoot: fx.workspaceRoot, llmModel: TEST_MODEL }),
+      repository: fx.repository,
+      logger: new InMemoryLogger(),
+      llmTestAdapter: adapter,
+    });
+    return { starter, adapter };
+  }
+
+  async function runCompletedTurn(fx: TurnFixture, sessionId: string): Promise<void> {
+    await fx.repository.append(sessionId, [
+      { eventType: "user_message", eventTime: Date.now(), data: { content: "write notes" } },
+    ]);
+    fx.adapter.script.push(
+      writeCall("call-write-1", "notes.txt", "hi from the model"),
+      textReply("done"),
+    );
+    await fx.starter.startTurn({ workspaceId: "ws-1", sessionId, seq: 0, content: "write notes" });
+    await waitFor(async () => {
+      const events = await fx.repository.readEvents(sessionId);
+      return events.some((e) => e.eventType === "turn/end");
+    }, 20_000, "turn completion in Postgres");
+  }
+
+  test("resumes the agent with history intact and continues the conversation", async () => {
+    const fx = await makeStarter();
+    const sessionId = "sess-resume-1";
+    await fx.seedSession(sessionId);
+    await runCompletedTurn(fx, sessionId);
+    const eventsBefore = await fx.repository.readEvents(sessionId);
+    expect(eventsBefore.map((e) => e.eventType)).toContain("assistant/message");
+
+    // ---- simulated restart ----
+    const { starter: starter2, adapter: adapter2 } = await restartStarter(fx);
+    expect(starter2.agentFor(sessionId)).toBeUndefined();
+
+    const { resumed } = await starter2.resumeSessions([sessionId]);
+    expect(resumed).toEqual([sessionId]);
+    expect(starter2.agentFor(sessionId)).toBeDefined();
+
+    // Resume replays stored history — it must not append duplicates.
+    expect(await fx.repository.readEvents(sessionId)).toHaveLength(eventsBefore.length);
+
+    // The next turn sees the resumed history: the model's first request
+    // carries the earlier user text AND the earlier assistant reply.
+    adapter2.script.push(textReply("second done"));
+    const seq = (await fx.repository.readEvents(sessionId)).length;
+    await starter2.startTurn({ workspaceId: "ws-1", sessionId, seq, content: "again" });
+    await waitFor(async () => {
+      const events = await fx.repository.readEvents(sessionId);
+      return events.some(
+        (e) => e.eventType === "assistant/message" && JSON.stringify(e.data).includes("second done"),
+      );
+    }, 20_000, "second turn completion after resume");
+    expect(adapter2.calls.length).toBeGreaterThanOrEqual(1);
+    const firstMessages = JSON.stringify(adapter2.calls[0]!.messages);
+    expect(firstMessages).toContain("write notes");
+    expect(firstMessages).toContain("done");
+  });
+
+  test("unknown session ids reject — never silently create an empty agent", async () => {
+    const fx = await makeStarter();
+    const { starter: starter2 } = await restartStarter(fx);
+    await expect(starter2.resumeSessions(["no-such-session"])).rejects.toThrow(
+      /no-such-session.*not found|not found.*no-such-session/,
+    );
+    expect(starter2.agentFor("no-such-session")).toBeUndefined();
+  });
+
+  test("an empty session list resumes nothing", async () => {
+    const fx = await makeStarter();
+    const { starter: starter2 } = await restartStarter(fx);
+    await expect(starter2.resumeSessions([])).resolves.toEqual({ resumed: [] });
+  });
+
+  test("already-live sessions are skipped, not double-resumed", async () => {
+    const fx = await makeStarter();
+    const sessionId = "sess-resume-live";
+    await fx.seedSession(sessionId);
+    await runCompletedTurn(fx, sessionId);
+    const { starter: starter2 } = await restartStarter(fx);
+    await starter2.resumeSessions([sessionId]);
+    await expect(starter2.resumeSessions([sessionId])).resolves.toEqual({ resumed: [] });
+    expect(starter2.agentFor(sessionId)).toBeDefined();
+  });
+
+  test("resumes mid-turn after a crash: the open turn restores without failing", async () => {
+    const fx = await makeStarter();
+    const sessionId = "sess-resume-crash";
+    await fx.seedSession(sessionId);
+    await fx.repository.append(sessionId, [
+      { eventType: "user_message", eventTime: Date.now(), data: { content: "slow" } },
+    ]);
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((r) => (releaseGate = r));
+    fx.adapter.script.push(async function* () {
+      yield { type: "block-start", index: 0, blockType: "text" };
+      await gate;
+      yield { type: "text-delta", index: 0, text: "late" };
+      yield { type: "block-end", index: 0, block: { type: "text", text: "late" } };
+      yield { type: "usage", usage: { inputTokens: 1, outputTokens: 1 } };
+      yield { type: "finish", reason: { kind: "stop" } };
+    });
+    await fx.starter.startTurn({ workspaceId: "ws-1", sessionId, seq: 0, content: "slow" });
+    // The turn opened but the model stream is stuck: this is the crash shape
+    // (stored log ends mid-turn, no turn/end).
+    await waitFor(async () => {
+      const events = await fx.repository.readEvents(sessionId);
+      return events.some((e) => e.eventType === "step/start");
+    }, 10_000, "open turn in Postgres");
+    expect(
+      (await fx.repository.readEvents(sessionId)).some((e) => e.eventType === "turn/end"),
+    ).toBe(false);
+
+    // The old process dies here (gate never released on fx's side).
+    const { starter: starter2 } = await restartStarter(fx);
+    const { resumed } = await starter2.resumeSessions([sessionId]);
+    expect(resumed).toEqual([sessionId]);
+    expect(starter2.agentFor(sessionId)).toBeDefined();
+
+    releaseGate();
   });
 });

@@ -6,6 +6,8 @@ import { InMemoryLogger } from "@cloud-run-dsh/observability";
 import {
   AgentHostConflictError,
   AgentHostForwardError,
+  type ForwardApprovalArgs,
+  type ForwardCancelArgs,
   type ForwardMessageArgs,
   type MessageForwarder,
 } from "./forwarding.js";
@@ -1290,6 +1292,8 @@ describe("SSE heartbeat cadence with an injected fake clock", () => {
 /** Recording MessageForwarder fake with switchable failure modes. */
 class RecordingForwarder implements MessageForwarder {
   calls: ForwardMessageArgs[] = [];
+  approvalCalls: ForwardApprovalArgs[] = [];
+  cancelCalls: ForwardCancelArgs[] = [];
   behavior: "ok" | "conflict" | "forward-error" = "ok";
 
   async forward(args: ForwardMessageArgs): Promise<{ status: number; turnStarted: boolean }> {
@@ -1297,6 +1301,34 @@ class RecordingForwarder implements MessageForwarder {
     if (this.behavior === "conflict") {
       throw new AgentHostConflictError(
         "agent-host refused the message (status 409): controller lease not held by this host",
+      );
+    }
+    if (this.behavior === "forward-error") {
+      throw new AgentHostForwardError("workspace instance unreachable at https://ah.test (boom)");
+    }
+    return { status: 202, turnStarted: true };
+  }
+
+  async forwardApproval(
+    args: ForwardApprovalArgs,
+  ): Promise<{ status: number; turnStarted: boolean }> {
+    this.approvalCalls.push(args);
+    if (this.behavior === "conflict") {
+      throw new AgentHostConflictError(
+        "agent-host refused the request (status 409): controller lease not held by this host",
+      );
+    }
+    if (this.behavior === "forward-error") {
+      throw new AgentHostForwardError("workspace instance unreachable at https://ah.test (boom)");
+    }
+    return { status: 202, turnStarted: true };
+  }
+
+  async forwardCancel(args: ForwardCancelArgs): Promise<{ status: number; turnStarted: boolean }> {
+    this.cancelCalls.push(args);
+    if (this.behavior === "conflict") {
+      throw new AgentHostConflictError(
+        "agent-host refused the request (status 409): controller lease not held by this host",
       );
     }
     if (this.behavior === "forward-error") {
@@ -1452,6 +1484,192 @@ describe("message forwarding to agent-host (issue #22)", () => {
       const res = await postAsAlice(h, sessionId, "local dev message");
       expect(res.status).toBe(201);
       expect(await h.repo.readEvents(sessionId)).toHaveLength(1);
+    } finally {
+      h.stop();
+    }
+  });
+});
+
+describe("approval/cancel forwarding to agent-host (issue #39)", () => {
+  async function setupApprovalForwarding(instanceUrl: string | null): Promise<{
+    h: TestHarness;
+    workspaceId: string;
+    sessionId: string;
+    forwarder: RecordingForwarder;
+    logger: InMemoryLogger;
+  }> {
+    const forwarder = new RecordingForwarder();
+    const logger = new InMemoryLogger();
+    const h = startHarness({ messageForwarder: forwarder, logger });
+    const ws = await h.createWorkspace("alice");
+    const handle = new FakeHandle();
+    handle.instanceUrl = instanceUrl;
+    h.deps.runtimes.set(ws.id, handle);
+    const sessionRes = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(sessionRes.status).toBe(201);
+    const sessionId = ((await sessionRes.json()) as { id: string }).id;
+    const acquire = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/controller/acquire`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(acquire.status).toBe(200);
+    return { h, workspaceId: ws.id, sessionId, forwarder, logger };
+  }
+
+  const postApprovalAsAlice = (h: TestHarness, sessionId: string, approvalId: string) =>
+    h.fetchAs("alice", `/v1/sessions/${sessionId}/approvals/${approvalId}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decision: "rejected" }),
+    });
+
+  const postCancelAsAlice = (h: TestHarness, sessionId: string) =>
+    h.fetchAs("alice", `/v1/sessions/${sessionId}/cancel`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+  test("running instance: approval appends once and forwards id/decision, 201", async () => {
+    const { h, sessionId, forwarder } = await setupApprovalForwarding("https://ah.test");
+    try {
+      const res = await postApprovalAsAlice(h, sessionId, "ap-1");
+      expect(res.status).toBe(201);
+      const event = await res.json();
+      expect(event.eventType).toBe("approval");
+      expect(event.data).toEqual({ approvalId: "ap-1", decision: "rejected" });
+
+      // Single writer: exactly one approval in the DB …
+      const persisted = await h.repo.readEvents(sessionId);
+      expect(persisted).toHaveLength(1);
+      expect(persisted[0]!.eventType).toBe("approval");
+
+      // … and the forwarder carried the SAME decision (a reference, not a
+      // second append — the fake has no repo access, like the gateway).
+      expect(forwarder.approvalCalls).toHaveLength(1);
+      expect(forwarder.approvalCalls[0]).toMatchObject({
+        instanceUrl: "https://ah.test",
+        sessionId,
+        approvalId: "ap-1",
+        decision: "rejected",
+        identity: { id: "alice", email: "alice@example.com" },
+      });
+      expect(await h.repo.readEvents(sessionId)).toHaveLength(1);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("running instance: cancel appends once and forwards the session, 201", async () => {
+    const { h, sessionId, forwarder } = await setupApprovalForwarding("https://ah.test");
+    try {
+      const res = await postCancelAsAlice(h, sessionId);
+      expect(res.status).toBe(201);
+      const event = await res.json();
+      expect(event.eventType).toBe("cancel");
+
+      const persisted = await h.repo.readEvents(sessionId);
+      expect(persisted).toHaveLength(1);
+      expect(persisted[0]!.eventType).toBe("cancel");
+
+      expect(forwarder.cancelCalls).toHaveLength(1);
+      expect(forwarder.cancelCalls[0]).toMatchObject({
+        instanceUrl: "https://ah.test",
+        sessionId,
+        identity: { id: "alice", email: "alice@example.com" },
+      });
+      expect(await h.repo.readEvents(sessionId)).toHaveLength(1);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("stopped instance (no URL): approval/cancel 409 WITHOUT writing orphans", async () => {
+    const { h, sessionId, forwarder } = await setupApprovalForwarding(null);
+    try {
+      const approvalRes = await postApprovalAsAlice(h, sessionId, "ap-1");
+      expect(approvalRes.status).toBe(409);
+      expect(((await approvalRes.json()) as { error: { code: string } }).error.code).toBe(
+        "conflict",
+      );
+
+      const cancelRes = await postCancelAsAlice(h, sessionId);
+      expect(cancelRes.status).toBe(409);
+
+      // No orphans: nothing appended, nothing forwarded to.
+      expect(await h.repo.readEvents(sessionId)).toHaveLength(0);
+      expect(forwarder.approvalCalls).toHaveLength(0);
+      expect(forwarder.cancelCalls).toHaveLength(0);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("forward failure: 502 (never a fake 201), orphan is traceable", async () => {
+    const { h, sessionId, forwarder, logger } = await setupApprovalForwarding("https://ah.test");
+    forwarder.behavior = "forward-error";
+    try {
+      const approvalRes = await postApprovalAsAlice(h, sessionId, "ap-9");
+      expect(approvalRes.status).toBe(502);
+      expect(((await approvalRes.json()) as { error: { code: string } }).error.code).toBe(
+        "bad_gateway",
+      );
+
+      const cancelRes = await postCancelAsAlice(h, sessionId);
+      expect(cancelRes.status).toBe(502);
+
+      // Both events WERE recorded but the client is told they did not land —
+      // and the log shows why.
+      expect(await h.repo.readEvents(sessionId)).toHaveLength(2);
+      const failed = logger.parsed.filter((e) => e["event"] === "control-plane.forward.failed");
+      expect(failed).toHaveLength(2);
+      expect(failed.map((e) => e["kind"]).sort()).toEqual(["approval", "cancel"]);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("agent-host conflict: approval/cancel 409, not 502", async () => {
+    const { h, sessionId, forwarder } = await setupApprovalForwarding("https://ah.test");
+    forwarder.behavior = "conflict";
+    try {
+      const approvalRes = await postApprovalAsAlice(h, sessionId, "ap-1");
+      expect(approvalRes.status).toBe(409);
+      expect(((await approvalRes.json()) as { error: { code: string } }).error.code).toBe(
+        "conflict",
+      );
+      const cancelRes = await postCancelAsAlice(h, sessionId);
+      expect(cancelRes.status).toBe(409);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("no forwarder configured (dev/tests): append-only 201, nothing forwarded", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      const sessionRes = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const sessionId = ((await sessionRes.json()) as { id: string }).id;
+      const acquire = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/controller/acquire`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(acquire.status).toBe(200);
+
+      expect((await postApprovalAsAlice(h, sessionId, "ap-1")).status).toBe(201);
+      expect((await postCancelAsAlice(h, sessionId)).status).toBe(201);
+      expect(await h.repo.readEvents(sessionId)).toHaveLength(2);
     } finally {
       h.stop();
     }

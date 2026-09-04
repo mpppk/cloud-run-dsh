@@ -231,17 +231,44 @@ export interface ForwardMessageArgs {
   readonly identity: ForwardIdentity;
 }
 
+export interface ForwardApprovalArgs {
+  /** Instance base URL (scheme + host, no trailing slash handling needed). */
+  readonly instanceUrl: string;
+  readonly workspaceId: string;
+  readonly sessionId: string;
+  /** The approval id from the route (`:approvalId`), also stored on the event. */
+  readonly approvalId: string;
+  readonly decision: "approved" | "rejected";
+  /** Caller identity, propagated so the host's gateway check can run. */
+  readonly identity: ForwardIdentity;
+}
+
+export interface ForwardCancelArgs {
+  /** Instance base URL (scheme + host, no trailing slash handling needed). */
+  readonly instanceUrl: string;
+  readonly workspaceId: string;
+  readonly sessionId: string;
+  /** Caller identity, propagated so the host's gateway check can run. */
+  readonly identity: ForwardIdentity;
+}
+
 export interface AgentHostForwardResult {
   readonly status: number;
   readonly turnStarted: boolean;
 }
 
 /**
- * Narrow seam the route handler depends on. Tests inject recording fakes;
- * production uses HttpAgentHostForwarder below.
+ * Narrow seam the route handlers depend on. Tests inject recording fakes;
+ * production uses HttpAgentHostForwarder below. All three forwards share one
+ * contract (issue #22 for messages, issue #39 for approvals/cancel):
+ * stopped Instance -> caller-visible conflict (the handler maps it to 409),
+ * failed forward after a successful append -> forward error (mapped to 502,
+ * never a fake 201).
  */
 export interface MessageForwarder {
   forward(args: ForwardMessageArgs): Promise<AgentHostForwardResult>;
+  forwardApproval(args: ForwardApprovalArgs): Promise<AgentHostForwardResult>;
+  forwardCancel(args: ForwardCancelArgs): Promise<AgentHostForwardResult>;
 }
 
 /** The agent-host refused the message for a caller-visible reason (maps to 409). */
@@ -284,6 +311,97 @@ export class HttpAgentHostForwarder implements MessageForwarder {
   }
 
   async forward(args: ForwardMessageArgs): Promise<AgentHostForwardResult> {
+    const path =
+      `/workspaces/${encodeURIComponent(args.workspaceId)}` +
+      `/sessions/${encodeURIComponent(args.sessionId)}/messages`;
+    const res = await this.postToHost({
+      instanceUrl: args.instanceUrl,
+      path,
+      body: {
+        workspaceId: args.workspaceId,
+        sessionId: args.sessionId,
+        seq: args.seq,
+        content: args.content,
+      },
+      identity: args.identity,
+      // The gateway reports explicitly when the turn did NOT start
+      // (turnStarted:false while the HTTP status stays 202). Trusting the
+      // status alone would re-create the "looks delivered but nothing runs"
+      // failure this forwarding exists to remove.
+      requireTurnStarted: true,
+    });
+    this.opts.logger?.info("control-plane.forward.delivered", {
+      kind: "message",
+      workspaceId: args.workspaceId,
+      sessionId: args.sessionId,
+      seq: args.seq,
+      status: res.status,
+    });
+    return { status: res.status, turnStarted: true };
+  }
+
+  /**
+   * Forwards a just-appended approval decision (issue #39). The host gateway
+   * keeps its acceptance semantics (202 with `approvalResolved` even for an
+   * unknown id — the decision is parked for a racing ask), so any 2xx counts
+   * as delivered; transport failures still surface as forward errors (502).
+   */
+  async forwardApproval(args: ForwardApprovalArgs): Promise<AgentHostForwardResult> {
+    const path =
+      `/workspaces/${encodeURIComponent(args.workspaceId)}` +
+      `/sessions/${encodeURIComponent(args.sessionId)}/approvals`;
+    const res = await this.postToHost({
+      instanceUrl: args.instanceUrl,
+      path,
+      body: { approvalId: args.approvalId, decision: args.decision },
+      identity: args.identity,
+    });
+    this.opts.logger?.info("control-plane.forward.delivered", {
+      kind: "approval",
+      workspaceId: args.workspaceId,
+      sessionId: args.sessionId,
+      approvalId: args.approvalId,
+      status: res.status,
+    });
+    return { status: res.status, turnStarted: true };
+  }
+
+  /**
+   * Forwards a just-appended cancel (issue #39). The host cancels the live
+   * turn for the session (or reports zero cancelled when nothing is live —
+   * still delivered). Same 409/502 contract as messages.
+   */
+  async forwardCancel(args: ForwardCancelArgs): Promise<AgentHostForwardResult> {
+    const path =
+      `/workspaces/${encodeURIComponent(args.workspaceId)}` +
+      `/sessions/${encodeURIComponent(args.sessionId)}/cancel`;
+    const res = await this.postToHost({
+      instanceUrl: args.instanceUrl,
+      path,
+      body: { sessionId: args.sessionId },
+      identity: args.identity,
+    });
+    this.opts.logger?.info("control-plane.forward.delivered", {
+      kind: "cancel",
+      workspaceId: args.workspaceId,
+      sessionId: args.sessionId,
+      status: res.status,
+    });
+    return { status: res.status, turnStarted: true };
+  }
+
+  /**
+   * Shared POST to the Instance gateway: ID-token mint, timeout, and the
+   * 409-vs-502 classification. Every forward reuses this — never a second
+   * copy of the auth/timeout/error mapping (issue #39).
+   */
+  private async postToHost(args: {
+    instanceUrl: string;
+    path: string;
+    body: Record<string, unknown>;
+    identity: ForwardIdentity;
+    requireTurnStarted?: boolean;
+  }): Promise<Response> {
     const base = args.instanceUrl.replace(/\/$/, "");
     // Audience is the Instance origin (scheme + host). The metadata server
     // signs `aud` exactly, so trailing slashes must not leak in.
@@ -295,9 +413,7 @@ export class HttpAgentHostForwarder implements MessageForwarder {
         `cannot mint ID token for the workspace instance: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
-    const url =
-      `${base}/workspaces/${encodeURIComponent(args.workspaceId)}` +
-      `/sessions/${encodeURIComponent(args.sessionId)}/messages`;
+    const url = `${base}${args.path}`;
     let res: Response;
     try {
       const controller = new AbortController();
@@ -314,12 +430,7 @@ export class HttpAgentHostForwarder implements MessageForwarder {
             "x-goog-authenticated-user-email": args.identity.email,
             "x-goog-authenticated-user-id": `accounts.google.com:${args.identity.id}`,
           },
-          body: JSON.stringify({
-            workspaceId: args.workspaceId,
-            sessionId: args.sessionId,
-            seq: args.seq,
-            content: args.content,
-          }),
+          body: JSON.stringify(args.body),
           signal: controller.signal,
         });
       } finally {
@@ -338,7 +449,7 @@ export class HttpAgentHostForwarder implements MessageForwarder {
       // The host refused for a caller-actionable reason (lease, stale state):
       // propagate as conflict, not as a gateway failure.
       throw new AgentHostConflictError(
-        `agent-host refused the message (status ${res.status}): ${truncate(await safeText(res))}`,
+        `agent-host refused the request (status ${res.status}): ${truncate(await safeText(res))}`,
       );
     }
     if (!res.ok) {
@@ -346,31 +457,23 @@ export class HttpAgentHostForwarder implements MessageForwarder {
         `agent-host answered ${res.status}: ${truncate(await safeText(res))}`,
       );
     }
-    // The gateway reports explicitly when the turn did NOT start
-    // (turnStarted:false while the HTTP status stays 202). Trusting the
-    // status alone would re-create the "looks delivered but nothing runs"
-    // failure this forwarding exists to remove.
-    let turnStarted = true;
-    try {
-      const body = (await res.json()) as Record<string, unknown>;
-      if (body !== null && typeof body === "object" && body["turnStarted"] === false) {
-        turnStarted = false;
+    if (args.requireTurnStarted) {
+      let turnStarted = true;
+      try {
+        const body = (await res.json()) as Record<string, unknown>;
+        if (body !== null && typeof body === "object" && body["turnStarted"] === false) {
+          turnStarted = false;
+        }
+      } catch {
+        // Non-JSON 2xx: no turn flag to contradict delivery; treat as started.
       }
-    } catch {
-      // Non-JSON 2xx: no turn flag to contradict delivery; treat as started.
+      if (!turnStarted) {
+        throw new AgentHostForwardError(
+          "agent-host accepted the request but reported turnStarted:false — the turn did not start",
+        );
+      }
     }
-    if (!turnStarted) {
-      throw new AgentHostForwardError(
-        "agent-host accepted the request but reported turnStarted:false — the turn did not start",
-      );
-    }
-    this.opts.logger?.info("control-plane.forward.delivered", {
-      workspaceId: args.workspaceId,
-      sessionId: args.sessionId,
-      seq: args.seq,
-      status: res.status,
-    });
-    return { status: res.status, turnStarted };
+    return res;
   }
 }
 

@@ -299,7 +299,7 @@ export interface TestHost {
 
 export async function composeTestHost(
   configOverrides: Partial<AgentHostConfig> = {},
-  extra: { turnStarter?: TurnStarter; logger?: Logger } = {},
+  extra: { turnStarter?: TurnStarter; logger?: Logger; repository?: PostgresSessionPersistenceRepository } = {},
 ): Promise<TestHost> {
   const clock = new FakeClock();
   const git = new RecordingGitRunner();
@@ -309,7 +309,7 @@ export async function composeTestHost(
   const instance = new FakeInstanceRuntime();
   const leaseStore = new InMemoryLeaseStore();
   const executor = new InMemoryFakeExecutor();
-  const repository = new PostgresSessionPersistenceRepository(executor);
+  const repository = extra.repository ?? new PostgresSessionPersistenceRepository(executor);
   const config = makeConfig(configOverrides);
   const scheduler = new FakeIntervalScheduler(clock);
 

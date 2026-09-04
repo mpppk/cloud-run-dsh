@@ -16,6 +16,8 @@ import {
   ID_TOKEN_REFRESH_MARGIN_MS,
   buildIdTokenUrl,
   parseJwtExpSeconds,
+  type ForwardApprovalArgs,
+  type ForwardCancelArgs,
   type ForwardMessageArgs,
 } from "./forwarding.js";
 
@@ -414,5 +416,133 @@ describe("HttpAgentHostForwarder", () => {
 
   test("refresh-margin constant matches the #27 access-token shape (60s)", () => {
     expect(ID_TOKEN_REFRESH_MARGIN_MS).toBe(60_000);
+  });
+});
+
+describe("HttpAgentHostForwarder approval/cancel (issue #39)", () => {
+  function approvalSetup(
+    body: unknown = { accepted: true },
+    status = 202,
+  ): {
+    calls: { url: string; init: RequestInit | undefined }[];
+    forwarder: HttpAgentHostForwarder;
+    seenAudiences: string[];
+  } {
+    const seenAudiences: string[] = [];
+    const calls: { url: string; init: RequestInit | undefined }[] = [];
+    const forwarder = new HttpAgentHostForwarder({
+      idTokenProvider: async (aud) => {
+        seenAudiences.push(aud);
+        return "id-token-123";
+      },
+      fetchFn: (async (url: string, init?: RequestInit) => {
+        calls.push({ url, init });
+        return jsonResponse(body, status);
+      }) as (url: string, init?: RequestInit) => Promise<Response>,
+    });
+    return { calls, forwarder, seenAudiences };
+  }
+
+  const approvalArgs = (overrides: Partial<ForwardApprovalArgs> = {}): ForwardApprovalArgs => ({
+    instanceUrl: "https://dsh-ws-1.run.app",
+    workspaceId: "ws-1",
+    sessionId: "sess-1",
+    approvalId: "ask-1",
+    decision: "rejected",
+    identity: { id: "alice", email: "alice@example.com" },
+    ...overrides,
+  });
+
+  const cancelArgs = (overrides: Partial<ForwardCancelArgs> = {}): ForwardCancelArgs => ({
+    instanceUrl: "https://dsh-ws-1.run.app",
+    workspaceId: "ws-1",
+    sessionId: "sess-1",
+    identity: { id: "alice", email: "alice@example.com" },
+    ...overrides,
+  });
+
+  test("forwardApproval POSTs to the session approvals path with id + decision", async () => {
+    const { calls, forwarder, seenAudiences } = approvalSetup();
+    const result = await forwarder.forwardApproval(approvalArgs());
+    expect(result).toEqual({ status: 202, turnStarted: true });
+
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.url).toBe(
+      "https://dsh-ws-1.run.app/workspaces/ws-1/sessions/sess-1/approvals",
+    );
+    const init = calls[0]!.init!;
+    expect(init.method).toBe("POST");
+    const headers = init.headers as Record<string, string>;
+    expect(headers["authorization"]).toBe("Bearer id-token-123");
+    expect(headers["x-goog-authenticated-user-email"]).toBe("alice@example.com");
+    expect(headers["x-goog-authenticated-user-id"]).toBe("accounts.google.com:alice");
+    expect(JSON.parse(init.body as string)).toEqual({
+      approvalId: "ask-1",
+      decision: "rejected",
+    });
+    expect(seenAudiences).toEqual(["https://dsh-ws-1.run.app"]);
+  });
+
+  test("forwardCancel POSTs to the session cancel path", async () => {
+    const { calls, forwarder } = approvalSetup({ accepted: true });
+    const result = await forwarder.forwardCancel(cancelArgs());
+    expect(result).toEqual({ status: 202, turnStarted: true });
+
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.url).toBe(
+      "https://dsh-ws-1.run.app/workspaces/ws-1/sessions/sess-1/cancel",
+    );
+    const init = calls[0]!.init!;
+    expect(init.method).toBe("POST");
+    const headers = init.headers as Record<string, string>;
+    expect(headers["authorization"]).toBe("Bearer id-token-123");
+    expect(JSON.parse(init.body as string)).toEqual({ sessionId: "sess-1" });
+  });
+
+  test("approval/cancel share the message contract: 409/403 -> conflict, 5xx/unreachable -> forward error", async () => {
+    for (const status of [409, 403]) {
+      const { forwarder } = approvalSetup({ error: "lease not held" }, status);
+      await expect(forwarder.forwardApproval(approvalArgs())).rejects.toBeInstanceOf(
+        AgentHostConflictError,
+      );
+      const { forwarder: cancelForwarder } = approvalSetup({ error: "nope" }, status);
+      await expect(cancelForwarder.forwardCancel(cancelArgs())).rejects.toBeInstanceOf(
+        AgentHostConflictError,
+      );
+    }
+    const { forwarder: fiveHundred } = approvalSetup({ error: "boom" }, 500);
+    await expect(fiveHundred.forwardApproval(approvalArgs())).rejects.toBeInstanceOf(
+      AgentHostForwardError,
+    );
+    const unreachable = new HttpAgentHostForwarder({
+      idTokenProvider: async () => "tok",
+      fetchFn: (async () => {
+        throw new Error("connection refused");
+      }) as (url: string, init?: RequestInit) => Promise<Response>,
+    });
+    const err = await unreachable.forwardCancel(cancelArgs()).catch((e) => e);
+    expect(err).toBeInstanceOf(AgentHostForwardError);
+    expect(String(err.message)).toContain("https://dsh-ws-1.run.app");
+  });
+
+  test("approval/cancel delivery is logged with kind, without secrets", async () => {
+    const logger = new InMemoryLogger();
+    const forwarder = new HttpAgentHostForwarder({
+      idTokenProvider: async () => "id-token-123",
+      fetchFn: (async () => jsonResponse({ accepted: true })) as (
+        url: string,
+        init?: RequestInit,
+      ) => Promise<Response>,
+      logger,
+    });
+    await forwarder.forwardApproval(approvalArgs());
+    await forwarder.forwardCancel(cancelArgs());
+    const kinds = logger.parsed
+      .filter((e) => e["event"] === "control-plane.forward.delivered")
+      .map((e) => e["kind"]);
+    expect(kinds).toEqual(["approval", "cancel"]);
+    for (const line of logger.lines) {
+      expect(line.includes("id-token-123")).toBe(false);
+    }
   });
 });
