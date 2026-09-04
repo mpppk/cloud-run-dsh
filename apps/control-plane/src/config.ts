@@ -5,8 +5,15 @@
 // Cloud Run injects. To manage workspace Instances it additionally needs the
 // GCP project/region, the agent-host image + service account, the checkpoint
 // bucket, and the agent-host's own required environment (DB URL, GitHub App
-// credentials) which it injects into every Instance it creates
+// credentials, LLM API key) which it injects into every Instance it creates
 // (see runtime-factory.ts and docs/deployment-runbook.md Step 6).
+//
+// Secret posture mirrors GITHUB_APP_PRIVATE_KEY_PEM throughout: OPENROUTER_API_KEY
+// travels as a plain env value into created Instances (Instances API
+// `valueSource` secret references are follow-up work — the typed client only
+// sends plain `value` pairs today). The key value is NEVER logged and NEVER
+// interpolated into an error message — MissingRequiredEnvError carries key
+// NAMES only.
 
 export const DEFAULT_PORT = 8080;
 
@@ -20,6 +27,11 @@ const REQUIRED_ENV_KEYS = [
   "AGENT_HOST_DATABASE_URL",
   "GITHUB_APP_ID",
   "GITHUB_APP_PRIVATE_KEY_PEM",
+  // Issue #41: without this the control plane builds Instances whose first
+  // turn dies with MISSING_CREDENTIAL. Required (not optional-with-default)
+  // so a missing key fails control-plane boot — long before any Instance is
+  // created — instead of failing the first turn inside the Instance.
+  "OPENROUTER_API_KEY",
 ] as const;
 
 export type RequiredEnvKey = (typeof REQUIRED_ENV_KEYS)[number];
@@ -57,6 +69,22 @@ export interface ControlPlaneConfig {
   readonly githubAppId: string;
   /** GitHub App private key PEM injected into created Instances (host-only). */
   readonly githubAppPrivateKeyPem: string;
+  /**
+   * OpenRouter API key injected into created Instances as OPENROUTER_API_KEY
+   * (issue #41 — the agent-host resolves it per LLM request via its default
+   * LLM_API_KEY_ENV). Same secret posture as the GitHub App PEM: plain env
+   * value, never logged, never interpolated into errors.
+   */
+  readonly openrouterApiKey: string;
+  /**
+   * Optional agent-host LLM overrides, passed through to created Instances
+   * ONLY when set (issue #41). Unset means "defer to the agent-host
+   * defaults" (LLM_BASE_URL https://openrouter.ai/api/v1,
+   * LLM_MODEL deepseek/deepseek-v4-flash, LLM_APPROVAL_POLICY ask).
+   */
+  readonly llmBaseUrl?: string;
+  readonly llmModel?: string;
+  readonly llmApprovalPolicy?: "ask" | "never";
 }
 
 export function readControlPlaneConfig(
@@ -90,5 +118,34 @@ export function readControlPlaneConfig(
     // a whole is required to be non-blank (checked above). Trailing newlines
     // from Secret Manager mounts are harmless for the broker.
     githubAppPrivateKeyPem: env["GITHUB_APP_PRIVATE_KEY_PEM"]!,
+    openrouterApiKey: env["OPENROUTER_API_KEY"]!.trim(),
+    ...readLlmOverrides(env),
   };
+}
+
+/**
+ * Optional agent-host LLM overrides (issue #41). Blank means "unset" — the
+ * key is omitted from the Instance env so the agent-host default applies
+ * (same blank-falls-back-to-default rule as apps/agent-host/src/config.ts).
+ * An invalid LLM_APPROVAL_POLICY fails here, at control-plane boot, not in
+ * the first turn inside the Instance. No secret values are involved, but this
+ * still never echoes env values into errors beyond the offending policy
+ * token (which is operator input, not a credential).
+ */
+function readLlmOverrides(
+  env: Readonly<Record<string, string | undefined>>,
+): Pick<ControlPlaneConfig, "llmBaseUrl" | "llmModel" | "llmApprovalPolicy"> {
+  const out: { llmBaseUrl?: string; llmModel?: string; llmApprovalPolicy?: "ask" | "never" } = {};
+  const baseUrl = env["LLM_BASE_URL"]?.trim();
+  if (baseUrl !== undefined && baseUrl !== "") out.llmBaseUrl = baseUrl;
+  const model = env["LLM_MODEL"]?.trim();
+  if (model !== undefined && model !== "") out.llmModel = model;
+  const policyRaw = env["LLM_APPROVAL_POLICY"]?.trim();
+  if (policyRaw !== undefined && policyRaw !== "") {
+    if (policyRaw !== "ask" && policyRaw !== "never") {
+      throw new Error(`invalid LLM_APPROVAL_POLICY: ${policyRaw} (want "ask" or "never")`);
+    }
+    out.llmApprovalPolicy = policyRaw;
+  }
+  return out;
 }

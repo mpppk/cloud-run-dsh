@@ -37,6 +37,8 @@ function testConfig(): ControlPlaneConfig {
     agentHostDatabaseUrl: "postgresql://dsh_app:pw@/dsh?host=/cloudsql/test-proj:test-region:main",
     githubAppId: "12345",
     githubAppPrivateKeyPem: "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n",
+    // Distinctive sentinel: leak assertions below search for this exact value.
+    openrouterApiKey: "sk-or-v1-test-sentinel-key-0001",
   };
 }
 
@@ -124,9 +126,9 @@ function openFlowHandler(instanceName: string, url: string) {
   };
 }
 
-function makeRegistry(h: Harness) {
+function makeRegistry(h: Harness, configOverride?: Partial<ControlPlaneConfig>) {
   return createProductionRuntimeRegistry({
-    config: testConfig(),
+    config: { ...testConfig(), ...configOverride },
     repo: h.repo,
     stateStore: new SqlTransactionalStateStore(h.executor),
     clock: new SystemClock(),
@@ -180,6 +182,9 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     expect(env["REPOSITORY_OWNER"]).toBe("mpppk");
     expect(env["CHECKPOINT_BUCKET"]).toBe("test-checkpoints");
     expect(env["GITHUB_APP_ID"]).toBe("12345");
+    // Issue #41: the created Instance carries the LLM key (fail-before-create
+    // companion tests below cover the missing-key path).
+    expect(env["OPENROUTER_API_KEY"]).toBe("sk-or-v1-test-sentinel-key-0001");
 
     // agent-host /healthz was polled at the instance URL from GET
     expect(h.healthCalls).toEqual(["https://dsh-ws-1.run.app/healthz"]);
@@ -472,6 +477,7 @@ describe("buildInstanceEnv — agent-host env contract", () => {
         "GITHUB_APP_ID",
         "GITHUB_APP_PRIVATE_KEY_PEM",
         "INSTANCE_NAME",
+        "OPENROUTER_API_KEY",
         "REPOSITORY_NAME",
         "REPOSITORY_OWNER",
         "USER_ID",
@@ -480,6 +486,100 @@ describe("buildInstanceEnv — agent-host env contract", () => {
     );
     expect(env["DATABASE_URL"]).toBe(config.agentHostDatabaseUrl);
     expect(env["GITHUB_APP_PRIVATE_KEY_PEM"]).toBe(config.githubAppPrivateKeyPem);
+    // Issue #41: the Instance env carries the LLM key value (agent-host
+    // resolves it per request via its default LLM_API_KEY_ENV).
+    expect(env["OPENROUTER_API_KEY"]).toBe("sk-or-v1-test-sentinel-key-0001");
+    // Optional overrides are absent by default — the agent-host defaults apply.
+    expect("LLM_BASE_URL" in env).toBe(false);
+    expect("LLM_MODEL" in env).toBe(false);
+    expect("LLM_APPROVAL_POLICY" in env).toBe(false);
+  });
+
+  test("optional LLM overrides pass through to the Instance env when configured", () => {
+    const config: ControlPlaneConfig = {
+      ...testConfig(),
+      llmBaseUrl: "https://llm.example.test/v1",
+      llmModel: "example/model-x",
+      llmApprovalPolicy: "never",
+    };
+    const workspace = {
+      id: "ws-1",
+      ownerId: "alice",
+      repositoryOwner: "mpppk",
+      repositoryName: "demo",
+      baseBranch: "main",
+      instanceName: null,
+      instanceUrl: null,
+      runtimeState: "STOPPED",
+      lastActivityAt: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    } as const;
+    const env = buildInstanceEnv(config, workspace, "dsh-ws-1", "ctrl-1");
+    expect(env["OPENROUTER_API_KEY"]).toBe("sk-or-v1-test-sentinel-key-0001");
+    expect(env["LLM_BASE_URL"]).toBe("https://llm.example.test/v1");
+    expect(env["LLM_MODEL"]).toBe("example/model-x");
+    expect(env["LLM_APPROVAL_POLICY"]).toBe("never");
+  });
+
+  test("blank LLM key fails before any Instances API call, without leaking the value", () => {
+    const config = testConfig();
+    const workspace = {
+      id: "ws-1",
+      ownerId: "alice",
+      repositoryOwner: "mpppk",
+      repositoryName: "demo",
+      baseBranch: "main",
+      instanceName: null,
+      instanceUrl: null,
+      runtimeState: "STOPPED",
+      lastActivityAt: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    } as const;
+    // Unit level: buildInstanceEnv throws and names only the variable.
+    // (There is no key VALUE to leak here — the throw happens precisely
+    // because the value is blank. Value-leak coverage lives in the
+    // "open() failure surfaces" test below, which runs with the sentinel key.)
+    for (const blank of ["", "   "]) {
+      let message = "";
+      try {
+        buildInstanceEnv({ ...config, openrouterApiKey: blank }, workspace, "dsh-ws-1", "ctrl-1");
+        expect.unreachable("expected buildInstanceEnv to throw for a blank LLM key");
+      } catch (e) {
+        message = String(e);
+      }
+      expect(message).toContain("OPENROUTER_API_KEY");
+    }
+  });
+
+  test("registry get() with a blank LLM key rejects without touching the Instances API", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
+    const registry = makeRegistry(h, { openrouterApiKey: "   " });
+    // buildInstanceEnv runs inside the registry factory, so the failure lands
+    // at handle creation — before open(), before any GET/create/start.
+    await expect(registry.get(workspace)).rejects.toThrow(/OPENROUTER_API_KEY/);
+    // Fail-before-create (#22 "never fake success"): no GET/create/start was sent.
+    expect(h.transport.requests).toEqual([]);
+  });
+
+  test("open() failure surfaces never contain the LLM key value", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    // Every Instances API call fails: the rejection must still not carry the key.
+    h.transport.setHandler(async () => ({ status: 500, body: { message: "boom" } }));
+    const registry = makeRegistry(h);
+    const handle = await registry.get(workspace);
+    let message = "";
+    try {
+      await handle.open();
+    } catch (e) {
+      message = String(e);
+    }
+    expect(message).not.toBe("");
+    expect(message).not.toContain("sk-or-v1-test-sentinel-key-0001");
   });
 
   test("defaultInstanceName honors an explicit instanceName, else dsh-<id>", () => {

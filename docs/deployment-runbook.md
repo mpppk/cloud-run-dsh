@@ -289,7 +289,14 @@ export LLM_KEY_FROM_SM="$(gcloud secrets versions access latest --secret=llm-api
 (A `MissingRequiredEnvError` crash mentions only the 13 required keys; a
 missing `OPENROUTER_API_KEY` does NOT crash boot — the key is resolved per
 LLM request, so turns fail with `MISSING_CREDENTIAL` while health checks
-stay green. Check the turn logs, not the boot logs, for key problems.)
+stay green. Check the turn logs, not the boot logs, for key problems.
+Note: this paragraph describes a MANUALLY created instance. Instances
+created by the control plane (the normal path, issue #41) always carry
+`OPENROUTER_API_KEY` — the control plane refuses to boot without it and
+refuses to create a credential-less Instance — plus whichever of
+`LLM_BASE_URL` / `LLM_MODEL` / `LLM_APPROVAL_POLICY` it was configured
+with. A control-plane-created Instance can still miss the key only if its
+env was tampered with after creation.)
 
 ### 5.2 Via REST (canonical while Pre-GA)
 
@@ -421,17 +428,18 @@ export CP_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-host/control-plane
 #   cross-architecture host — type safety is enforced by CI and
 #   `bunx tsc --build` instead.)
 #  (the production entrypoint is apps/control-plane/src/main.ts; it requires
-#   the 9 env keys in the table below, respects PORT, and serves /healthz +
+#   the 10 env keys in the table below, respects PORT, and serves /healthz +
 #   /readyz — see apps/control-plane/README.md. The RuntimeRegistry is wired:
 #   POST /v1/workspaces/:id/open creates-or-starts the workspace Instance.)
 #
 # Control-plane environment — mirrors apps/control-plane/src/config.ts.
 # If you add an env key to config.ts, update this table in the same PR.
-# Secret hygiene: the DB password and the PEM never appear in argv or shell
-# history — secrets travel via Secret Manager (--set-secrets) and stdin
-# redirection (herestrings use temp files, not argv). The control-plane SA
-# already holds accessor grants for db-password / github-app-private-key
-# (iam.tf) and run.admin + act-as agent-host (Steps 5/7 need them).
+# Secret hygiene: the DB password, the PEM, AND the LLM key never appear in
+# argv or shell history — secrets travel via Secret Manager (--set-secrets)
+# and stdin redirection (herestrings use temp files, not argv). The
+# control-plane SA already holds accessor grants for db-password /
+# github-app-private-key / llm-api-key (iam.tf) and run.admin + act-as
+# agent-host (Steps 5/7 need them).
 export SA_EMAIL="$(terraform -chdir=infra/terraform output -raw agent_host_service_account_email)"
 export BUCKET="$(terraform -chdir=infra/terraform output -raw checkpoint_bucket_name)"
 export SQL_CONNECTION="$(terraform -chdir=infra/terraform output -raw sql_connection_name)"
@@ -474,15 +482,17 @@ gcloud run deploy control-plane \
   --ingress=internal-and-cloud-load-balancing \
   --no-allow-unauthenticated \
   --env-vars-file="$CP_ENV" \
-  --set-secrets="DATABASE_URL=control-plane-database-url:latest,GITHUB_APP_PRIVATE_KEY_PEM=github-app-private-key:latest"
+  --set-secrets="DATABASE_URL=control-plane-database-url:latest,GITHUB_APP_PRIVATE_KEY_PEM=github-app-private-key:latest,OPENROUTER_API_KEY=llm-api-key:latest"
 ```
 
 Created Instances receive their environment (including `DATABASE_URL` with the
-DB password) as plain `value` pairs — the same posture as the manual create in
-Step 5.2. Switching to secret references (`valueSource`) once the v2
-Instances API shape for secrets is verified is follow-up work (the typed
-client in `packages/cloud-run-instance-client` only sends plain values
-today).
+DB password AND `OPENROUTER_API_KEY` with the LLM key — issue #41, plus
+whichever of `LLM_BASE_URL` / `LLM_MODEL` / `LLM_APPROVAL_POLICY` the control
+plane was configured with) as plain `value` pairs — the same posture as the
+manual create in Step 5.2. Switching to secret references (`valueSource`)
+once the v2 Instances API shape for secrets is verified is follow-up work
+(the typed client in `packages/cloud-run-instance-client` only sends plain
+values today).
 
 IAP configuration (brand + client were already created by Terraform in Step 2; members via `var.iap_members`):
 
