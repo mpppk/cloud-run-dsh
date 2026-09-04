@@ -348,8 +348,25 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
           }
           return info.url;
         }
-      } catch {
-        // Live lookup failed — fall through to the durable row.
+        // The Instance exists but exposes no URL yet (e.g. PENDING while a
+        // recreation is in flight). A cached URL at this point would be the
+        // previous generation's dead address — report "not running" instead
+        // of forwarding to it.
+        return null;
+      } catch (e) {
+        if (e instanceof InstanceNotFoundError) {
+          // The Instance is gone: any durable URL is dead. Clear it so #22
+          // never forwards to it (callers answer 409 / open first). The
+          // clear is best-effort — the in-memory entry is nulled regardless,
+          // and the next lookup re-attempts the clear while still returning
+          // null, so a stale row is never served from here.
+          lastKnownUrl = null;
+          await repo.updateWorkspace(workspace.id, { instanceUrl: null }).catch(() => undefined);
+          return null;
+        }
+        // Transient lookup failure (network/auth) — fall through to the
+        // durable row; a possibly-stale URL beats no URL when the API
+        // itself could not be reached.
       }
       if (lastKnownUrl) return lastKnownUrl;
       const current = await repo.getWorkspace(workspace.id).catch(() => null);

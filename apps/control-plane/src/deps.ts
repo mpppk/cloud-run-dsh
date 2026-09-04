@@ -14,8 +14,10 @@ import type { SessionPersistenceRepository } from "@cloud-run-dsh/session-persis
 import type { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
 import type { WorkspaceRuntime } from "@cloud-run-dsh/workspace-runtime";
 import type { ActivityKind } from "@cloud-run-dsh/workspace-runtime";
+import type { Logger } from "@cloud-run-dsh/observability";
 import type { AuthDeps } from "./auth.js";
 import type { MembershipStore } from "./membership.js";
+import type { MessageForwarder } from "./forwarding.js";
 
 /**
  * The control-plane clock.
@@ -193,4 +195,14 @@ export interface ControlPlaneDeps extends AuthDeps {
    * runtime registry is a placeholder reports NOT ready with the reason.
    */
   readonly readiness?: () => ControlPlaneReadiness;
+  /**
+   * Forwards appended `user_message` events to the workspace Instance
+   * (issue #22). Optional so unit tests and the local dev server (which
+   * have no Instance) keep the append-only 201 behavior; production always
+   * supplies it. When present and the Instance has no URL, postMessage
+   * answers 409 (open first); when the forward itself fails it answers 502.
+   */
+  readonly messageForwarder?: MessageForwarder;
+  /** Structured logger for forward-failure traceability (never carries tokens). */
+  readonly logger?: Logger;
 }

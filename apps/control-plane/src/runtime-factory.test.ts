@@ -338,6 +338,54 @@ describe("getInstanceUrl — the #22 forwarding seam", () => {
     await handle.open();
     expect(await handle.getInstanceUrl()).toBe("https://dsh-ws-1.run.app");
   });
+
+  test("deleted instance (GET 404): null + durable URL cleared, never the stale URL", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
+    const registry = makeRegistry(h);
+    const handle = await registry.get(workspace);
+    await handle.open();
+    expect(await h.repo.getWorkspace("ws-1")).toMatchObject({
+      instanceUrl: "https://dsh-ws-1.run.app",
+    });
+
+    // The Instance is deleted out-of-band: the API 404s from now on.
+    h.transport.setHandler(async () => ({ status: 404, body: { message: "not found" } }));
+    expect(await handle.getInstanceUrl()).toBeNull();
+    // The dead URL is cleared from the durable row too, so no other
+    // reader can pick it up and forward to it.
+    expect((await h.repo.getWorkspace("ws-1"))!.instanceUrl).toBeNull();
+  });
+
+  test("recreation in flight (READY-less GET without URL): null, not the old URL", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
+    const registry = makeRegistry(h);
+    const handle = await registry.get(workspace);
+    await handle.open();
+
+    // New generation exists but exposes no URL yet (PENDING): serving the
+    // previous generation's address would forward to a dead Instance.
+    h.transport.setHandler(async () => ({
+      status: 200,
+      body: { name: "dsh-ws-1", terminalCondition: { state: "CONDITION_PENDING" } },
+    }));
+    expect(await handle.getInstanceUrl()).toBeNull();
+
+    // Once the new generation is READY with its (changed) URL, the live
+    // lookup wins and the durable row follows it — no stale URL survives
+    // the recreation.
+    h.transport.setHandler(async () => ({
+      status: 200,
+      body: instanceBody("dsh-ws-1", "https://dsh-ws-1-new.run.app"),
+    }));
+    expect(await handle.getInstanceUrl()).toBe("https://dsh-ws-1-new.run.app");
+    expect((await h.repo.getWorkspace("ws-1"))!.instanceUrl).toBe(
+      "https://dsh-ws-1-new.run.app",
+    );
+  });
 });
 
 describe("runManualCheckpoint — GCS marker", () => {

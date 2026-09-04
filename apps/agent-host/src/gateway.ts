@@ -23,6 +23,42 @@ export interface AgentGatewayDeps {
   readonly runtime: WorkspaceRuntime;
   readonly lease: ControllerLeaseService;
   readonly logger: Logger;
+  /**
+   * Starts the agent turn for a forwarded user message (issue #22 seam for
+   * issue #21: the LLM turn plugs in here).
+   *
+   * The input is deliberately narrow — workspace/session identity plus the
+   * ALREADY-persisted event reference (seq) and its content. Harness and LLM
+   * types must NOT leak into this signature (#21 owns them).
+   *
+   * The implementation MUST return quickly (enqueue the turn, not run it to
+   * completion): the control plane awaits this call inside its own request.
+   *
+   * When absent the gateway answers 503 (turn_not_implemented) so a missing
+   * turn never looks delivered. The control plane maps that to its 502.
+   */
+  readonly turnStarter?: TurnStarter;
+}
+
+/**
+ * Narrow turn-start seam (issue #22 -> #21 handoff).
+ *
+ * `seq` references the `user_message` event the control plane already
+ * appended to the shared DB — the host MUST NOT append it again
+ * (single-writer invariant: the control plane is the sole writer).
+ * `seq` is -1 and `content` is "" only for direct calls that carry no
+ * forwarded body (backward compatibility); control-plane forwards always
+ * send both.
+ */
+export interface AgentTurnInput {
+  readonly workspaceId: string;
+  readonly sessionId: string;
+  readonly seq: number;
+  readonly content: string;
+}
+
+export interface TurnStarter {
+  startTurn(input: AgentTurnInput): Promise<void>;
 }
 
 export class AgentGateway {
@@ -38,15 +74,27 @@ export class AgentGateway {
       return healthzResponse(this.deps.health.snapshot());
     }
 
-    // TRUST ASSUMPTION (仕様書 section 21 / 実装手順書 section 25): identity is
-    // accepted from the IAP-set header on presence alone. This host is only
-    // reachable behind IAP, which strips/overwrites this header before the
-    // request reaches us — a directly-set header from an outside caller is
-    // not reachable. Resolving the authenticated identity to an internal user
-    // and authorizing it (user → workspace membership → authorization) is the
-    // CONTROL PLANE's responsibility (T9); this host deliberately does not
-    // duplicate membership resolution, and the workspace-id match below is
-    // the only host-side authorization.
+    // TRUST ASSUMPTION (仕様書 section 21 / 実装手順書 section 25, updated
+    // for issue #22): identity is accepted from the IAP-set headers on
+    // presence alone. The host is NO LONGER only reachable behind IAP: the
+    // control plane calls this gateway directly (service-to-service) and
+    // sets these headers itself when forwarding.
+    //
+    // The trust root for forwarded identity is therefore NOT "IAP
+    // strips/overwrites this header" — it is the Instance's INVOKER IAM,
+    // which admits only the control-plane service account. A forged header
+    // from any other caller cannot reach this container because the
+    // platform edge rejects it first. Consequently the invoker IAM binding
+    // is the SOLE foundation of this trust: loosening it to any other
+    // caller immediately enables identity spoofing.
+    //
+    // (No IAP brand / load balancer exists in this milestone — see issue
+    // #31 user tasks. The only thing guarding this host today is invoker
+    // IAM. Resolving the authenticated identity to an internal user and
+    // authorizing it (user → workspace membership → authorization) remains
+    // the CONTROL PLANE's responsibility (T9); this host deliberately does
+    // not duplicate membership resolution, and the workspace-id match below
+    // is the only host-side authorization.)
     const identity = request.headers.get(IAP_IDENTITY_HEADER);
     if (!identity) {
       return this.json(401, { error: "unauthenticated: missing IAP identity" });
@@ -76,11 +124,11 @@ export class AgentGateway {
 
     switch (action) {
       case "messages":
-        return this.agentInput(sessionId, identity, "user_message");
+        return this.agentInput(request, workspaceId, sessionId, identity, "user_message");
       case "approvals":
-        return this.agentInput(sessionId, identity, "approval");
+        return this.agentInput(request, workspaceId, sessionId, identity, "approval");
       case "cancel":
-        return this.agentInput(sessionId, identity, "workspace_operation");
+        return this.agentInput(request, workspaceId, sessionId, identity, "workspace_operation");
       default:
         return this.json(404, { error: "not found" });
     }
@@ -95,6 +143,8 @@ export class AgentGateway {
   }
 
   private async agentInput(
+    request: Request,
+    workspaceId: string,
     sessionId: string | undefined,
     identity: string,
     activity: "user_message" | "approval" | "workspace_operation",
@@ -110,6 +160,9 @@ export class AgentGateway {
       }
       throw e;
     }
+    if (activity === "user_message") {
+      return this.startTurn(request, workspaceId, sessionId!, identity);
+    }
     // Meaningful activity (仕様書 section 11).
     this.deps.runtime.recordActivity(activity);
     this.deps.logger.info("gateway.request.accepted", {
@@ -118,6 +171,81 @@ export class AgentGateway {
       event_detail: activity,
     });
     return this.json(202, { accepted: true, sessionId, activity });
+  }
+
+  /**
+   * Starts the agent turn for a forwarded user message via the TurnStarter
+   * seam (issue #22 -> #21). The `user_message` event itself is NEVER
+   * appended here — the control plane already wrote it (single writer).
+   */
+  private async startTurn(
+    request: Request,
+    workspaceId: string,
+    sessionId: string,
+    identity: string,
+  ): Promise<Response> {
+    const starter = this.deps.turnStarter;
+    let seq = -1;
+    let content = "";
+    try {
+      const parsed = await readForwardedBody(request);
+      if (parsed) {
+        if (parsed.sessionId !== undefined && parsed.sessionId !== sessionId) {
+          return this.json(400, { error: "sessionId mismatch between path and body" });
+        }
+        seq = parsed.seq;
+        content = parsed.content;
+      }
+    } catch (e) {
+      return this.json(400, {
+        error: e instanceof Error ? e.message : "invalid request body",
+      });
+    }
+    if (!starter) {
+      // No turn implementation is wired (issue #21 has not landed): say so
+      // OUT LOUD (503 + explicit code + structured log) instead of 202.
+      // A 202 here would re-create the exact "looks delivered but nothing
+      // runs" failure the control-plane forwarding exists to remove.
+      this.deps.logger.error("gateway.turn.not_implemented", {
+        userId: identity,
+        workspaceId,
+        sessionId,
+        seq,
+      });
+      return this.json(503, {
+        error: "turn not implemented: no TurnStarter is wired (issue #21)",
+        code: "turn_not_implemented",
+        sessionId,
+      });
+    }
+    try {
+      await starter.startTurn({ workspaceId, sessionId, seq, content });
+    } catch (e) {
+      this.deps.logger.error("gateway.turn.failed", {
+        userId: identity,
+        workspaceId,
+        sessionId,
+        seq,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return this.json(500, { error: "turn failed to start" });
+    }
+    // Meaningful activity (仕様書 section 11).
+    this.deps.runtime.recordActivity("user_message");
+    this.deps.logger.info("gateway.request.accepted", {
+      userId: identity,
+      sessionId,
+      event_detail: "user_message",
+      turn_started: true,
+      seq,
+    });
+    return this.json(202, {
+      accepted: true,
+      sessionId,
+      activity: "user_message",
+      turnStarted: true,
+      seq,
+    });
   }
 
   private sseStream(sessionId: string, identity: string): Response {
@@ -160,6 +288,52 @@ export class AgentGateway {
       headers: { "Content-Type": "application/json" },
     });
   }
+}
+
+/**
+ * Reads the control-plane forward payload. Empty bodies (direct callers,
+ * older tests) yield null and the turn starts with unknown seq/content.
+ * A present-but-malformed body is a 400 — silently ignoring it would
+ * start a turn for the wrong event.
+ */
+async function readForwardedBody(
+  request: Request,
+): Promise<{ sessionId?: string; seq: number; content: string } | null> {
+  let text: string;
+  try {
+    text = await request.text();
+  } catch {
+    throw new Error("unreadable request body");
+  }
+  if (!text.trim()) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    throw new Error("request body must be JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error("request body must be a JSON object");
+  }
+  const record = parsed as Record<string, unknown>;
+  if (record["seq"] === undefined || record["content"] === undefined) {
+    throw new Error("request body must carry the forwarded event ('seq' and 'content')");
+  }
+  if (typeof record["seq"] !== "number" || !Number.isInteger(record["seq"])) {
+    throw new Error("field 'seq' must be an integer");
+  }
+  if (typeof record["content"] !== "string") {
+    throw new Error("field 'content' must be a string");
+  }
+  const sessionId = record["sessionId"];
+  if (sessionId !== undefined && typeof sessionId !== "string") {
+    throw new Error("field 'sessionId' must be a string");
+  }
+  return {
+    sessionId,
+    seq: record["seq"] as number,
+    content: record["content"] as string,
+  };
 }
 
 export type { InvalidOperationError };

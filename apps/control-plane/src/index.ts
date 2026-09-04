@@ -24,7 +24,29 @@ export {
   assertMember,
   type MembershipStore,
 } from "./membership.js";
-export { ApiError, badRequest, unauthorized, forbidden, notFound, conflict, unavailable } from "./errors.js";
+export { ApiError, badRequest, unauthorized, forbidden, notFound, conflict, badGateway, unavailable } from "./errors.js";
+export {
+  AgentHostConflictError,
+  AgentHostForwardError,
+  HttpAgentHostForwarder,
+  RefreshingIdTokenProvider,
+  buildIdTokenUrl,
+  createIdTokenProvider,
+  parseJwtExpSeconds,
+  ID_TOKEN_DEFAULT_EXPIRES_IN_S,
+  ID_TOKEN_ENV_LIFETIME_S,
+  ID_TOKEN_ENV_VAR,
+  ID_TOKEN_METADATA_BASE,
+  ID_TOKEN_REFRESH_MARGIN_MS,
+  type AgentHostForwardResult,
+  type AgentHostFetchFn,
+  type ForwardIdentity,
+  type ForwardMessageArgs,
+  type HttpAgentHostForwarderOptions,
+  type IdTokenProvider,
+  type MessageForwarder,
+  type RefreshingIdTokenProviderDeps,
+} from "./forwarding.js";
 export {
   createWorkspace,
   getWorkspace,
