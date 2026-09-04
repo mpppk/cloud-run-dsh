@@ -48,10 +48,12 @@ jobs:
           terraform -chdir=infra/terraform validate
 
   image:
-    name: agent-host image builds for linux/amd64
+    name: agent-host + control-plane image builds for linux/amd64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       # Native amd64 runner: this is the build that the arm64 dev host cannot do.
       - name: Build agent-host
         run: docker build --platform linux/amd64 -f apps/agent-host/Dockerfile -t agent-host:ci .
+      - name: Build control-plane
+        run: docker build --platform linux/amd64 -f apps/control-plane/Dockerfile -t control-plane:ci .

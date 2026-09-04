@@ -24,7 +24,7 @@ export {
   assertMember,
   type MembershipStore,
 } from "./membership.js";
-export { ApiError, badRequest, unauthorized, forbidden, notFound, conflict } from "./errors.js";
+export { ApiError, badRequest, unauthorized, forbidden, notFound, conflict, unavailable } from "./errors.js";
 export {
   createWorkspace,
   getWorkspace,

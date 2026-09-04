@@ -8,6 +8,7 @@
   "dependencies": {
     "@cloud-run-dsh/cloud-run-instance-client": "workspace:*",
     "@cloud-run-dsh/controller-lease": "workspace:*",
+    "@cloud-run-dsh/observability": "workspace:*",
     "@cloud-run-dsh/session-persistence-postgres": "workspace:*",
     "@cloud-run-dsh/workspace-checkpoint": "workspace:*",
     "@cloud-run-dsh/workspace-runtime": "workspace:*"
@@ -15,6 +16,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test src",
-    "build": "tsc --build"
+    "build": "tsc --build",
+    "start": "bun run src/main.ts"
   }
 }

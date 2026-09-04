@@ -135,6 +135,17 @@ export class RuntimeRegistry {
   }
 }
 
+/**
+ * Readiness report served by GET /readyz. Unlike /healthz (liveness: the
+ * process is up), readiness must honestly reflect degraded capability —
+ * e.g. the production runtime registry being a placeholder.
+ */
+export interface ControlPlaneReadiness {
+  readonly ready: boolean;
+  /** Human-readable reason when not ready. Never contains secrets. */
+  readonly reason?: string;
+}
+
 export interface ControlPlaneDeps extends AuthDeps {
   /** T4 repository (workspace/session/event persistence). */
   readonly repo: SessionPersistenceRepository;
@@ -154,4 +165,10 @@ export interface ControlPlaneDeps extends AuthDeps {
   readonly ssePollIntervalMs?: number;
   /** SSE idle heartbeat interval in ms (default 15000). Heartbeats are NOT activity. */
   readonly sseHeartbeatMs?: number;
+  /**
+   * Optional readiness probe (GET /readyz). When absent, /readyz reports
+   * ready. When present it must report honestly — a control plane whose
+   * runtime registry is a placeholder reports NOT ready with the reason.
+   */
+  readonly readiness?: () => ControlPlaneReadiness;
 }
