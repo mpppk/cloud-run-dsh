@@ -14,7 +14,8 @@
     "test": "bun test --path-ignore-patterns='**/dist/**'",
     "build": "tsc --build",
     "lint": "tsc --noEmit",
-    "preflight:gcp": "bun run scripts/preflight-gcp.ts"
+    "preflight:gcp": "bun run scripts/preflight-gcp.ts",
+    "teardown:empty-bucket": "bun run scripts/empty-checkpoint-bucket.ts"
   },
   "devDependencies": {
     "typescript": "5.9.3",
