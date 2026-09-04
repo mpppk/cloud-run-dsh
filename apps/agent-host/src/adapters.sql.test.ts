@@ -9,7 +9,8 @@
 //   gcs_object) — there is no `data` column in the T4 schema.
 
 import { describe, expect, test } from "bun:test";
-import { BunSqlLeaseStore, SqlTransactionalStateStore } from "./adapters.js";
+import { BunSqlLeaseStore, BunSqlQueryExecutor, SqlTransactionalStateStore } from "./adapters.js";
+import type { BunSqlConnectionTarget } from "@cloud-run-dsh/session-persistence-postgres";
 import { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
 import type { LeaseTransaction } from "@cloud-run-dsh/controller-lease";
 import type { QueryExecutor } from "@cloud-run-dsh/session-persistence-postgres";
@@ -241,6 +242,77 @@ class LockingFakeExecutor implements QueryExecutor {
     throw new Error(`LockingFakeExecutor: unhandled statement: ${n}`);
   }
 }
+
+// ---------------------------------------------------------------------------
+// BunSqlQueryExecutor.connect — Cloud SQL socket form + password hygiene
+// (issue #42; mirrors apps/control-plane/src/prod.test.ts; resolution
+// logic itself is covered in the shared package)
+// ---------------------------------------------------------------------------
+
+const CONNECT_SECRET = "ah-s3cr3t-Pw/xX9qZ";
+
+describe("BunSqlQueryExecutor.connect", () => {
+  const seen: BunSqlConnectionTarget[] = [];
+
+  class StubSql {
+    constructor(target: BunSqlConnectionTarget) {
+      seen.push(target);
+    }
+    async unsafe(): Promise<unknown[]> {
+      return [];
+    }
+    async begin<T>(fn: (tx: StubSql) => Promise<T>): Promise<T> {
+      return fn(this);
+    }
+    async close(): Promise<void> {}
+  }
+
+  test("socket DSN resolves to the options object, not the URL string", async () => {
+    seen.length = 0;
+    await BunSqlQueryExecutor.connect(
+      `postgresql://dsh_app:${CONNECT_SECRET}@/dsh?host=/cloudsql/p:r:i`,
+      StubSql,
+    );
+    expect(seen.length).toBe(1);
+    expect(seen[0]).toEqual({
+      path: "/cloudsql/p:r:i",
+      username: "dsh_app",
+      password: CONNECT_SECRET,
+      database: "dsh",
+    });
+  });
+
+  test("TCP DSN passes through byte-identical", async () => {
+    seen.length = 0;
+    const url = `postgres://dsh:${CONNECT_SECRET}@localhost:5432/dsh`;
+    await BunSqlQueryExecutor.connect(url, StubSql);
+    expect(seen).toEqual([url]);
+  });
+
+  test("constructor failure never carries the password", async () => {
+    const dsn = `postgresql://dsh_app:${CONNECT_SECRET}@/dsh?host=/cloudsql/p:r:i`;
+    class ThrowingSql extends StubSql {
+      constructor(target: BunSqlConnectionTarget) {
+        super(target);
+        // Faithful to Bun: message clean, password in `input`.
+        throw Object.assign(new TypeError("Invalid URL"), {
+          code: "ERR_INVALID_URL",
+          input: dsn,
+        });
+      }
+    }
+    const err = await BunSqlQueryExecutor.connect(dsn, ThrowingSql).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+    expect(err).not.toBeNull();
+    expect(err!.name).toBe("BunSqlConnectionError");
+    expect(err!.message.includes(CONNECT_SECRET)).toBe(false);
+    expect(JSON.stringify(err).includes(CONNECT_SECRET)).toBe(false);
+    expect("input" in err!).toBe(false);
+    expect("cause" in err!).toBe(false);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // MAJOR-1: transactional lease read takes SELECT ... FOR UPDATE

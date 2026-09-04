@@ -48,9 +48,16 @@ export interface ControlPlaneConfig {
   readonly checkpointBucket: string;
   /**
    * DATABASE_URL injected into created Instances. It MUST use the Cloud SQL
-   * socket path (`postgresql://user:pass@/dsh?host=/cloudsql/<conn>`) — the
+   * socket form (`postgresql://user:pass@/dsh?host=/cloudsql/<conn>`) — the
    * Instance reaches Cloud SQL through its `cloudSqlInstance` volume, never
    * over the control plane's TCP address (see docs/deployment-runbook.md).
+   *
+   * Mechanism note (issue #42): Bun.SQL rejects Unix-socket DSNs passed as
+   * URL strings, so `BunSqlQueryExecutor.connect()` detects the absolute-path
+   * `host` (or `socket`) query parameter and connects via the options object
+   * `{ path, username, password, database }` instead. TCP URLs pass through
+   * unchanged. Characters outside `[A-Za-z0-9-_.~]` in the userinfo
+   * (notably in the password) MUST be percent-encoded.
    */
   readonly agentHostDatabaseUrl: string;
   /** GitHub App ID injected into created Instances (host-only, never logged). */
