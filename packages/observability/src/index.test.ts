@@ -202,24 +202,94 @@ describe("observability", () => {
     expect(redactValue("API_KEY=short") as string).not.toContain("short");
     expect(redactValue("password: hunter2") as string).not.toContain("hunter2");
   });
-  test("bare high-entropy tokens without secret context are NOT redacted (i29)", () => {
-    // #29: value-shape redaction could not tell random tokens apart from commit
-    // SHAs / PascalCase identifiers, so generic entropy redaction was removed.
-    // Secrets are redacted by marker-prefixed shape (PEM/Bearer/sk-/ghp_/DB URLs)
-    // or by position (secret-like keys, KEY=VALUE assignments) instead.
-    const bare = "xK9mPq3vT8rY2nZ5bJ7hL0cF4dW6aG1sE2qXyZ";
-    expect(redactValue(`token is ${bare} here`) as string).toContain(bare);
+  test("r36/BLOCKER-1: marker-less high-entropy secrets ARE redacted (exclusion-listed net)", () => {
+    // Old impl caught these via entropy; the #29 rewrite dropped them.
+    // The net is back with exclusions: only strict PascalCase / hex-only
+    // 40-or-64 / lowercase snake_case survive (see next test).
+    const bare = "xK9mPq3vT8rY2nZ5bJ7hL0cF4dW6aG1sE2qX9z";
+    const out = redactValue(`token is ${bare} here`) as string;
+    expect(out).not.toContain(bare);
+    expect(out).toContain("[REDACTED]");
 
-    // ...but the same value under a secret-like key is still redacted
-    const out = redactValue({ apiKey: bare }) as Record<string, unknown>;
-    expect(out["apiKey"]).toBe("[REDACTED]");
+    // Bearer-less Google token in an error message
+    const google = "Error: request failed with token ya29.a0AfH6SMBx9mPq3vT8rY2nZ5bJ7hL0cF4dW6aG1sE2qX9zAbCdEfGh";
+    const outGoogle = redactValue(google) as string;
+    expect(outGoogle).not.toContain("a0AfH6SMB");
+    expect(outGoogle).toContain("[REDACTED]");
 
-    // Bounding: low-entropy 20-char repeated string must NOT be redacted (false positive check)
+    // Secrets under unknown keys are still caught by shape, not by key name
+    const outDbPw = redactValue({ db_pw: bare }) as Record<string, unknown>;
+    expect(outDbPw["db_pw"]).toBe("[REDACTED]");
+    const outPwd = redactValue({ pwd: bare }) as Record<string, unknown>;
+    expect(outPwd["pwd"]).toBe("[REDACTED]");
+
+    // JWT in free text (no Bearer marker)
+    const jwt =
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+    const outJwt = redactValue(`auth failed: ${jwt} rejected`) as string;
+    expect(outJwt).not.toContain("eyJhbGciOi");
+    expect(outJwt).not.toContain("SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c");
+    expect(outJwt).toContain("[REDACTED]");
+
+    // AWS access key ID in free text
+    const outAkia = redactValue("saw key AKIAIOSFODNN7EXAMPLE in log") as string;
+    expect(outAkia).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    expect(outAkia).toContain("[REDACTED]");
+
+    // Bounding: low-entropy 20-char repeated string must NOT be redacted
     const lowEntropy = "aaaaaaaaaaaaaaaaaaaa";
     expect(redactValue(lowEntropy) as string).toBe(lowEntropy);
     expect(redactValue("hello world") as string).toBe("hello world");
-    // Workspace-like ID short mixed but low entropy / short should not be redacted separately
     expect(redactValue("ws-123") as string).toBe("ws-123");
+  });
+
+  test("r36/BLOCKER-1: identifier shapes survive the entropy net", () => {
+    // Strict PascalCase identifiers
+    expect(redactValue("RuntimeNotWiredError")).toBe("RuntimeNotWiredError");
+    expect(redactValue("PascalCaseIdentifierExample")).toBe("PascalCaseIdentifierExample");
+    // Commit SHAs: hex-only 40 / 64 chars
+    const sha40 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b";
+    expect(redactValue(`commit ${sha40} deployed`) as string).toContain(sha40);
+    const sha64 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    expect(redactValue(`commit ${sha64} done`) as string).toContain(sha64);
+    // Lowercase snake_case event names
+    expect(redactValue("my_event_name_with_long_description")).toBe(
+      "my_event_name_with_long_description",
+    );
+  });
+
+  test("r36/BLOCKER-2: OpenRouter sk-or-v1 keys are redacted", () => {
+    const orKey = "sk-or-v1-0123456789abcdef0123456789abcdef0123456789abcdef";
+    const out = redactValue(`key ${orKey} leaked`) as string;
+    expect(out).not.toContain("sk-or-v1");
+    expect(out).not.toContain("0123456789abcdef");
+    expect(out).toContain("[REDACTED]");
+    // Marker-prefixed shapes are redacted regardless of entropy: a low-entropy
+    // tail isolates the sk- pattern from the entropy net (which would miss it).
+    // This case fails if the pattern regresses to /sk-[A-Za-z0-9]{20,}/.
+    const lowEntropyOrKey = `sk-or-v1-${"a".repeat(48)}`;
+    const outLow = redactValue(`key ${lowEntropyOrKey} leaked`) as string;
+    expect(outLow).not.toContain("sk-or-v1");
+    expect(outLow).toContain("[REDACTED]");
+    // DeepSeek-style sk- keys keep working
+    expect(redactValue("key is sk-1234567890abcdefghij1234 ok") as string).toContain("[REDACTED]");
+  });
+
+  test("r36/MINOR-1: compact JSON stays parseable after assignment redaction", () => {
+    const out = redactValue('{"password":"hunter2","x":1}') as string;
+    const parsed = JSON.parse(out) as Record<string, unknown>;
+    expect(parsed["password"]).toBe("[REDACTED]");
+    expect(parsed["x"]).toBe(1);
+  });
+
+  test("r36/MINOR-2: pwd / pw count as secret-like keys", () => {
+    const out = redactValue({ pwd: "hunter2", pw: "hunter2", db_pw: "x" }) as Record<
+      string,
+      unknown
+    >;
+    expect(out["pwd"]).toBe("[REDACTED]");
+    expect(out["pw"]).toBe("[REDACTED]");
+    expect(out["db_pw"]).toBe("[REDACTED]");
   });
 
   // -----------------------------------------------------------------------
