@@ -23,7 +23,7 @@
 
 import { Context } from "@deepseek-ai/cordis";
 import { AgentRegistry } from "@deepseek-ai/dsh-agent";
-import type { Agent } from "@deepseek-ai/dsh-agent";
+import type { Agent, AgentSetup } from "@deepseek-ai/dsh-agent";
 import { AgentLoop } from "@deepseek-ai/dsh-agent-loop";
 import { LlmRuntime, createUserMessage } from "@deepseek-ai/dsh-llm";
 import type { LlmAdapter } from "@deepseek-ai/dsh-llm";
@@ -45,6 +45,7 @@ import type {
 import type { AgentHostConfig } from "./config.js";
 import type { AgentTurnInput, ApprovalDecision, TurnStarter } from "./gateway.js";
 import { mountHarnessBasePlugins } from "./harness-real.js";
+import { PostgresSessionPersistence } from "./session-persistence.js";
 
 /**
  * Provider route the turn's agents request. This is the route the
@@ -106,6 +107,15 @@ export class HarnessTurnStarter implements TurnStarter {
     await mountHarnessBasePlugins(ctx, deps.config.workspaceRoot);
     await ctx.plugin(AgentRegistry);
     await ctx.plugin(SessionStore);
+    // Postgres-backed session persistence (issue #39): the resume source.
+    // Inert until resume() is called — the live write path stays in the
+    // session/event subscription below (see session-persistence.ts).
+    await ctx.plugin(PostgresSessionPersistence, {
+      repository: deps.repository,
+      workspaceId: deps.config.workspaceId,
+      workspaceRoot: deps.config.workspaceRoot,
+      logger: deps.logger,
+    });
     await ctx.plugin(LlmRuntime);
     if (deps.llmTestAdapter) {
       ctx.llm.registerAdapter([LLM_PROVIDER_ROUTE], deps.llmTestAdapter);
@@ -238,46 +248,7 @@ export class HarnessTurnStarter implements TurnStarter {
       sessionId,
       meta: { cwd: this.config.workspaceRoot },
       agentOptions: { provider: LLM_PROVIDER_ROUTE, model: this.config.llmModel },
-      setup: (agentCtx) => {
-        // Agent-scoped answerer: scope-filtered dispatch delivers only this
-        // agent's asks here. It pends until the HTTP decision arrives
-        // (resolveApproval), the request signal aborts (turn cancel), or a
-        // pre-arrived decision is found.
-        agentCtx.on("approval/request", (req, next) =>
-          this.onApprovalRequest(sessionId as string, req, next),
-        );
-        // Agent-scoped persistence feed: `session/event` is scope-filtered
-        // dispatch, so a root listener never sees these — each agent's setup
-        // subscribes its own session feed (and flush drain) here.
-        // The asked-id → call-id link is updated SYNCHRONOUSLY (before the
-        // async persist below): ApprovalService appends `approval/asked`
-        // strictly before dispatching the `approval/request` waterfall, so by
-        // the time the answerer pends, this link already exists.
-        agentCtx.on("session/event", (session: Session, event: SessionEvent) => {
-          if (event.type === "approval/asked") {
-            const data = event.data as { id?: unknown; callId?: unknown };
-            if (typeof data.id === "string") {
-              this.askedLinks.set(data.id, {
-                sessionId: session.id as string,
-                callId: typeof data.callId === "string" ? data.callId : undefined,
-              });
-            }
-          }
-          void this.enqueueAppend(session, event).catch((error) => {
-            // Persistence must never break the loop (session/event failures
-            // are contained by the session boundary anyway).
-            this.logger.error("turn.persist_failed", {
-              sessionId: session.id as string,
-              eventType: event.type,
-              error: error instanceof Error ? error.message : String(error),
-            });
-          });
-        });
-        // Durability checkpoint: drain this session's ordered append chain.
-        agentCtx.on("session/flush", (session: Session) =>
-          this.drainAppends(session.id as string),
-        );
-      },
+      setup: this.agentSetup(sessionId),
     });
     // Owned by the root fiber for the host lifetime: per-turn disposal would
     // drop the session log the next turn resumes from.
@@ -287,6 +258,92 @@ export class HarnessTurnStarter implements TurnStarter {
       throw new Error(`agent for session ${sessionId as string} was not published`);
     }
     return agent;
+  }
+
+  /**
+   * Resumes one agent per persisted session (issue #39 restart recovery).
+   * Called once during recovery with the session ids read from Postgres —
+   * sessions with no live agent are rehydrated via AgentLoop.resume() (the
+   * create/createAgent counterpart for persisted history), NOT recreated
+   * empty: recreating would silently drop the conversation history.
+   *
+   * A resume failure REJECTS (never falls back to create): history that
+   * cannot be restored must surface as a recovery failure, not as a fresh
+   * session that looks like deleted history. Sessions that are already live
+   * are skipped (recovery runs once per boot; the skip is defensive).
+   */
+  async resumeSessions(sessionIds: readonly string[]): Promise<{ resumed: string[] }> {
+    const resumed: string[] = [];
+    for (const rawId of sessionIds) {
+      const sessionId = SessionId(rawId);
+      if (this.ctx.agents.get(sessionId)) {
+        this.logger.info("turn.resume.skipped_live", { sessionId: rawId });
+        continue;
+      }
+      const handle = await this.ctx.agentLoop.resume(this.ctx, {
+        resumeSessionId: sessionId,
+        agentOptions: { provider: LLM_PROVIDER_ROUTE, model: this.config.llmModel },
+        setup: this.agentSetup(sessionId),
+      });
+      // Same ownership as created agents: the root fiber holds the handle
+      // for the host lifetime.
+      void handle;
+      resumed.push(rawId);
+      this.logger.info("turn.resumed", {
+        workspaceId: this.config.workspaceId,
+        sessionId: rawId,
+      });
+    }
+    return { resumed };
+  }
+
+  /**
+   * The agent-scoped world every agent gets — shared by create AND resume so
+   * a resumed agent answers approvals and persists events exactly like a
+   * fresh one. (A divergence here would mean resumed turns silently lose
+   * approval handling or durability.)
+   */
+  private agentSetup(sessionId: SessionId): AgentSetup {
+    return (agentCtx) => {
+      // Agent-scoped answerer: scope-filtered dispatch delivers only this
+      // agent's asks here. It pends until the HTTP decision arrives
+      // (resolveApproval), the request signal aborts (turn cancel), or a
+      // pre-arrived decision is found.
+      agentCtx.on("approval/request", (req, next) =>
+        this.onApprovalRequest(sessionId as string, req, next),
+      );
+      // Agent-scoped persistence feed: `session/event` is scope-filtered
+      // dispatch, so a root listener never sees these — each agent's setup
+      // subscribes its own session feed (and flush drain) here.
+      // The asked-id → call-id link is updated SYNCHRONOUSLY (before the
+      // async persist below): ApprovalService appends `approval/asked`
+      // strictly before dispatching the `approval/request` waterfall, so by
+      // the time the answerer pends, this link already exists.
+      agentCtx.on("session/event", (session: Session, event: SessionEvent) => {
+        if (event.type === "approval/asked") {
+          const data = event.data as { id?: unknown; callId?: unknown };
+          if (typeof data.id === "string") {
+            this.askedLinks.set(data.id, {
+              sessionId: session.id as string,
+              callId: typeof data.callId === "string" ? data.callId : undefined,
+            });
+          }
+        }
+        void this.enqueueAppend(session, event).catch((error) => {
+          // Persistence must never break the loop (session/event failures
+          // are contained by the session boundary anyway).
+          this.logger.error("turn.persist_failed", {
+            sessionId: session.id as string,
+            eventType: event.type,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      });
+      // Durability checkpoint: drain this session's ordered append chain.
+      agentCtx.on("session/flush", (session: Session) =>
+        this.drainAppends(session.id as string),
+      );
+    };
   }
 
   // -------------------------------------------------------------------------

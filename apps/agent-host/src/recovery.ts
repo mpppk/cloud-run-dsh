@@ -26,6 +26,7 @@ import type {
 } from "@cloud-run-dsh/workspace-runtime";
 import type { AgentHostConfig } from "./config.js";
 import { WorkspaceNotFoundError, InstanceNotHealthyError } from "./errors.js";
+import type { TurnStarter } from "./gateway.js";
 import type { HarnessComposition } from "./harness.js";
 import type { WorkspaceBootstrapper } from "./bootstrap.js";
 import type { HealthService } from "./health.js";
@@ -38,6 +39,13 @@ export interface LifecycleStepDeps {
   readonly sandboxManager: SandboxManager;
   readonly harness: HarnessComposition;
   readonly repository: SessionPersistenceRepository;
+  /**
+   * Turn starter for agent resume (issue #39). Optional so message-only
+   * starters and unit tests without one keep working: without a capable
+   * starter the recovery restores harness metadata only and logs the skip.
+   */
+  readonly turnStarter?: TurnStarter;
+  readonly logger: Logger;
 }
 
 /**
@@ -65,6 +73,30 @@ export function buildLifecycleSteps(deps: LifecycleStepDeps): WorkspaceLifecycle
         eventsBySession[session.id] = await deps.repository.readEvents(session.id);
       }
       await deps.harness.restoreSessions({ sessions, eventsBySession });
+      // Agent resume (issue #39 — the "AH->>DB: セッションとイベントを復元"
+      // sequence): one live agent per persisted session, rehydrated from the
+      // rows read above via AgentLoop.resume(). A resume failure REJECTS this
+      // step (recovery fails, input is refused): falling back to create would
+      // silently present deleted history as a fresh session.
+      const starter = deps.turnStarter;
+      if (sessions.length === 0) {
+        deps.logger.info("turn.resume.empty", {
+          workspaceId: deps.config.workspaceId,
+        });
+        return;
+      }
+      if (!starter?.resumeSessions) {
+        deps.logger.info("turn.resume.skipped_no_starter", {
+          workspaceId: deps.config.workspaceId,
+          sessionCount: sessions.length,
+        });
+        return;
+      }
+      const { resumed } = await starter.resumeSessions(sessions.map((s) => s.id));
+      deps.logger.info("turn.resume.completed", {
+        workspaceId: deps.config.workspaceId,
+        resumed,
+      });
     },
     runLifecycleCheckpoint: async () => {
       const result = await deps.checkpointScheduler.runLifecycleCheckpoint();

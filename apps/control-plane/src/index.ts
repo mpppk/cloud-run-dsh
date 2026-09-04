@@ -40,6 +40,8 @@ export {
   ID_TOKEN_REFRESH_MARGIN_MS,
   type AgentHostForwardResult,
   type AgentHostFetchFn,
+  type ForwardApprovalArgs,
+  type ForwardCancelArgs,
   type ForwardIdentity,
   type ForwardMessageArgs,
   type HttpAgentHostForwarderOptions,

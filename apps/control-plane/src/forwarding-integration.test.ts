@@ -29,8 +29,18 @@ import { HttpAgentHostForwarder } from "./forwarding.js";
 
 class RecordingTurnStarter implements TurnStarter {
   inputs: AgentTurnInput[] = [];
+  cancelled: (string | undefined)[] = [];
+  approvals: { approvalId: string; decision: string }[] = [];
   async startTurn(input: AgentTurnInput): Promise<void> {
     this.inputs.push(input);
+  }
+  async cancelTurn(sessionId?: string): Promise<number> {
+    this.cancelled.push(sessionId);
+    return 1;
+  }
+  async resolveApproval(approvalId: string, decision: "approved" | "rejected"): Promise<boolean> {
+    this.approvals.push({ approvalId, decision });
+    return true;
   }
 }
 
@@ -190,6 +200,124 @@ describe("control-plane -> agent-host forwarding over HTTP (issue #22)", () => {
       expect(
         logger.parsed.some((e) => e["event"] === "control-plane.forward.delivered"),
       ).toBe(true);
+    } finally {
+      cpServer.stop(true);
+      ahServer?.stop(true);
+    }
+  });
+
+  test("POST /v1/sessions/:id/cancel + /approvals/:approvalId reach the host seams", async () => {
+    // Same production shape as the message test: real HTTP on both sides,
+    // production HttpAgentHostForwarder, recording starter that never touches
+    // a repo (single-writer proof for approval/cancel too).
+    const executor = new InMemoryFakeExecutor();
+    const repo = new PostgresSessionPersistenceRepository(executor);
+    const clock = new SystemClock();
+    const leases = new ControllerLeaseService({
+      store: new InMemoryLeaseStore(),
+      clock,
+    });
+    const membership = new InMemoryMembershipStore();
+    const runtimes = new RuntimeRegistry(() => {
+      throw new Error("test presets its handle");
+    });
+    const logger = new InMemoryLogger();
+    const deps = createControlPlaneDeps({
+      resolveUser: async (identity) =>
+        identity.subject === "alice"
+          ? { id: "alice", email: "alice@example.com" }
+          : null,
+      repo,
+      leases,
+      membership,
+      runtimes,
+      clock,
+      logger,
+      messageForwarder: new HttpAgentHostForwarder({
+        idTokenProvider: async () => "test-id-token",
+        logger,
+      }),
+    });
+    const cpServer = Bun.serve({ port: 0, fetch: createFetchHandler(deps) });
+
+    let ahServer: { stop: (closeActiveConnections?: boolean) => void; url: URL } | null =
+      null;
+    try {
+      const cpFetch = (user: string, path: string, init: RequestInit = {}) => {
+        const headers = new Headers(init.headers);
+        headers.set("x-goog-authenticated-user-id", `accounts.google.com:${user}`);
+        headers.set("x-goog-authenticated-user-email", `${user}@example.com`);
+        return fetch(`${cpServer.url.origin}${path}`, { ...init, headers });
+      };
+
+      const created = await cpFetch("alice", "/v1/workspaces", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
+      });
+      expect(created.status).toBe(201);
+      const workspaceId = ((await created.json()) as { id: string }).id;
+
+      const starter = new RecordingTurnStarter();
+      const th = await composeTestHost({ workspaceId }, { turnStarter: starter });
+      await seedWorkspace(th);
+      await th.host.recover();
+
+      ahServer = Bun.serve({
+        port: 0,
+        fetch: (req) => th.host.gateway.handle(req),
+      });
+      runtimes.set(workspaceId, new TestInstanceHandle(ahServer.url.origin));
+
+      const sessionRes = await cpFetch("alice", `/v1/workspaces/${workspaceId}/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(sessionRes.status).toBe(201);
+      const sessionId = ((await sessionRes.json()) as { id: string }).id;
+
+      const acquire = await cpFetch("alice", `/v1/workspaces/${workspaceId}/controller/acquire`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(acquire.status).toBe(200);
+
+      // ---- the forwarded approval ----
+      const approvalRes = await cpFetch("alice", `/v1/sessions/${sessionId}/approvals/ask-7`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decision: "rejected" }),
+      });
+      expect(approvalRes.status).toBe(201);
+
+      // ---- the forwarded cancel ----
+      const cancelRes = await cpFetch("alice", `/v1/sessions/${sessionId}/cancel`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(cancelRes.status).toBe(201);
+
+      // Both reached the host's TurnStarter seams with the right payloads.
+      expect(starter.approvals).toEqual([{ approvalId: "ask-7", decision: "rejected" }]);
+      expect(starter.cancelled).toEqual([sessionId]);
+      // Neither started a turn.
+      expect(starter.inputs).toHaveLength(0);
+
+      // Single writer: the control-plane DB holds exactly the two events …
+      const persisted = await repo.readEvents(sessionId);
+      expect(persisted.map((e) => e.eventType)).toEqual(["approval", "cancel"]);
+
+      // … and the host appended nothing itself (its repo never saw the session).
+      expect(await th.repository.readEvents(sessionId)).toHaveLength(0);
+
+      // Both deliveries are traceable by kind.
+      const kinds = logger.parsed
+        .filter((e) => e["event"] === "control-plane.forward.delivered")
+        .map((e) => e["kind"]);
+      expect(kinds).toEqual(["approval", "cancel"]);
     } finally {
       cpServer.stop(true);
       ahServer?.stop(true);

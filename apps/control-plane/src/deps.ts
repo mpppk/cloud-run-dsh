@@ -196,11 +196,13 @@ export interface ControlPlaneDeps extends AuthDeps {
    */
   readonly readiness?: () => ControlPlaneReadiness;
   /**
-   * Forwards appended `user_message` events to the workspace Instance
-   * (issue #22). Optional so unit tests and the local dev server (which
-   * have no Instance) keep the append-only 201 behavior; production always
-   * supplies it. When present and the Instance has no URL, postMessage
-   * answers 409 (open first); when the forward itself fails it answers 502.
+   * Forwards appended events to the workspace Instance (issues #22/#39:
+   * `user_message` + `approval` + `cancel`). Optional so unit tests and the
+   * local dev server (which have no Instance) keep the append-only 201
+   * behavior; production always supplies it. When present and the Instance
+   * has no URL, the handlers answer 409 (open first); when the forward
+   * itself fails they answer 502. The control plane stays the SOLE writer
+   * of all three event types — the host never appends them.
    */
   readonly messageForwarder?: MessageForwarder;
   /** Structured logger for forward-failure traceability (never carries tokens). */
