@@ -3,6 +3,7 @@
 // section 30 — the normal path), and serves the Agent Gateway on 0.0.0.0:$PORT.
 
 import { CloudRunInstanceClient } from "@cloud-run-dsh/cloud-run-instance-client";
+import { createLogger } from "@cloud-run-dsh/observability";
 import { composeAgentHost } from "./composition.js";
 import type { AgentHostDependencies } from "./composition.js";
 import { readAgentHostConfig } from "./config.js";
@@ -17,8 +18,8 @@ import {
   SqlTransactionalStateStore,
   createCheckpointStorage,
   createEnvSecretProvider,
+  createGcsTokenProvider,
   createSessionRepository,
-  envGcsTokenProvider,
   fetchHttpTransport,
   instanceHttpTransport,
 } from "./adapters.js";
@@ -27,8 +28,14 @@ export async function createProductionDependencies(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): Promise<AgentHostDependencies> {
   const config = readAgentHostConfig(env);
+  const logger = createLogger({ defaultFields: { component: "agent-host" } });
 
-  const gcsClient = new FetchGcsClient({ tokenProvider: envGcsTokenProvider(env) });
+  // GCS auth (issue #27): execution service account via the metadata server,
+  // falling back to ADC then GCP_ACCESS_TOKEN off-GCP. Tokens are cached
+  // until 60s before expiry, so long-lived Instances never go stale.
+  const gcsClient = new FetchGcsClient({
+    tokenProvider: createGcsTokenProvider(env, { logger }),
+  });
   const executor = await BunSqlQueryExecutor.connect(config.databaseUrl);
   const repository = await createSessionRepository(config.databaseUrl);
 
