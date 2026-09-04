@@ -225,10 +225,13 @@ describe("content checks", () => {
     expect(c).toContain("ai_agent_service_account_email");
   });
 
-  test("README documents Cloud Run Instances TODO, bootstrap, and run.admin narrow alternative", () => {
+  test("README documents the Cloud Run Instances decision (ADR-0001), bootstrap, and run.admin narrow alternative", () => {
     const c = readFileSync(join(tfDir, "README.md"), "utf8");
     expect(c).toMatch(/Cloud Run Instances/i);
-    expect(c).toMatch(/TODO/);
+    // #28 decided Instances stay outside Terraform (ADR-0001); the old
+    // "Pre-GA TODO, promote .example once a resource ships" wording is gone.
+    expect(c).toMatch(/ADR-0001/);
+    expect(c).toMatch(/outside Terraform/i);
     expect(c).toMatch(/Bootstrap sequence/i);
     expect(c).toMatch(/servicenetworking/);
     expect(c).toMatch(/checkpoint_live_delete_age_days/);

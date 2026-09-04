@@ -215,7 +215,19 @@ permission mode:
 workspace-write
 ```
 
-これによりmodel-facing `write` / `edit` はworkspace外への変更を拒否する。
+これによりmodel-facing `write` / `edit` は、ワークスペースルートおよびプラットフォームの
+一時領域（`/tmp`）を除くワークスペース外への**永続的な**変更を拒否する。
+`/tmp` ちょうど（`/var/tmp` は不可）への書き込みは upstream の `workspace-write` の
+定義として許可される。2026-09-03 に GCP 上の Instance で実測済み
+（`/etc`・`/var/tmp`・`/home`・`/app`・パストラバーサルは全て拒否、`/tmp` のみ許可。
+詳細は `docs/bringup-report.md` の G8 を参照）。
+
+`/tmp` を許すのは Harness のバグではなく仕様であり、封じ込めは次の理由で成立している
+（[#30](https://github.com/mpppk/cloud-run-dsh/issues/30) での判断: 許容する）。
+ワークスペース外の永続的な書き込みは拒否されるため、`/tmp` に書かれたものが
+ホストや他ワークスペースの永続状態を汚すことはない。加えて Instance は短命であり、
+プロセス終了時に `/tmp` ごと消える。チェックポイントの対象は `/workspace` のみで、
+`/tmp` の内容が GCS や Cloud SQL に残ることもない。
 
 `fs-observation-policy` によりread-before-write/editおよびstale-write保護を維持する。citeturn517072search4turn517072search10
 
@@ -851,7 +863,9 @@ Sandbox lifecycleはCloud Loggingにも記録される。citeturn989520sea
 必須:
 
 1. AI生成commandをHost上で直接実行しない。
-2. `/workspace` 外へのmodel-driven writeを禁止する。
+2. `/workspace` 外へのmodel-driven writeを禁止する。ただしプラットフォームの一時領域
+   （`/tmp`。`/var/tmp` は不可）への書き込みは upstream の `workspace-write` の定義として
+   許す（§6.2）。`/tmp` は Instance の破棄とともに消え、チェックポイントにも含まれない。
 3. Host credentialをSandboxへ継承しない。
 4. GitHub App private keyをSandboxへ渡さない。
 5. SecretをHost filesystemへ書かない。
@@ -915,7 +929,7 @@ danger-full-access
 ✓ Harnessからnpm testをSandboxで実行できる
 ✓ stdout / stderr / exit codeがHarnessへ返る
 ✓ Harness file editがSandboxから即時参照できる
-✓ workspace外へのfile editが拒否される
+✓ workspace外へのfile editが拒否される（`/tmp` の一時書き込みを除く。§6.2）
 ✓ SandboxからHost credentialを取得できない
 ✓ GitHub App tokenでclone/fetch/pushできる
 ✓ Agent sessionがCloud SQLへ永続化される

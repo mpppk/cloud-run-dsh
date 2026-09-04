@@ -184,31 +184,13 @@ terraform -chdir=infra/terraform validate
 
 `terraform` is not bundled in this repo; if the binary is absent the PR body notes it.
 
-## Cloud Run Instances — Pre-GA note (TODO)
+## Cloud Run Instances — deliberately outside Terraform (ADR-0001)
 
-Cloud Run Instances (`run.googleapis.com` Instance API: create/start/stop/delete per-instance lifecycle, Pre-GA) do **not** yet have a stable Terraform resource in `hashicorp/google` / `google-beta` at the time of this baseline. The provider exposes `google_cloud_run_v2_service` / `job` but not a `google_cloud_run_instance` resource.
+Cloud Run Instances (`run.googleapis.com` Instance API: create/start/stop/delete per-instance lifecycle, Pre-GA) are **not** provisioned via Terraform, by decision — not by accident. See [ADR-0001](../../docs/adr/0001-instances-outside-terraform.md) ([#28](https://github.com/mpppk/cloud-run-dsh/issues/28)).
 
-This baseline therefore does **not** provision Instances via Terraform. Instance lifecycle is handled at runtime by the control plane's `InstanceRuntime` adapter (see 実装手順書 §5) which calls the Cloud Run REST API directly.
+In short: Instances are short-lived, per-workspace resources whose lifecycle belongs to the application (the control plane creates/deletes them at runtime). Managing them declaratively would turn every runtime-created Instance into `terraform plan` drift, while making "open a workspace" an infrastructure change. Terraform owns the static foundation (APIs, Cloud SQL, GCS, Secrets, IAM, service accounts) — nothing more.
 
-```hcl
-# TODO(cloud-run-instances): replace direct REST calls with a Terraform
-# resource once hashicorp/google(-beta) ships google_cloud_run_instance
-# (or google_cloud_run_v2_instance). Track:
-#   https://github.com/hashicorp/terraform-provider-google/issues
-#   https://cloud.google.com/run/docs/reference/rest/v1/projects.locations.instances
-#
-# resource "google_cloud_run_instance" "workspace" {
-#   for_each = var.workspaces
-#   ...
-#   cpu             = 4
-#   memory          = "8Gi"
-#   restart_policy  = "ON_FAILURE"
-# }
-
-# Until then: DO NOT fake it with google_cloud_run_v2_service.
-```
-
-When a resource becomes available, add it under `infra/terraform/run_instances.tf` and wire the agent-host image from `google_artifact_registry_repository.agent_host`, the two service accounts, and the IAP backend.
+Instance lifecycle is handled at runtime by the control plane's `InstanceRuntime` adapter (see 実装手順書 §5) which calls the Cloud Run REST API directly. Do **not** fake it with `google_cloud_run_v2_service`, and do not add a `run_instances.tf` even if `hashicorp/google`(-beta) ships a `google_cloud_run_instance` resource — revisit ADR-0001 first.
 
 ## Private IP choice (cloudsql.tf)
 
