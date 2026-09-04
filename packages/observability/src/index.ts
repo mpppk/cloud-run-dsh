@@ -236,6 +236,25 @@ export function redactLogFields(fields: LogFields): LogFields {
 }
 
 // ---------------------------------------------------------------------------
+// Error IDs for 500 correlation (issue #48)
+// ---------------------------------------------------------------------------
+
+/**
+ * Generates the random error ID shared by a generic 500 response and its
+ * server-side log line, so an operator can correlate a client report with
+ * Cloud Logging without the response leaking internals.
+ *
+ * Deliberately 16 hex chars (64-bit), NOT a full UUID: values of 20+ chars
+ * with 2+ character classes are masked to `[REDACTED]` by the
+ * high-entropy redactor net above — a UUID errorId would arrive redacted in
+ * the very log line meant to carry it. 16 chars pass through while remaining
+ * unique enough for error correlation.
+ */
+export function newErrorId(): string {
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+}
+
+// ---------------------------------------------------------------------------
 // Logger
 // ---------------------------------------------------------------------------
 

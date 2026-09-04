@@ -36,6 +36,7 @@ import {
 import type { QueryExecutor } from "@cloud-run-dsh/session-persistence-postgres";
 import type { Clock } from "@cloud-run-dsh/workspace-checkpoint";
 import {
+  badRequest,
   createControlPlaneDeps,
   createFetchHandler,
   InMemoryMembershipStore,
@@ -1670,6 +1671,133 @@ describe("approval/cancel forwarding to agent-host (issue #39)", () => {
       expect((await postApprovalAsAlice(h, sessionId, "ap-1")).status).toBe(201);
       expect((await postCancelAsAlice(h, sessionId)).status).toBe(201);
       expect(await h.repo.readEvents(sessionId)).toHaveLength(2);
+    } finally {
+      h.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unexpected-error observability (issue #48)
+//
+// A 500 must leave a redacted structured log line carrying the same errorId
+// the client receives, while the response itself stays generic.
+// ---------------------------------------------------------------------------
+
+describe("unexpected error observability (issue #48)", () => {
+  test("toErrorResponse logs class/message/stack + context; response stays generic with matching errorId", async () => {
+    const logger = new InMemoryLogger();
+    const res = toErrorResponse(new TypeError("boom details here"), {
+      logger,
+      context: {
+        method: "POST",
+        path: "/v1/workspaces/ws-1/open",
+        userId: "alice",
+        workspaceId: "ws-1",
+      },
+    });
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as {
+      error: { code: string; message: string; errorId: string };
+    };
+    expect(body.error.code).toBe("internal");
+    expect(body.error.message).toBe("internal server error");
+    // 16 hex chars by design (not a UUID): a UUID-shaped ID would be masked
+    // to [REDACTED] by the entropy redactor in the very log line meant to
+    // carry it. See newErrorId in @cloud-run-dsh/observability.
+    expect(body.error.errorId).toMatch(/^[0-9a-f]{16}$/);
+
+    // The response carries no internals.
+    expect(JSON.stringify(body)).not.toContain("boom details here");
+
+    const line = logger.parsed.find((e) => e["event"] === "http.unexpected_error");
+    expect(line).toBeTruthy();
+    expect(line!["errorId"]).toBe(body.error.errorId);
+    expect(line!["errorClass"]).toBe("TypeError");
+    expect(line!["errorMessage"]).toBe("boom details here");
+    expect(typeof line!["errorStack"]).toBe("string");
+    expect(line!["errorStack"] as string).toContain("TypeError");
+    expect(line!["method"]).toBe("POST");
+    expect(line!["path"]).toBe("/v1/workspaces/ws-1/open");
+    expect(line!["userId"]).toBe("alice");
+    expect(line!["workspaceId"]).toBe("ws-1");
+  });
+
+  test("typed errors (4xx/409) stay silent: no ERROR log for expected failures", () => {
+    const logger = new InMemoryLogger();
+    expect(toErrorResponse(badRequest("missing field"), { logger }).status).toBe(400);
+    expect(toErrorResponse(new InvalidOperationError("open", "BUSY"), { logger }).status).toBe(
+      409,
+    );
+    expect(logger.lines).toHaveLength(0);
+  });
+
+  test("secret-bearing exceptions are redacted in the log (#42 regression)", async () => {
+    const logger = new InMemoryLogger();
+    // Shapes mirroring the real #42 leak: a Bun.SQL-style message carrying a
+    // postgres connection string plus a GitHub token.
+    const secretUrl = "postgres://dsh_app:Sup3rS3cretDbPassw0rd@10.0.0.1:5432/dsh";
+    const token = "ghp_1234567890abcdefghij1234567890abcd";
+    const err = new Error(`Bun.SQL connection failed using ${secretUrl} with token ${token}`);
+    const res = toErrorResponse(err, { logger });
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { error: { errorId: string } };
+
+    const rawLogs = logger.lines.join("\n");
+    expect(rawLogs).not.toContain("Sup3rS3cretDbPassw0rd");
+    expect(rawLogs).not.toContain(token);
+    expect(rawLogs).not.toContain(secretUrl);
+    // …but the line exists and is correlatable.
+    expect(rawLogs).toContain(body.error.errorId);
+    expect(rawLogs).toContain("http.unexpected_error");
+  });
+
+  test("end-to-end: throwing open() -> generic 500 + redacted log with matching errorId", async () => {
+    const logger = new InMemoryLogger();
+    const h = startHarness({ logger });
+    try {
+      const ws = await h.createWorkspace("alice");
+      const secret = "postgres://dsh_app:An0therS3cretPass@10.0.0.2:5432/dsh";
+      const throwing: WorkspaceRuntimeHandle = {
+        open: async () => {
+          throw new Error(`Instance start failed: ${secret}`);
+        },
+        stop: async () => "STOPPED",
+        getState: () => "STOPPED",
+        recordActivity: () => {},
+        assertAgentInputAllowed: () => {},
+        runManualCheckpoint: async () => {},
+        getInstanceUrl: async () => null,
+      };
+      h.deps.runtimes.set(ws.id, throwing);
+
+      const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/open`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(500);
+      const rawBody = await res.text();
+      const body = JSON.parse(rawBody) as {
+        error: { code: string; message: string; errorId: string };
+      };
+      expect(body.error.code).toBe("internal");
+      expect(body.error.message).toBe("internal server error");
+      expect(rawBody).not.toContain("An0therS3cretPass");
+      expect(rawBody).not.toContain("Instance start failed");
+
+      const line = logger.parsed.find((e) => e["event"] === "http.unexpected_error");
+      expect(line).toBeTruthy();
+      expect(line!["errorId"]).toBe(body.error.errorId);
+      // NOTE (known redactor behavior, not a bug in this change): workspace
+      // UUIDs are masked to [REDACTED] by the high-entropy net, so the
+      // errorId — not the workspaceId — is the correlation key operators use.
+      // The field is still passed to the logger per 仕様書 §25.
+      expect(line!["workspaceId"]).toBe("[REDACTED]");
+      expect(line!["userId"]).toBe("alice");
+      expect(line!["method"]).toBe("POST");
+      expect(line!["path"]).toContain("/v1/workspaces/");
+      expect(logger.lines.join("\n")).not.toContain("An0therS3cretPass");
     } finally {
       h.stop();
     }

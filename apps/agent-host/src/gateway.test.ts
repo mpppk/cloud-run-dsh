@@ -290,3 +290,70 @@ describe("AgentGateway", () => {
     expect(res.status).toBe(500);
   });
 });
+
+describe("unexpected error observability (issue #48)", () => {
+  test("uncaught throw (lease lookup outage) -> generic 500 + redacted log with matching errorId", async () => {
+    const logger = new InMemoryLogger();
+    const th = await composeTestHost({}, { logger });
+    await seedWorkspace(th);
+    await th.host.recover();
+    // Simulate a DB outage behind the lease lookup: the throw escapes every
+    // inner handler and must still be logged, never leaked.
+    const secret = "postgres://dsh_app:HostS3cretPassw0rd@10.0.0.3:5432/dsh";
+    const token = "ghp_abcdefghij12345678901234567890abcd";
+    th.host.lease.getActive = async () => {
+      throw new Error(`lease store unreachable ${secret} ${token}`);
+    };
+    const res = await th.host.gateway.handle(
+      request("POST", "/workspaces/ws-1/sessions/s1/messages", IAP, {
+        sessionId: "s1",
+        seq: 0,
+        content: "hi",
+      }),
+    );
+    expect(res.status).toBe(500);
+    const rawBody = await res.text();
+    const body = JSON.parse(rawBody) as { error: string; errorId: string };
+    expect(body.error).toBe("internal server error");
+    expect(typeof body.errorId).toBe("string");
+    expect(rawBody).not.toContain("lease store unreachable");
+    expect(rawBody).not.toContain("HostS3cretPassw0rd");
+    expect(rawBody).not.toContain(token);
+
+    const line = logger.parsed.find((e) => e["event"] === "gateway.unexpected_error");
+    expect(line).toBeTruthy();
+    expect(line!["errorId"]).toBe(body.errorId);
+    expect(line!["errorClass"]).toBe("Error");
+    expect(line!["workspaceId"]).toBe("ws-1");
+    expect(line!["sessionId"]).toBe("s1");
+    expect(typeof line!["errorStack"]).toBe("string");
+    const rawLogs = logger.lines.join("\n");
+    expect(rawLogs).not.toContain("HostS3cretPassw0rd");
+    expect(rawLogs).not.toContain(token);
+    expect(rawLogs).not.toContain(secret);
+  });
+
+  test("starter failure 500 carries the errorId of the gateway.turn.failed log", async () => {
+    const logger = new InMemoryLogger();
+    const starter = new RecordingTurnStarter();
+    starter.failNext = new Error("llm exploded");
+    const th = await composeTestHost({}, { turnStarter: starter, logger });
+    await seedWorkspace(th);
+    await th.host.recover();
+    const res = await th.host.gateway.handle(
+      request("POST", "/workspaces/ws-1/sessions/s1/messages", IAP, {
+        sessionId: "s1",
+        seq: 0,
+        content: "hi",
+      }),
+    );
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { error: string; errorId: string };
+    expect(body.error).toBe("turn failed to start");
+    const line = logger.parsed.find((e) => e["event"] === "gateway.turn.failed");
+    expect(line).toBeTruthy();
+    expect(line!["errorId"]).toBe(body.errorId);
+    expect(line!["errorClass"]).toBe("Error");
+    expect(typeof line!["errorStack"]).toBe("string");
+  });
+});
