@@ -24,6 +24,15 @@ export const DEFAULT_LLM_API_KEY_ENV = "OPENROUTER_API_KEY";
  */
 export const DEFAULT_LLM_MODEL = "deepseek/deepseek-v4-flash";
 
+/**
+ * Default Cloud Run Instances API origin + version (issue #47). Overridable
+ * via `INSTANCES_API_BASE_URL` for tests and emulators. Kept in sync with
+ * `DEFAULT_INSTANCES_API_BASE_URL` in
+ * `@cloud-run-dsh/cloud-run-instance-client` (same literal; config.ts stays
+ * dependency-free).
+ */
+export const DEFAULT_INSTANCES_API_BASE_URL = "https://run.googleapis.com/v2";
+
 export type LlmApprovalPolicy = "ask" | "never";
 
 const REQUIRED_ENV_KEYS = [
@@ -72,6 +81,12 @@ export interface AgentHostConfig {
   readonly instanceName: string;
   readonly gcpProjectId: string;
   readonly gcpRegion: string;
+  /**
+   * Cloud Run Instances API origin + version (issue #47). Defaults to
+   * `https://run.googleapis.com/v2`; set `INSTANCES_API_BASE_URL` to point at
+   * an emulator in tests (e.g. `http://localhost:8080/v2`).
+   */
+  readonly instancesApiBaseUrl: string;
   /** Provided by Cloud Run — never vendored into the container. */
   readonly sandboxCliPath: string;
   /** Sandbox creation egress policy (実装手順書 section 9 uses --allow-egress). */
@@ -131,10 +146,37 @@ export function readAgentHostConfig(
     instanceName: env["INSTANCE_NAME"]!.trim(),
     gcpProjectId: env["GCP_PROJECT_ID"]!.trim(),
     gcpRegion: env["GCP_REGION"]!.trim(),
+    instancesApiBaseUrl: readInstancesApiBaseUrl(env),
     sandboxCliPath: env["SANDBOX_CLI_PATH"]?.trim() || DEFAULT_SANDBOX_CLI_PATH,
     allowEgress: env["SANDBOX_ALLOW_EGRESS"]?.trim() !== "false",
     ...readLlmConfig(env),
   };
+}
+
+/**
+ * Instances API origin + version (issue #47). Blank/unset means the
+ * production default. A non-absolute value fails here, at agent-host boot,
+ * instead of failing the first Instances API call inside fetch().
+ */
+function readInstancesApiBaseUrl(
+  env: Readonly<Record<string, string | undefined>>,
+): string {
+  const raw = env["INSTANCES_API_BASE_URL"]?.trim();
+  if (raw === undefined || raw === "") return DEFAULT_INSTANCES_API_BASE_URL;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(
+      `invalid INSTANCES_API_BASE_URL: ${JSON.stringify(raw)} (want an absolute http(s) URL like ${DEFAULT_INSTANCES_API_BASE_URL})`,
+    );
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(
+      `invalid INSTANCES_API_BASE_URL: ${JSON.stringify(raw)} (want an absolute http(s) URL like ${DEFAULT_INSTANCES_API_BASE_URL})`,
+    );
+  }
+  return raw;
 }
 
 function readLlmConfig(

@@ -18,12 +18,13 @@ import type { ControlPlaneConfig } from "./config.js";
 import {
   assertTwoMethodClock,
   buildInstanceEnv,
+  buildInstancesBasePathForConfig,
   createProductionRuntimeRegistry,
   defaultInstanceName,
   type HealthFetch,
 } from "./runtime-factory.js";
 
-const BASE_PATH = "projects/test-proj/locations/test-region";
+const BASE_PATH = "https://run.googleapis.com/v2/projects/test-proj/locations/test-region";
 
 function testConfig(): ControlPlaneConfig {
   return {
@@ -31,6 +32,7 @@ function testConfig(): ControlPlaneConfig {
     databaseUrl: "postgresql://dsh_app:pw@/dsh?host=/cloudsql/test-proj:test-region:main",
     gcpProjectId: "test-proj",
     gcpRegion: "test-region",
+    instancesApiBaseUrl: "https://run.googleapis.com/v2",
     agentHostImage: "test-region-docker.pkg.dev/test-proj/agent-host/agent-host:v1",
     agentHostServiceAccount: "agent-host@test-proj.iam.gserviceaccount.com",
     checkpointBucket: "test-checkpoints",
@@ -329,6 +331,54 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     const handle = await registry.get(workspace);
     await expect(handle.open()).rejects.toThrow(/never became healthy/);
     expect(handle.getState()).toBe("RESTORE_FAILED");
+  });
+});
+
+describe("buildInstancesBasePathForConfig — issue #47 absolute-URL contract", () => {
+  test("assembles the production v2 basePath", () => {
+    expect(buildInstancesBasePathForConfig(testConfig())).toBe(BASE_PATH);
+  });
+
+  test("every Instances API request is an absolute fetchable URL", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
+    const registry = makeRegistry(h);
+    const handle = await registry.get(workspace);
+    await handle.open();
+    expect(h.transport.requests.length).toBeGreaterThan(0);
+    for (const req of h.transport.requests) {
+      // The #47 failure mode: fetch(relative) throws "URL is invalid".
+      expect(() => new URL(req.url)).not.toThrow();
+      expect(req.url.startsWith("https://run.googleapis.com/v2/")).toBe(true);
+    }
+  });
+
+  test("custom INSTANCES_API_BASE_URL (emulator) is honored", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(async (req) => {
+      if (req.method === "GET") {
+        return {
+          status: 200,
+          body: {
+            name: "dsh-ws-1",
+            terminalCondition: { state: "CONDITION_SUCCEEDED" },
+            urls: ["https://dsh-ws-1.run.app"],
+          },
+        };
+      }
+      return { status: 200, body: {} };
+    });
+    const registry = makeRegistry(h, { instancesApiBaseUrl: "http://localhost:8080/v2/" });
+    const handle = await registry.get(workspace);
+    await handle.open();
+    expect(h.transport.requests.length).toBeGreaterThan(0);
+    for (const req of h.transport.requests) {
+      expect(req.url.startsWith("http://localhost:8080/v2/projects/test-proj/locations/test-region/")).toBe(
+        true,
+      );
+    }
   });
 });
 

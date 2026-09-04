@@ -268,7 +268,7 @@ Baseline configuration (仕様書 §22 / 実装手順書 §6): `cpu: 4`, `memory
 | 12 | `GCP_PROJECT_ID` | `$PROJECT_ID`. |
 | 13 | `GCP_REGION` | `$REGION`. |
 
-Optional (not required, have defaults in `config.ts`): `PORT` (8080), `WORKSPACE_ROOT` (`/workspace`), `CHECKPOINT_KEY`, `SANDBOX_CLI_PATH`, `SANDBOX_ALLOW_EGRESS`, plus the LLM settings below.
+Optional (not required, have defaults in `config.ts`): `PORT` (8080), `WORKSPACE_ROOT` (`/workspace`), `CHECKPOINT_KEY`, `SANDBOX_CLI_PATH`, `SANDBOX_ALLOW_EGRESS`, `INSTANCES_API_BASE_URL` (`https://run.googleapis.com/v2` — issue #47; the Instances API basePath must stay absolute, override only for emulators), plus the LLM settings below.
 
 > **Bun.SQL socket note (#42):** Bun.SQL rejects Unix-socket DSNs passed as
 > URL strings outright (`TypeError: Invalid URL` — and the thrown error

@@ -3,6 +3,9 @@ import {
   DEFAULT_INSTANCE_CONFIG,
   INSTANCE_PROFILES,
   AVAILABLE_PROFILES,
+  DEFAULT_INSTANCES_API_BASE_URL,
+  InvalidBasePathError,
+  buildInstancesBasePath,
   configForProfile,
   toApiRestartPolicy,
   ProfileNotAvailableError,
@@ -57,7 +60,7 @@ describe("cloud-run-instance-client config defaults", () => {
 
   test("client uses default config when none provided", () => {
     const t = new FakeTransport();
-    const c = new CloudRunInstanceClient({ transport: t, basePath: "projects/p/locations/us-central1" });
+    const c = new CloudRunInstanceClient({ transport: t, basePath: "https://run.googleapis.com/v2/projects/p/locations/us-central1" });
     expect(c.getConfig()).toEqual(DEFAULT_INSTANCE_CONFIG);
   });
 
@@ -65,7 +68,7 @@ describe("cloud-run-instance-client config defaults", () => {
     const t = new FakeTransport();
     const c = new CloudRunInstanceClient({
       transport: t,
-      basePath: "projects/p/locations/us-central1",
+      basePath: "https://run.googleapis.com/v2/projects/p/locations/us-central1",
       profile: "Standard",
     });
     expect(c.getConfig()).toEqual(DEFAULT_INSTANCE_CONFIG);
@@ -79,7 +82,7 @@ describe("cloud-run-instance-client restartPolicy always rejection", () => {
       () =>
         new CloudRunInstanceClient({
           transport: t,
-          basePath: "projects/p/locations/us-central1",
+          basePath: "https://run.googleapis.com/v2/projects/p/locations/us-central1",
           config: { cpu: 4, memory: "8Gi", restartPolicy: "always", sandboxLauncher: true, port: 8080 },
         }),
     ).toThrow(InvalidRestartPolicyError);
@@ -90,7 +93,7 @@ describe("cloud-run-instance-client restartPolicy always rejection", () => {
     try {
       new CloudRunInstanceClient({
         transport: t,
-        basePath: "projects/p/locations/us-central1",
+        basePath: "https://run.googleapis.com/v2/projects/p/locations/us-central1",
         config: { cpu: 4, memory: "8Gi", restartPolicy: "always", sandboxLauncher: true, port: 8080 },
       });
       expect.unreachable();
@@ -102,7 +105,7 @@ describe("cloud-run-instance-client restartPolicy always rejection", () => {
 });
 
 describe("cloud-run-instance-client request shapes", () => {
-  const basePath = "projects/test-proj/locations/us-central1";
+  const basePath = "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1";
   const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
 
   test("toApiRestartPolicy maps to the v2 API enum", () => {
@@ -201,7 +204,7 @@ describe("cloud-run-instance-client request shapes", () => {
   test("create parses a pending v2 longrunning operation", async () => {
     const transport = new FakeTransport(async () => ({
       status: 200,
-      body: { name: "projects/test-proj/locations/us-central1/operations/op-1", done: false },
+      body: { name: "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1/operations/op-1", done: false },
     }));
     const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     const info = await client.create({ id: "ws-1" });
@@ -212,7 +215,7 @@ describe("cloud-run-instance-client request shapes", () => {
   test("create throws when the completed operation carries an error", async () => {
     const transport = new FakeTransport(async () => ({
       status: 200,
-      body: { name: "projects/test-proj/locations/us-central1/operations/op-1", done: true, error: { code: 13, message: "internal boom" } },
+      body: { name: "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1/operations/op-1", done: true, error: { code: 13, message: "internal boom" } },
     }));
     const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     await expect(client.create({ id: "ws-1" })).rejects.toThrow("internal boom");
@@ -285,7 +288,7 @@ describe("cloud-run-instance-client request shapes", () => {
 });
 
 describe("cloud-run-instance-client v2 response parsing", () => {
-  const basePath = "projects/test-proj/locations/us-central1";
+  const basePath = "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1";
   const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
 
   test("get derives READY from terminalCondition.state (v2 has no top-level state)", async () => {
@@ -326,7 +329,7 @@ describe("cloud-run-instance-client v2 response parsing", () => {
 });
 
 describe("cloud-run-instance-client error mapping", () => {
-  const basePath = "projects/test-proj/locations/us-central1";
+  const basePath = "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1";
   const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
 
   test("404 maps to InstanceNotFoundError", async () => {
@@ -390,7 +393,7 @@ describe("cloud-run-instance-client error mapping", () => {
 });
 
 describe("cloud-run-instance-client container env", () => {
-  const basePath = "projects/test-proj/locations/us-central1";
+  const basePath = "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1";
   const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
 
   function createBodyOf(req: { body?: unknown }): Record<string, unknown> {
@@ -428,5 +431,94 @@ describe("cloud-run-instance-client container env", () => {
       { name: "DATABASE_URL", value: "postgresql://x" },
       { name: "WORKSPACE_ID", value: "ws-1" },
     ]);
+  });
+});
+
+describe("cloud-run-instance-client basePath contract (issue #47)", () => {
+  const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
+
+  test("DEFAULT_INSTANCES_API_BASE_URL is the production v2 origin", () => {
+    expect(DEFAULT_INSTANCES_API_BASE_URL).toBe("https://run.googleapis.com/v2");
+  });
+
+  test("buildInstancesBasePath assembles an absolute basePath", () => {
+    expect(
+      buildInstancesBasePath({
+        apiBaseUrl: "https://run.googleapis.com/v2",
+        projectId: "my-proj",
+        region: "asia-northeast1",
+      }),
+    ).toBe("https://run.googleapis.com/v2/projects/my-proj/locations/asia-northeast1");
+  });
+
+  test("buildInstancesBasePath tolerates a trailing slash on the origin", () => {
+    expect(
+      buildInstancesBasePath({
+        apiBaseUrl: "http://localhost:8080/v2/",
+        projectId: "p",
+        region: "r",
+      }),
+    ).toBe("http://localhost:8080/v2/projects/p/locations/r");
+  });
+
+  test("relative basePath is rejected in the constructor, before any request", () => {
+    const t = new FakeTransport();
+    expect(
+      () =>
+        new CloudRunInstanceClient({
+          transport: t,
+          basePath: "projects/p/locations/us-central1",
+        }),
+    ).toThrow(InvalidBasePathError);
+    expect(t.requests).toHaveLength(0);
+  });
+
+  test("rejection message names the absolute-URL contract", () => {
+    const t = new FakeTransport();
+    try {
+      new CloudRunInstanceClient({ transport: t, basePath: "projects/p/locations/r" });
+      expect.unreachable();
+    } catch (e) {
+      expect(e).toBeInstanceOf(InvalidBasePathError);
+      expect((e as Error).message).toContain("https://run.googleapis.com/v2");
+    }
+  });
+
+  test("empty and non-http(s) basePaths are rejected", () => {
+    for (const bad of ["", "   ", "ftp://example.com/v2/projects/p/locations/r"]) {
+      const t = new FakeTransport();
+      expect(() => new CloudRunInstanceClient({ transport: t, basePath: bad })).toThrow(
+        InvalidBasePathError,
+      );
+      expect(t.requests).toHaveLength(0);
+    }
+  });
+
+  test("http:// emulator origins are accepted", async () => {
+    const basePath = "http://localhost:8080/v2/projects/p/locations/r";
+    const transport = new FakeTransport(async () => ({
+      status: 200,
+      body: { name: "x", state: "READY" },
+    }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    await client.get("x");
+    expect(transport.lastRequest()!.url).toBe(`${basePath}/instances/x`);
+  });
+
+  test("absolute request URLs are fetchable (regression: relative URLs threw 'URL is invalid')", async () => {
+    const basePath =
+      "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1";
+    const transport = new FakeTransport(async () => ({
+      status: 200,
+      body: { name: "x", state: "READY" },
+    }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    await client.get("x");
+    const url = transport.lastRequest()!.url;
+    // Must survive the WHATWG URL parser that fetch() applies — the exact
+    // failure mode of the relative basePath in #47.
+    expect(() => new URL(url)).not.toThrow();
+    expect(new URL(url).protocol).toBe("https:");
+    expect(url).toBe(`${basePath}/instances/x`);
   });
 });

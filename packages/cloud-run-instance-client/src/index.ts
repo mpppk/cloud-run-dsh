@@ -4,14 +4,70 @@
 // REST surface: Cloud Run Instances API **v2** (verified against the live
 // discovery document on 2026-09-03: `https://run.googleapis.com/$discovery/rest?version=v2`).
 // v1 exposes `projects.locations.instances` with IAM methods only — no CRUD.
-// The API version is decided by the caller via `basePath` (e.g.
-// "projects/P/locations/L" is prefixed with the v2 host by the transport):
+// `basePath` MUST be an absolute URL including the API host + version, e.g.
+// "https://run.googleapis.com/v2/projects/P/locations/L" (issue #47: a
+// relative "projects/P/locations/L" makes fetch() throw "URL is invalid").
+// The API version is decided by the caller via the `basePath` host+version
+// prefix (use `buildInstancesBasePath()` or pass an emulator origin):
 //   list   GET    {basePath}/instances            (create body name is IGNORED; id goes in ?instanceId=)
 //   create POST   {basePath}/instances?instanceId=<id>[&validateOnly=true]
 //   get    GET    {basePath}/instances/<id>
 //   start  POST   {basePath}/instances/<id>:start
 //   stop   POST   {basePath}/instances/<id>:stop
 //   delete DELETE {basePath}/instances/<id>
+
+/**
+ * Production Cloud Run Instances API origin + version. Callers build their
+ * `basePath` as `${apiBaseUrl}/projects/<id>/locations/<region>`; the value
+ * is configurable (env `INSTANCES_API_BASE_URL`, emulator origins) so tests
+ * and emulators never hard-code the production host.
+ */
+export const DEFAULT_INSTANCES_API_BASE_URL = "https://run.googleapis.com/v2";
+
+/**
+ * Assembles an absolute Instances API `basePath` from an API origin and a
+ * project/region pair. Trailing slashes on the origin are ignored so both
+ * "https://run.googleapis.com/v2" and ".../v2/" produce the same basePath.
+ */
+export function buildInstancesBasePath(args: {
+  readonly apiBaseUrl: string;
+  readonly projectId: string;
+  readonly region: string;
+}): string {
+  const origin = args.apiBaseUrl.replace(/\/+$/, "");
+  return `${origin}/projects/${args.projectId}/locations/${args.region}`;
+}
+
+/** Thrown when `basePath` is not an absolute http(s) URL (issue #47). */
+export class InvalidBasePathError extends Error {
+  readonly name = "InvalidBasePathError";
+  constructor(public readonly basePath: string) {
+    super(
+      `CloudRunInstanceClient basePath must be an absolute URL including the API host and version, ` +
+        `e.g. "https://run.googleapis.com/v2/projects/<project>/locations/<region>" (got ${JSON.stringify(basePath)}). ` +
+        `A relative "projects/<project>/locations/<region>" cannot be fetched — ` +
+        `build it with buildInstancesBasePath() or set INSTANCES_API_BASE_URL (issue #47).`,
+    );
+  }
+}
+
+/**
+ * Fail-fast guard (issue #47): relative basePaths used to travel all the way
+ * to `fetch()` before failing as "URL is invalid". Reject them here, in the
+ * constructor, with the fix spelled out. `http://` origins are accepted so
+ * emulators (e.g. http://localhost:8080/v2/...) keep working.
+ */
+export function assertAbsoluteBasePath(basePath: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(basePath);
+  } catch {
+    throw new InvalidBasePathError(basePath);
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new InvalidBasePathError(basePath);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // InstanceRuntime interface (implementation guide section 5 — exact shape)
@@ -198,7 +254,13 @@ export interface HttpTransport {
 
 export interface CloudRunInstanceClientOptions {
   transport: HttpTransport;
-  /** e.g. "projects/my-proj/locations/us-central1" — prefixed to instance paths */
+  /**
+   * Absolute Instances API base, e.g.
+   * "https://run.googleapis.com/v2/projects/my-proj/locations/us-central1".
+   * Relative "projects/.../locations/..." values are rejected in the
+   * constructor (InvalidBasePathError, issue #47) — use
+   * `buildInstancesBasePath()` to assemble this.
+   */
   basePath: string;
   config?: InstanceConfig;
   profile?: InstanceProfileName;
@@ -242,6 +304,8 @@ export class CloudRunInstanceClient implements InstanceRuntime {
 
   constructor(options: CloudRunInstanceClientOptions) {
     this.transport = options.transport;
+    // Issue #47: fail here on a relative basePath — never let it reach fetch().
+    assertAbsoluteBasePath(options.basePath);
     this.basePath = options.basePath.replace(/\/$/, "");
     this.image = options.image;
     this.serviceAccount = options.serviceAccount;

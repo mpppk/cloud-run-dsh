@@ -30,6 +30,8 @@ describe("readAgentHostConfig", () => {
     expect(config.checkpointKey).toBe(defaultCheckpointKey("ws-9"));
     expect(config.sandboxCliPath).toBe("/usr/local/gcp/bin/sandbox");
     expect(config.allowEgress).toBe(true);
+    // Issue #47: production default is the absolute v2 origin.
+    expect(config.instancesApiBaseUrl).toBe("https://run.googleapis.com/v2");
     // Issue #21 LLM defaults: OpenRouter route, env-name credential ref, verified model.
     expect(config.llmBaseUrl).toBe("https://openrouter.ai/api/v1");
     expect(config.llmApiKeyEnv).toBe("OPENROUTER_API_KEY");
@@ -79,5 +81,24 @@ describe("readAgentHostConfig", () => {
     expect(() =>
       readAgentHostConfig({ ...validEnv, LLM_APPROVAL_POLICY: "sometimes" }),
     ).toThrow(/invalid LLM_APPROVAL_POLICY/);
+  });
+
+  test("INSTANCES_API_BASE_URL defaults to production, honors overrides, rejects relative (issue #47)", () => {
+    expect(readAgentHostConfig(validEnv).instancesApiBaseUrl).toBe(
+      "https://run.googleapis.com/v2",
+    );
+    expect(
+      readAgentHostConfig({ ...validEnv, INSTANCES_API_BASE_URL: "http://localhost:8080/v2" })
+        .instancesApiBaseUrl,
+    ).toBe("http://localhost:8080/v2");
+    expect(
+      readAgentHostConfig({ ...validEnv, INSTANCES_API_BASE_URL: "   " }).instancesApiBaseUrl,
+    ).toBe("https://run.googleapis.com/v2");
+    expect(() =>
+      readAgentHostConfig({
+        ...validEnv,
+        INSTANCES_API_BASE_URL: "projects/proj/locations/us-central1",
+      }),
+    ).toThrow(/invalid INSTANCES_API_BASE_URL/);
   });
 });

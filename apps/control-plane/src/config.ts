@@ -17,6 +17,15 @@
 
 export const DEFAULT_PORT = 8080;
 
+/**
+ * Default Cloud Run Instances API origin + version (issue #47). Overridable
+ * via `INSTANCES_API_BASE_URL` for tests and emulators. Kept in sync with
+ * `DEFAULT_INSTANCES_API_BASE_URL` in
+ * `@cloud-run-dsh/cloud-run-instance-client` (same literal; config.ts stays
+ * dependency-free).
+ */
+export const DEFAULT_INSTANCES_API_BASE_URL = "https://run.googleapis.com/v2";
+
 const REQUIRED_ENV_KEYS = [
   "DATABASE_URL",
   "GCP_PROJECT_ID",
@@ -48,10 +57,17 @@ export interface ControlPlaneConfig {
   readonly port: number;
   /** Cloud SQL (production) / docker compose Postgres (local) connection string. */
   readonly databaseUrl: string;
-  /** GCP project hosting the Cloud Run Instances (basePath `projects/<id>/locations/<region>`). */
+  /** GCP project hosting the Cloud Run Instances (absolute basePath `https://run.googleapis.com/v2/projects/<id>/locations/<region>` — issue #47). */
   readonly gcpProjectId: string;
   /** GCP region for every Instance the control plane creates. */
   readonly gcpRegion: string;
+  /**
+   * Cloud Run Instances API origin + version (issue #47). Defaults to
+   * `https://run.googleapis.com/v2`; set `INSTANCES_API_BASE_URL` to point at
+   * an emulator in tests (e.g. `http://localhost:8080/v2`). Combined with
+   * `gcpProjectId`/`gcpRegion` into the client's absolute `basePath`.
+   */
+  readonly instancesApiBaseUrl: string;
   /** Agent-host container image for created Instances (v2 `containers[].image`). */
   readonly agentHostImage: string;
   /** Service account the created Instances run as (v2 top-level `serviceAccount`). */
@@ -116,6 +132,7 @@ export function readControlPlaneConfig(
     databaseUrl: env["DATABASE_URL"]!.trim(),
     gcpProjectId: env["GCP_PROJECT_ID"]!.trim(),
     gcpRegion: env["GCP_REGION"]!.trim(),
+    instancesApiBaseUrl: readInstancesApiBaseUrl(env),
     agentHostImage: env["AGENT_HOST_IMAGE"]!.trim(),
     agentHostServiceAccount: env["AGENT_HOST_SERVICE_ACCOUNT"]!.trim(),
     checkpointBucket: env["CHECKPOINT_BUCKET"]!.trim(),
@@ -128,6 +145,32 @@ export function readControlPlaneConfig(
     openrouterApiKey: env["OPENROUTER_API_KEY"]!.trim(),
     ...readLlmOverrides(env),
   };
+}
+
+/**
+ * Instances API origin + version (issue #47). Blank/unset means the
+ * production default. A non-absolute value fails here, at control-plane boot,
+ * instead of failing the first open() inside fetch() with "URL is invalid".
+ */
+function readInstancesApiBaseUrl(
+  env: Readonly<Record<string, string | undefined>>,
+): string {
+  const raw = env["INSTANCES_API_BASE_URL"]?.trim();
+  if (raw === undefined || raw === "") return DEFAULT_INSTANCES_API_BASE_URL;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(
+      `invalid INSTANCES_API_BASE_URL: ${JSON.stringify(raw)} (want an absolute http(s) URL like ${DEFAULT_INSTANCES_API_BASE_URL})`,
+    );
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(
+      `invalid INSTANCES_API_BASE_URL: ${JSON.stringify(raw)} (want an absolute http(s) URL like ${DEFAULT_INSTANCES_API_BASE_URL})`,
+    );
+  }
+  return raw;
 }
 
 /**
