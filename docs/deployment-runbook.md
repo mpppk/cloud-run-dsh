@@ -167,6 +167,12 @@ echo -n "$GITHUB_APP_PEM" | gcloud secrets versions add github-app-private-key -
 echo -n "$LLM_KEY"        | gcloud secrets versions add llm-api-key        --data-file=-
 ```
 
+`$LLM_KEY` is the **OpenRouter** API key (`sk-or-v1-…`, from https://openrouter.ai/keys).
+The agent-host turn (issue #21) calls OpenRouter's OpenAI-compatible
+endpoint with it; how the secret reaches the container is described in
+Step 5.1 (LLM settings below). Terraform only provisions the container
+(`infra/terraform/secrets.tf`) — no Terraform change is needed for #21.
+
 ### 2.5 Record the outputs
 
 ```bash
@@ -259,7 +265,31 @@ Baseline configuration (仕様書 §22 / 実装手順書 §6): `cpu: 4`, `memory
 | 12 | `GCP_PROJECT_ID` | `$PROJECT_ID`. |
 | 13 | `GCP_REGION` | `$REGION`. |
 
-Optional (not required, have defaults in `config.ts`): `PORT` (8080), `WORKSPACE_ROOT` (`/workspace`), `CHECKPOINT_KEY`, `SANDBOX_CLI_PATH`, `SANDBOX_ALLOW_EGRESS`.
+Optional (not required, have defaults in `config.ts`): `PORT` (8080), `WORKSPACE_ROOT` (`/workspace`), `CHECKPOINT_KEY`, `SANDBOX_CLI_PATH`, `SANDBOX_ALLOW_EGRESS`, plus the LLM settings below.
+
+#### 5.1.1 Agent-host LLM settings (issue #21)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible chat-completions endpoint base (`/chat/completions` is appended by the adapter). |
+| `LLM_API_KEY_ENV` | `OPENROUTER_API_KEY` | **Name** of the env var holding the key — the value itself never appears in config (same rule as the adapter's `apiKeyEnv`: a literal key is not a configuration value). The adapter resolves it per request from the process environment. |
+| `LLM_MODEL` | `deepseek/deepseek-v4-flash` | Wire model id. Verified against the public OpenRouter catalog: advertises `tools`, 1M context, cheapest DeepSeek-family tool-calling model; DeepSeek-native minimizes the risk of OpenRouter rejecting DeepSeek-specific request fields. Override per deployment. |
+| `LLM_APPROVAL_POLICY` | `ask` | Default approval policy for sessions without an override (`ask` pends tool-escalation asks for an HTTP `/approvals` decision; `never` auto-rejects — the headless/CI stance). |
+
+Injection: at instance-create time, resolve the secret into the container env
+inside the same 0600 temp-file body as `DATABASE_URL` (secret hygiene as above —
+never argv/history):
+
+```bash
+export LLM_KEY_FROM_SM="$(gcloud secrets versions access latest --secret=llm-api-key)"
+# ... inside the "env" array of $BODY:
+      { "name": "OPENROUTER_API_KEY", "value": "${LLM_KEY_FROM_SM}" }
+```
+
+(A `MissingRequiredEnvError` crash mentions only the 13 required keys; a
+missing `OPENROUTER_API_KEY` does NOT crash boot — the key is resolved per
+LLM request, so turns fail with `MISSING_CREDENTIAL` while health checks
+stay green. Check the turn logs, not the boot logs, for key problems.)
 
 ### 5.2 Via REST (canonical while Pre-GA)
 
