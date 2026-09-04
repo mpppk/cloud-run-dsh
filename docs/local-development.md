@@ -193,8 +193,11 @@ primitives that do not exist on a dev machine:
   `/usr/local/gcp/bin/sandbox`) is provided **by Cloud Run** and cannot be
   installed or faked locally. Do not fabricate a shim and present it as
   working — the harness would immediately diverge from the platform.
-- **GCS checkpoints.** `FetchGcsClient` + `envGcsTokenProvider` require real
-  Application Default Credentials and a real `CHECKPOINT_BUCKET`.
+- **GCS checkpoints.** `FetchGcsClient` + `createGcsTokenProvider`
+  (`apps/agent-host/src/adapters.ts`) resolve tokens as
+  metadata server → ADC (`gcloud auth application-default login`) →
+  `GCP_ACCESS_TOKEN`, so a real `CHECKPOINT_BUCKET` works wherever any one
+  of those sources exists. Tokens are cached until 60s before expiry.
 - **GitHub App token exchange.** The credential broker needs a real
   `GITHUB_APP_PRIVATE_KEY_PEM` for the configured `GITHUB_APP_ID`; there is
   no local stand-in.
