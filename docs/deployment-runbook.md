@@ -10,7 +10,7 @@
 > | Cloud Run Instance (4 vCPU / 8 GiB, Pre-GA) | per-second billing while the instance is **running**; cheap only when stopped | instance stopped/deleted |
 > | GCS checkpoint bucket | negligible at MVP scale | bucket deleted |
 > | Artifact Registry | negligible (one image) | repository deleted |
-> | NAT/none — Cloud SQL is private-IP only; no Cloud NAT is provisioned by the baseline | — | — |
+> | VPC/none — the baseline provisions no Cloud NAT and no VPC connector. Cloud Run Instances have **no VPC connectivity at all** (`vpcAccess.networkInterfaces` is silently dropped, `vpcAccess.connector` is rejected with "not supported on resources of kind 'instance'"); they reach Cloud SQL through the native `cloudSqlInstance` volume, which dials the instance's **public IPv4** (see Step 5) | — | — |
 >
 > **If you stop working mid-runbook, jump to [Step 8 — Teardown](#step-8--teardown-stop-paying) and run `terraform destroy`.** Cloud SQL keeps billing even if nothing connects to it. The Cloud Run Instance keeps billing while it is `RUNNING`; `stop` it when idle (the control plane's idle manager normally does this for you, but a manually created PoC instance has no idle manager watching it).
 
@@ -20,7 +20,7 @@ Scope of the Terraform baseline (what you are about to create):
 
 - 11 APIs enabled (`cloudresourcemanager`, `iam`, `run`, `sqladmin`, `secretmanager`, `artifactregistry`, `storage`, `iap`, `logging`, `monitoring`, `servicenetworking`) — `apis.tf`
 - Artifact Registry Docker repository `agent-host` — `artifact_registry.tf`
-- Cloud SQL PostgreSQL 16, **private IP only** (own VPC + Service Networking peering), database `dsh`, user `dsh_app` — `cloudsql.tf`
+- Cloud SQL PostgreSQL 16 with a private IP (own VPC + Service Networking peering) **plus a public IPv4** (`db_enable_public_ip = true`) — Cloud Run Instances have no VPC connectivity, so the native `cloudSqlInstance` volume path dials the public address (see Step 5); `authorized_networks` stays empty (IAM + short-lived client certificate do the authorization), database `dsh`, user `dsh_app` — `cloudsql.tf`
 - GCS checkpoint bucket (uniform access, versioning, ARCHIVED-object 30-day lifecycle) — `storage.tf`
 - Three service accounts (agent-host, control-plane, and the `ai-agent` operator identity) with least-privilege bindings — `iam.tf`. The `ai-agent` operator identity and its gcloud impersonation setup are documented separately in [`gcp-ai-agent-impersonation.md`](gcp-ai-agent-impersonation.md).
 - Secret Manager placeholders: `github-app-private-key`, `llm-api-key`, `db-password` (no values in code) — `secrets.tf`
@@ -190,7 +190,7 @@ The image never contains secrets — configuration is injected via environment a
 
 ## Step 4 — Apply migrations to Cloud SQL
 
-Cloud SQL is **private IP only** (`ipv4_enabled = false`), so your workstation cannot reach it directly. Use the Cloud SQL Auth Proxy from your workstation:
+Cloud SQL carries a private IP (own VPC + Service Networking peering), but `authorized_networks` is deliberately left **empty**: a Cloud Run Instance egresses from Google's shared address pool, so any allowlist wide enough to admit it is effectively 0.0.0.0/0. Authorization is IAM (`roles/cloudsql.client`) plus an ephemeral client certificate, never a source IP — a plain TCP connect from an unlisted host does not open. Use the Cloud SQL Auth Proxy from your workstation (it dials the instance's **public IPv4**, so the instance must have been created with `db_enable_public_ip = true`; without it the proxy fails with `SFEClient is nil` / `refresh failed: context deadline exceeded`):
 
 ```bash
 # Install: https://cloud.google.com/sql/docs/mysql/sql-proxy (curl the binary or brew install cloud-sql-proxy)
@@ -233,7 +233,7 @@ Baseline configuration (仕様書 §22 / 実装手順書 §6): `cpu: 4`, `memory
 |---|---|---|
 | 1 | `WORKSPACE_ID` | The workspace the instance serves (the control plane passes the workspace UUID created in Step 7). |
 | 2 | `CHECKPOINT_BUCKET` | Terraform output `checkpoint_bucket_name`. |
-| 3 | `DATABASE_URL` | `postgresql://dsh_app:<db-password>@<private-ip>:5432/dsh` — password from Secret Manager `db-password` (Step 4). |
+| 3 | `DATABASE_URL` | `postgresql://dsh_app:<db-password>@/dsh?host=/cloudsql/<sql_connection_name>` — the Instance reaches Cloud SQL through its `cloudSqlInstance` volume mounted at `/cloudsql` (no Auth Proxy sidecar, no VPC connector; only the runtime SA needs `roles/cloudsql.client`, and the instance must have a public IPv4 — see Step 5.2). Password from Secret Manager `db-password` (Step 4). |
 | 4 | `GITHUB_APP_ID` | Your GitHub App settings page. |
 | 5 | `GITHUB_APP_PRIVATE_KEY_PEM` | The GitHub App private key PEM (multi-line — keep the file-based env mechanism below). |
 | 6 | `REPOSITORY_OWNER` | Same repo owner you created the workspace with (Step 7). |
@@ -267,10 +267,11 @@ cat > "$BODY" <<EOF
     "resources": { "limits": { "cpu": "4", "memory": "8Gi" } },
     "ports": [{ "containerPort": 8080 }],
     "sandboxLauncher": true,
+    "volumeMounts": [{ "name": "cloudsql", "mountPath": "/cloudsql" }],
     "env": [
       { "name": "WORKSPACE_ID",  "value": "<workspace-id, e.g. the UUID from Step 7>" },
       { "name": "CHECKPOINT_BUCKET", "value": "${BUCKET}" },
-      { "name": "DATABASE_URL",  "value": "postgresql://dsh_app:${DB_PASSWORD}@<cloudsql-private-ip>:5432/dsh" },
+      { "name": "DATABASE_URL",  "value": "postgresql://dsh_app:${DB_PASSWORD}@/dsh?host=/cloudsql/${SQL_CONNECTION}" },
       { "name": "GITHUB_APP_ID", "value": "<github-app-id>" },
       { "name": "GITHUB_APP_PRIVATE_KEY_PEM", "value": "<pem, with \n escapes>" },
       { "name": "REPOSITORY_OWNER", "value": "<repo-owner>" },
@@ -283,6 +284,7 @@ cat > "$BODY" <<EOF
       { "name": "GCP_REGION", "value": "${REGION}" }
     ]
   }],
+  "volumes": [{ "name": "cloudsql", "cloudSqlInstance": "${SQL_CONNECTION}" }],
   "serviceAccount": "${SA_EMAIL}",
   "restartPolicy": "ON_FAILURE"
 }
@@ -308,7 +310,7 @@ curl -X POST \
 
 > 🚨 **`restartPolicy` must stay `"ON_FAILURE"`** — never `ALWAYS` (see the warning above / 仕様書 §23).
 
-Exact field names for sandbox launcher, instance-level settings, and the DATABASE_URL scheme for private-IP Cloud SQL are Preview surface — **verify against the current v2 REST reference before running**, and prefer the SDK's typed client (`packages/cloud-run-instance-client`) as the source of truth for the shape the control plane actually sends.
+Exact field names for sandbox launcher, instance-level settings, and the `DATABASE_URL` socket scheme are Preview surface — **verify against the current v2 REST reference before running**, and prefer the SDK's typed client (`packages/cloud-run-instance-client`) as the source of truth for the shape the control plane actually sends. Connectivity facts measured against this project on 2026-09-03: the `cloudSqlInstance` volume is the **only** working path to Cloud SQL from an Instance (no VPC connector possible, no proxy sidecar needed), it dials the instance's public address so `ipv4_enabled` must be true, and the runtime SA needs only `roles/cloudsql.client`.
 
 The v2 `GoogleCloudRunV2Instance` shape (verified against the live discovery document on 2026-09-03) differs from the Services/Revisions shape this runbook previously showed:
 

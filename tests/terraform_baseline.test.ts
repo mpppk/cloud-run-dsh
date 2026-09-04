@@ -112,6 +112,16 @@ describe("content checks", () => {
     expect(tfContents["variables.tf"]).toMatch(
       /variable "db_enable_public_ip"[\s\S]*?default\s*=\s*false/,
     );
+    // The edition MUST be explicitly wired to var.db_edition with an
+    // ENTERPRISE default. Left implicit the API picks ENTERPRISE_PLUS and
+    // rejects db-custom-* / db-f1-micro tiers with "Invalid Tier ... for
+    // (ENTERPRISE_PLUS) Edition" — a 400 that only surfaces at apply time,
+    // while terraform validate stays green. Anchor the assignment itself
+    // (`^\s*` cannot match a `#` comment line), never the comment text.
+    expect(c).toMatch(/^\s*edition\s*=\s*var\.db_edition\s*$/m);
+    expect(tfContents["variables.tf"]).toMatch(
+      /variable "db_edition"[\s\S]*?default\s*=\s*"ENTERPRISE"/,
+    );
     // Conditional bootstrap: data source has count and var.db_password handling
     expect(c).toMatch(/count\s*=\s*var\.db_password/);
     expect(tfContents["variables.tf"]).toMatch(/variable "db_password"/);

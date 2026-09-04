@@ -91,6 +91,9 @@ terraform -chdir=infra/terraform apply -var-file=profiles/minimal.tfvars
   (`db_backup_enabled = true`) に戻す。
 - なお `terraform destroy` 自体はバックアップ無効でも動作に影響しない。
 
+<!-- Explicit anchor: profiles/minimal.tfvars links to cost.md#teardown, and the
+     heading slug ("teardown--課金を止めるまでの手順") does not match it. -->
+<a id="teardown"></a>
 ## Teardown — 課金を止めるまでの手順
 
 > **🚨 `terraform destroy` が失敗したまま放置すると課金は止まらない。**
