@@ -5,7 +5,11 @@
 # so git/bash/tar/gzip are NOT needed here.
 #
 # Build from the repository root:
-#   docker build -f apps/control-plane/Dockerfile -t control-plane .
+#   docker build --platform linux/amd64 -f apps/control-plane/Dockerfile -t control-plane .
+#
+# `--platform linux/amd64` is REQUIRED for every image destined for GCP:
+# Cloud Run executes linux/amd64 only, and a native build on Apple Silicon
+# produces a linux/arm64 image that Cloud Run cannot run.
 #
 # Runtime configuration (injected via environment by Cloud Run — no secrets
 # are baked into the image):
@@ -31,12 +35,23 @@ COPY packages/workspace-checkpoint/package.json packages/workspace-checkpoint/pa
 COPY packages/workspace-runtime/package.json packages/workspace-runtime/package.json
 RUN bun install --frozen-lockfile
 
-# --- build: typecheck the workspace ------------------------------------------
+# --- build: assemble the workspace -------------------------------------------
+#
+# Typechecking deliberately does NOT run here. It runs in CI instead
+# (.github/workflows/ci.yml) and locally via `bunx tsc --build`. Re-running it
+# during packaging buys nothing and makes the image unbuildable on a
+# cross-architecture host: under qemu
+# (arm64 host -> linux/amd64 image) `bun run typecheck` dies immediately with
+#   ASSERTION FAILED: MemoryExhaustion ... JSC::LocalAllocator::allocateSlowCase
+#   panic(main thread): abort() called   (Bun v1.4.0, exit code 134)
+# (apps/agent-host/Dockerfile got the same treatment for the same reason.)
+# Cloud Run only runs linux/amd64, so every image destined for GCP must be
+# built with `--platform linux/amd64`; keeping the typecheck here would force
+# that build onto a native amd64 machine for no packaging benefit.
 FROM deps AS build
 COPY tsconfig.json tsconfig.base.json ./
 COPY apps ./apps
 COPY packages ./packages
-RUN bun run typecheck
 
 # --- runtime -----------------------------------------------------------------
 FROM oven/bun:1-slim AS runtime

@@ -21,7 +21,11 @@ baked into the image — everything is injected via environment at runtime.
 
 ```sh
 # from the repository root
-docker build -f apps/control-plane/Dockerfile -t control-plane .
+# --platform linux/amd64 is REQUIRED for any image destined for Cloud Run
+# (Cloud Run executes linux/amd64 only; a native build on Apple Silicon
+# produces linux/arm64). Typechecking is not part of the image build — it
+# runs in CI and via `bunx tsc --build` (see the Dockerfile build-stage note).
+docker build --platform linux/amd64 -f apps/control-plane/Dockerfile -t control-plane .
 
 # dependencies: Postgres + schema
 docker compose up -d postgres        # wait for healthy

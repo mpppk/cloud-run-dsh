@@ -14,6 +14,7 @@
 // Run with: bun run apps/control-plane/src/main.ts (see apps/control-plane/README.md)
 
 import { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
+import { createLogger } from "@cloud-run-dsh/observability";
 import { PostgresSessionPersistenceRepository } from "@cloud-run-dsh/session-persistence-postgres";
 import { createControlPlaneDeps, startControlPlane, SystemClock } from "./index.js";
 import { readControlPlaneConfig } from "./config.js";
@@ -26,6 +27,9 @@ import {
 
 async function main(): Promise<void> {
   const config = readControlPlaneConfig();
+  // Structured JSON logging via @cloud-run-dsh/observability, same as the
+  // agent-host composition root.
+  const logger = createLogger();
 
   const executor = await BunSqlQueryExecutor.connect(config.databaseUrl);
   const deps = createControlPlaneDeps({
@@ -50,17 +54,21 @@ async function main(): Promise<void> {
   });
 
   // Startup WARN so an operator reading container logs sees immediately that
-  // runtime operations are unavailable in this image.
-  console.warn(
-    `[control-plane] WARN: runtime operations are unavailable: RuntimeRegistry is a placeholder ` +
-      `(RuntimeNotWiredError on open/stop/checkpoint; P11a wires the full T8 composition)`,
+  // runtime operations are unavailable in this image. NOTE: the error class
+  // name is spelled "RuntimeNotWired" here because the observability redactor
+  // replaces 20+ char high-entropy tokens with [REDACTED], which would corrupt
+  // the full class name "RuntimeNotWiredError" in the log line.
+  logger.warn(
+    "runtime operations are unavailable: RuntimeRegistry is a placeholder " +
+      "(open/stop/checkpoint fail with 503 RuntimeNotWired; P11a wires the " +
+      "full T8 composition)",
   );
 
   const server = startControlPlane(deps, config.port);
-  console.log(`[control-plane] listening on 0.0.0.0:${server.port} (DATABASE_URL configured)`);
+  logger.info(`listening on 0.0.0.0:${server.port} (DATABASE_URL configured)`);
 
   const shutdown = (signal: string): void => {
-    console.log(`[control-plane] ${signal} received; shutting down`);
+    logger.info(`${signal} received; shutting down`);
     server.stop();
     void executor.close().finally(() => process.exit(0));
   };

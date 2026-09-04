@@ -335,7 +335,12 @@ export CP_SA_EMAIL="$(terraform -chdir=infra/terraform output -raw control_plane
 export CP_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-host/control-plane:v1"
 
 # (build the control-plane image analogously to Step 3:)
-#   docker build -f apps/control-plane/Dockerfile -t "$CP_IMAGE" .
+#   docker build --platform linux/amd64 -f apps/control-plane/Dockerfile -t "$CP_IMAGE" .
+#  (--platform linux/amd64 is REQUIRED: Cloud Run executes linux/amd64 only,
+#   and a native build on Apple Silicon yields linux/arm64. The image build
+#   does NOT run the typecheck — `bun run typecheck` aborts under qemu on a
+#   cross-architecture host — type safety is enforced by CI and
+#   `bunx tsc --build` instead.)
 #  (the production entrypoint is apps/control-plane/src/main.ts; it requires
 #   DATABASE_URL, respects PORT, and serves /healthz + /readyz — see
 #   apps/control-plane/README.md. NOTE: until P11a the runtime registry is a
