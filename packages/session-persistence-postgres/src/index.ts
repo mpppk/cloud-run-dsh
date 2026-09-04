@@ -2,12 +2,15 @@
 export type { Workspace, Session, SessionEvent, NewSessionEvent, CreateWorkspaceInput, CreateSessionInput, UpdateWorkspacePatch, WorkspaceRuntimeState } from "./types.js";
 export type { QueryExecutor, ClosableExecutor } from "./executor.js";
 export {
+  BUN_SQL_ENV_URL_KEYS,
   BunSqlConnectionError,
   DatabaseUrlParseError,
+  createBunSqlClient,
   describeConnectionTarget,
   isSocketTarget,
   resolveBunSqlTarget,
   toBunSqlConnectionError,
+  withIsolatedBunSqlEnv,
 } from "./connection.js";
 export type { BunSqlConnectionTarget, BunSqlSocketOptions } from "./connection.js";
 export { PostgresSessionPersistenceRepository, type SessionPersistenceRepository } from "./repository.js";

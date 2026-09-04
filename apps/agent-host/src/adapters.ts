@@ -35,6 +35,7 @@ import type { Logger } from "@cloud-run-dsh/observability";
 import type { QueryExecutor as SessionQueryExecutor } from "@cloud-run-dsh/session-persistence-postgres";
 import { PostgresSessionPersistenceRepository } from "@cloud-run-dsh/session-persistence-postgres";
 import {
+  createBunSqlClient,
   resolveBunSqlTarget,
   toBunSqlConnectionError,
 } from "@cloud-run-dsh/session-persistence-postgres";
@@ -657,7 +658,10 @@ export class BunSqlQueryExecutor implements SessionQueryExecutor {
    * socket-form values (`?host=/cloudsql/<conn>`) become the `{ path,
    * username, password, database }` options object Bun.SQL requires, while
    * TCP URLs pass through unchanged. `new SQL()` throws are re-wrapped so
-   * the password never reaches the exception (issue #42).
+   * the password never reaches the exception (issue #42). Construction goes
+   * through the shared `createBunSqlClient()` so ambient `*_URL` variables
+   * (notably production's `DATABASE_URL`) cannot make the options object
+   * throw `ERR_INVALID_URL` (issue #45).
    *
    * The optional `sqlCtor` is a test seam for asserting the resolved target
    * without opening a real connection.
@@ -671,7 +675,7 @@ export class BunSqlQueryExecutor implements SessionQueryExecutor {
       sqlCtor ??
       (await import("bun") as unknown as { SQL: SqlClientCtor }).SQL;
     try {
-      return new BunSqlQueryExecutor(new Ctor(target));
+      return new BunSqlQueryExecutor(createBunSqlClient(target, Ctor));
     } catch (e) {
       throw toBunSqlConnectionError(e, target);
     }

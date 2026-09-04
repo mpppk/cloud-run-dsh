@@ -317,3 +317,103 @@ export function toBunSqlConnectionError(err: unknown, target: BunSqlConnectionTa
     code,
   );
 }
+
+// ---------------------------------------------------------------------------
+// Bun.SQL environment isolation (issue #45).
+//
+// BACKGROUND: `new SQL(optionsObject)` still reads connection URLs from the
+// process environment FIRST. In `parseConnectionDetailsFromOptionsOrEnvironment`
+// (`src/js/internal/sql/shared.ts`) an options-object call resolves its URL
+// via `getConnectionDetailsFromEnvironment(options.adapter)`; with no explicit
+// `adapter` (our socket form never sets one) that means "every known URL key".
+// An unparseable value — notably the Cloud SQL socket DSN from #42, which is
+// exactly what Cloud Run injects as `DATABASE_URL` in production — throws
+// `ERR_INVALID_URL` before the explicit `{ path, username, password,
+// database }` options are even considered. Local tests never set
+// `DATABASE_URL`, so the bug only surfaced in production.
+//
+// FIX: delete the URL-discovery keys for the duration of the synchronous
+// `new SQL()` call and restore them in `finally`. Callers MUST construct via
+// `createBunSqlClient()` below so the key list stays in one place.
+//
+// KEY LIST (verified against oven-sh/bun tags `bun-v1.4.0` AND `bun-v1.4.1`,
+// `getConnectionDetailsFromEnvironment` — identical in both; the duplicate
+// `PGURL` in Bun's own `POSTGRES_URL || PGURL || PG_URL || PGURL` chain is
+// listed once here):
+//   generic:  DATABASE_URL, DATABASEURL, TLS_DATABASE_URL
+//   postgres: POSTGRES_URL, PGURL, PG_URL, TLS_POSTGRES_DATABASE_URL
+//   mysql:    MYSQL_URL, MYSQLURL, TLS_MYSQL_DATABASE_URL
+//   mariadb:  MARIADB_URL, MARIADBURL, TLS_MARIADB_DATABASE_URL
+//   sqlite:   SQLITE_URL, SQLITEURL
+// Per-field keys (PGHOST, PGUSER, PGPASSWORD, PGDATABASE, PGSSLMODE, ...)
+// are deliberately NOT cleared: explicit options already outrank them, they
+// cannot throw `ERR_INVALID_URL`, and our socket form passes
+// username/password/database explicitly (hostname falls back to localhost and
+// is ignored by the native driver whenever `path` is set).
+// Likewise `POSTGRES_CONNECTION_STRING` / `DATABASE_URL_UNPOOLED` (seen in
+// the issue's "delete everything" experiment) are NOT read by Bun 1.4.0/1.4.1
+// and are therefore NOT listed — clearing them would only hide the true set.
+// ---------------------------------------------------------------------------
+
+/**
+ * Every environment key Bun.SQL 1.4.0/1.4.1 consults for URL discovery.
+ * Keep in sync with `getConnectionDetailsFromEnvironment` if Bun is upgraded.
+ */
+export const BUN_SQL_ENV_URL_KEYS = [
+  "DATABASE_URL",
+  "DATABASEURL",
+  "TLS_DATABASE_URL",
+  "POSTGRES_URL",
+  "PGURL",
+  "PG_URL",
+  "TLS_POSTGRES_DATABASE_URL",
+  "MYSQL_URL",
+  "MYSQLURL",
+  "TLS_MYSQL_DATABASE_URL",
+  "MARIADB_URL",
+  "MARIADBURL",
+  "TLS_MARIADB_DATABASE_URL",
+  "SQLITE_URL",
+  "SQLITEURL",
+] as const;
+
+/**
+ * Runs `fn` with Bun.SQL's URL-discovery environment keys hidden.
+ * The function MUST be synchronous (the `new SQL()` constructor is): an
+ * async callback could outlive the `finally` restore and observe either the
+ * stripped or the restored environment depending on timing.
+ * Restoration is exact — keys present before are restored byte-identical,
+ * keys absent before are absent after (even if `fn` created them), and a
+ * throw inside `fn` still restores via `finally`.
+ */
+export function withIsolatedBunSqlEnv<T>(fn: () => T): T {
+  const saved = new Map<string, string | undefined>();
+  for (const key of BUN_SQL_ENV_URL_KEYS) {
+    saved.set(key, process.env[key]);
+    delete process.env[key];
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
+/**
+ * Constructs a Bun.SQL-compatible client with the environment isolated.
+ * This is the ONLY approved way to call `new SQL(target)`: it guarantees
+ * the explicit `target` (socket options object or TCP string) cannot be
+ * overridden, polluted, or rejected because of ambient `*_URL` variables.
+ */
+export function createBunSqlClient<TClient>(
+  target: BunSqlConnectionTarget,
+  ctor: new (target: BunSqlConnectionTarget) => TClient,
+): TClient {
+  return withIsolatedBunSqlEnv(() => new ctor(target));
+}
