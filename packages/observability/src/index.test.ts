@@ -155,21 +155,64 @@ describe("observability", () => {
     expect(out2["myToken"]).toBe("[REDACTED]");
   });
 
-  test("redacts high-entropy generic tokens and avoids false positives", () => {
-    // High-entropy 32-char mixed-case + digits token should be redacted (spec 26 item 12)
-    const highEntropy = "xK9mPq3vT8rY2nZ5bJ7hL0cF4dW6aG1sE2qXyZ";
-    const out = redactValue(`token is ${highEntropy} here`) as string;
-    expect(out).toContain("[REDACTED]");
-    expect(out).not.toContain(highEntropy);
-
-    // Also via logger: high-entropy token in any log value is redacted
+  test("i29: 20+ char technical identifiers are NOT redacted", () => {
+    // Repro for #29: RuntimeNotWiredError (20 chars) was redacted as [REDACTED]
+    expect(redactValue("RuntimeNotWiredError")).toBe("RuntimeNotWiredError");
+    expect(redactValue("Error: RuntimeNotWiredError: unavailable") as string).toContain(
+      "RuntimeNotWiredError",
+    );
+    // Other known-safe shapes: long PascalCase identifiers, snake_case event names
+    expect(redactValue("PascalCaseIdentifierExample")).toBe("PascalCaseIdentifierExample");
+    expect(redactValue("my_event_name_with_long_description")).toBe(
+      "my_event_name_with_long_description",
+    );
+    // 40-hex commit SHA: indistinguishable from random hex by shape alone, must survive
+    const sha = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b";
+    expect(redactValue(`commit ${sha} deployed`) as string).toContain(sha);
+    // Via the logger as well: structured identifier fields must stay readable
     const logger = new InMemoryLogger();
-    logger.info("sandbox.exec.completed", {
-      workspaceId: "ws-1",
-      sandboxId: highEntropy,
+    logger.error("runtime.unavailable", {
+      errorName: "RuntimeNotWiredError",
     } as unknown as LogFields);
-    const logged = logger.parsed[0] as Record<string, unknown>;
-    expect(logged["sandboxId"] as string).toBe("[REDACTED]");
+    expect((logger.parsed[0] as Record<string, unknown>)["errorName"]).toBe(
+      "RuntimeNotWiredError",
+    );
+  });
+
+  test("i29: real secrets are still redacted (position + specific shapes)", () => {
+    // Shape-specific: PEM / Bearer / connection strings in free text
+    const pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC...\n-----END PRIVATE KEY-----";
+    expect(redactValue(`key ${pem} end`) as string).toContain("[REDACTED]");
+    expect(
+      redactValue("Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.sig") as string,
+    ).toContain("[REDACTED]");
+    expect(redactValue("postgres://user:pass@host/db") as string).toContain("[REDACTED]");
+    // Well-known vendor prefix anywhere (aligns with dsh-subprocess-cloud-run layer)
+    expect(redactValue("key is sk-1234567890abcdefghij1234 ok") as string).toContain("[REDACTED]");
+    // Position-based: secret-like object keys redact the whole value, even short ones
+    const out = redactValue({
+      password: "hunter2",
+      apiKey: "sk-test-short",
+      normalField: "hello world",
+    }) as Record<string, unknown>;
+    expect(out["password"]).toBe("[REDACTED]");
+    expect(out["apiKey"]).toBe("[REDACTED]");
+    expect(out["normalField"]).toBe("hello world");
+    // Position-based in free text: KEY=VALUE assignments (short values shape-checks miss)
+    expect(redactValue("API_KEY=short") as string).not.toContain("short");
+    expect(redactValue("password: hunter2") as string).not.toContain("hunter2");
+  });
+  test("bare high-entropy tokens without secret context are NOT redacted (i29)", () => {
+    // #29: value-shape redaction could not tell random tokens apart from commit
+    // SHAs / PascalCase identifiers, so generic entropy redaction was removed.
+    // Secrets are redacted by marker-prefixed shape (PEM/Bearer/sk-/ghp_/DB URLs)
+    // or by position (secret-like keys, KEY=VALUE assignments) instead.
+    const bare = "xK9mPq3vT8rY2nZ5bJ7hL0cF4dW6aG1sE2qXyZ";
+    expect(redactValue(`token is ${bare} here`) as string).toContain(bare);
+
+    // ...but the same value under a secret-like key is still redacted
+    const out = redactValue({ apiKey: bare }) as Record<string, unknown>;
+    expect(out["apiKey"]).toBe("[REDACTED]");
 
     // Bounding: low-entropy 20-char repeated string must NOT be redacted (false positive check)
     const lowEntropy = "aaaaaaaaaaaaaaaaaaaa";

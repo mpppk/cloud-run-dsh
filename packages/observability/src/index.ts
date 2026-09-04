@@ -34,13 +34,20 @@ export interface LogFields {
 
 const REDACTED = "[REDACTED]";
 
-// Patterns for realistic secret shapes
+// Patterns for realistic secret shapes.
+// Only shapes with an unambiguous marker are matched anywhere in free text:
+// vendor prefixes (ghp_/ghs_/...), "Bearer" scheme, PEM armor, DB URL schemes,
+// OpenAI-style sk- keys. Bare high-entropy strings are deliberately NOT matched
+// here (see HIGH_ENTROPY_TOKEN_RE note below) — everything else is redacted by
+// position (isProbablySecretKey / SECRET_ASSIGNMENT_RE).
 const SECRET_PATTERNS: RegExp[] = [
   // GitHub tokens
   /ghs_[A-Za-z0-9_]{20,}/g,
   /ghu_[A-Za-z0-9_]{20,}/g,
   /github_pat_[A-Za-z0-9_]{20,}/g,
   /ghp_[A-Za-z0-9]{20,}/g,
+  // OpenAI-style API keys (same prefix as the dsh-subprocess-cloud-run layer)
+  /sk-[A-Za-z0-9]{20,}/g,
   // Generic token-like (Bearer, x-access-token, etc.)
   /Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi,
   /x-access-token:[^\s]+/gi,
@@ -49,61 +56,68 @@ const SECRET_PATTERNS: RegExp[] = [
   // Connection strings
   /postgres(?:ql)?:\/\/[^\s"']+/gi,
   /mysql:\/\/[^\s"']+/gi,
-  // Generic secret-ish env patterns: *_TOKEN, *_KEY, *_SECRET values (heuristic via surrounding text)
-  // We redact values that look like high-entropy tokens (>=20 chars base64-ish)
 ];
 
+/**
+ * KEY=VALUE / KEY:VALUE assignments whose key is a known secret name, matched
+ * in free text (e.g. `API_KEY=xyz`, `"password": "xyz"`). The key name is the
+ * position signal; the value is redacted regardless of shape or length, so
+ * short values that no entropy check could catch are still covered.
+ */
+const SECRET_ASSIGNMENT_RE =
+  /["']?(API[_-]?KEY|SECRET|TOKEN|PRIVATE[_-]?KEY|PASSWORD|PASSWD)["']?\s*[:=]\s*["']?[^\s"'`{},;\]]+/gi;
+
+/**
+ * @deprecated Kept only for backward-compatible imports. Since #29 this
+ * pattern is intentionally NOT applied by the redactor: matching bare
+ * `[A-Za-z0-9_-]{20,}` strings by value shape redacted legitimate 20+ char
+ * technical identifiers (`RuntimeNotWiredError`, long PascalCase names) and
+ * could not distinguish random tokens from commit SHAs. Redaction is now
+ * position-based (secret-like keys, KEY=VALUE assignments) plus
+ * marker-prefixed shapes (SECRET_PATTERNS).
+ */
 export const HIGH_ENTROPY_TOKEN_RE = /[A-Za-z0-9_\-]{20,}/g;
-
-function shannonEntropy(str: string): number {
-  const freq = new Map<string, number>();
-  for (const ch of str) freq.set(ch, (freq.get(ch) ?? 0) + 1);
-  let entropy = 0;
-  for (const count of freq.values()) {
-    const p = count / str.length;
-    entropy -= p * Math.log2(p);
-  }
-  return entropy;
-}
-
-function isHighEntropyToken(token: string): boolean {
-  if (token.length < 20) return false;
-  const hasLower = /[a-z]/.test(token);
-  const hasUpper = /[A-Z]/.test(token);
-  const hasDigit = /[0-9]/.test(token);
-  const classCount = [hasLower, hasUpper, hasDigit].filter(Boolean).length;
-  // Require at least 2 character classes to avoid redacting low-entropy words / repeated chars
-  if (classCount < 2) return false;
-  // Repeated-char strings like "aaaaaaaaaaaaaaaaaaaa" have entropy 0; random tokens > 3.5
-  return shannonEntropy(token) > 3.0;
-}
 
 function redactString(input: string): string {
   let out = input;
   for (const re of SECRET_PATTERNS) {
     out = out.replace(re, REDACTED);
   }
-  // High-entropy generic token redaction (spec 26 item 12: stdout/stderr secret redaction).
-  // Bounded by character-class + entropy check to avoid false positives on normal IDs/words.
-  out = out.replace(HIGH_ENTROPY_TOKEN_RE, (m) => (isHighEntropyToken(m) ? REDACTED : m));
+  // Position-based: redact the VALUE of KEY=VALUE assignments with known
+  // secret names, keeping the key for log readability.
+  out = out.replace(SECRET_ASSIGNMENT_RE, "$1=[REDACTED]");
   return out;
 }
 
 function isProbablySecretKey(key: string): boolean {
   const lower = key.toLowerCase();
-  return (
+  if (
     lower.includes("token") ||
     lower.includes("private_key") ||
     lower.includes("privatekey") ||
     lower.includes("secret") ||
     lower.includes("password") ||
     lower.includes("passwd") ||
-    lower === "authorization" ||
-    lower === "cookie" ||
+    lower.includes("authorization") ||
+    lower.includes("cookie") ||
+    lower.includes("credential") ||
+    lower.includes("api_key") ||
+    lower.includes("apikey") ||
+    lower.includes("api-key") ||
+    lower.includes("access_key") ||
+    lower.includes("accesskey") ||
+    lower.includes("access-key") ||
     lower.includes("connection_string") ||
     lower.includes("database_url") ||
     lower.includes("bearer")
-  );
+  ) {
+    return true;
+  }
+  // "key" as a standalone word (apiKey, my_key, access-key). A plain substring
+  // check would false-positive on "monkey"/"keyboard", so split the name into
+  // words on separators and camelCase boundaries first.
+  const words = key.split(/(?<=[a-z0-9])(?=[A-Z])|[_.\-\s]+/).map((w) => w.toLowerCase());
+  return words.includes("key") || words.includes("keys");
 }
 
 export function redactValue(value: unknown): unknown {
