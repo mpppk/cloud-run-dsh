@@ -103,7 +103,15 @@ describe("content checks", () => {
     expect(c).not.toMatch(/password\s*=\s*"/);
     expect(c).not.toMatch(/password\s*=\s*'/);
     expect(c).toMatch(/Private IP/);
-    expect(c).toMatch(/ipv4_enabled\s*=\s*false/);
+    // The public IPv4 is opt-in through a variable, never hardcoded on.
+    // Assert the wiring AND the safe default — matching a bare
+    // `ipv4_enabled = false` would also be satisfied by a comment, so anchor
+    // on the assignment itself.
+    expect(c).toMatch(/^\s*ipv4_enabled\s*=\s*var\.db_enable_public_ip\s*$/m);
+    expect(c).not.toMatch(/^\s*ipv4_enabled\s*=\s*true\s*$/m);
+    expect(tfContents["variables.tf"]).toMatch(
+      /variable "db_enable_public_ip"[\s\S]*?default\s*=\s*false/,
+    );
     // Conditional bootstrap: data source has count and var.db_password handling
     expect(c).toMatch(/count\s*=\s*var\.db_password/);
     expect(tfContents["variables.tf"]).toMatch(/variable "db_password"/);

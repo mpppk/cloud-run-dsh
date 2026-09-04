@@ -68,6 +68,8 @@ Least-privilege alternative (if your org forbids Owner): the Terraform apply in 
 
 Cloud Run Instances and Sandboxes are **Pre-GA**. You must have Preview access enabled on the project (allowlist/feature-flag as per Google's Preview enrollment) before Step 5 works. If `gcloud` or the REST API returns 404/403 on `instances`, the Preview is not enabled for that project — this is the most common early failure.
 
+The Instances CRUD surface exists in **Cloud Run API v2 only** (verified 2026-09-03): the v1 discovery document exposes only `getIamPolicy` / `setIamPolicy` / `testIamPermissions` under `projects.locations.instances`, and `GET https://run.googleapis.com/v1/projects/.../locations/.../instances` returns a plain HTML 404. All REST calls in this runbook therefore target `run.googleapis.com/v2/...`. `bun run preflight:gcp` probes the v2 list endpoint read-only and classifies 200 / 403 / 404 for you before you reach Step 5.
+
 ---
 
 ## Step 1 — Project and billing setup
@@ -114,6 +116,14 @@ terraform -chdir=infra/terraform plan
 ```
 
 `plan` fails without valid Application Default Credentials / `gcloud auth login` + `gcloud auth application-default login`. That is expected — authenticate first; do not try to work around it.
+
+> ⚠️ **Bootstrap APIs must exist before the FIRST apply.** The google provider itself depends on `cloudresourcemanager.googleapis.com` (it resolves project numbers / IAM during plan and apply). On a brand-new project the first apply would otherwise fail *while trying to enable that same API*. Enable the two bootstrap APIs **out-of-band, before the first `terraform apply`**:
+>
+> ```bash
+> gcloud services enable cloudresourcemanager.googleapis.com run.googleapis.com
+> ```
+>
+> `run.googleapis.com` is in the same boat in practice: the Cloud Run Instances Preview surface used in Step 5 was verified against a project where `run.googleapis.com` had been enabled manually before any Terraform ran. Terraform (`apis.tf`) declares both APIs, but the provider's *own* bootstrap dependency on `cloudresourcemanager` cannot be satisfied by Terraform itself — hence the manual pre-step.
 
 ### 2.3 The two-phase DB-password bootstrap (do NOT skip phase 1's `-var`)
 
@@ -202,10 +212,10 @@ Alternative for private-network environments: run the same command from a VM ins
 
 ## Step 5 — Create the Cloud Run Instance **outside Terraform** (Pre-GA ⚠️)
 
-> **This is the most fragile step in the runbook.** Cloud Run Instances have no Terraform resource (`run_instances.tf.example` is the standing TODO — do **not** fake it with `google_cloud_run_v2_service`, the Instance API is a different surface). The create/start/stop/delete REST paths and gcloud flags below are **Preview surface and can change without notice**. Per 仕様書 §29: **check the Cloud Run Instances Known Issues page and release notes before EVERY deploy** — a Preview API breaking change can invalidate this step (and the runtime adapter in `packages/cloud-run-instance-client`).
+> **This is the most fragile step in the runbook.** Cloud Run Instances have no Terraform resource (`run_instances.tf.example` is the standing TODO — do **not** fake it with `google_cloud_run_v2_service`, the Instance API is a different surface). The create/start/stop/delete REST paths and gcloud flags below are **Preview surface and can change without notice** (paths verified against v2 on 2026-09-03; re-verify before every deploy). Per 仕様書 §29: **check the Cloud Run Instances Known Issues page and release notes before EVERY deploy** — a Preview API breaking change can invalidate this step (and the runtime adapter in `packages/cloud-run-instance-client`).
 >
 > References to monitor before each deploy:
-> - REST reference: `https://cloud.google.com/run/docs/reference/rest/v1/projects.locations.instances`
+> - REST reference (**v2** — the Instances CRUD surface exists in v2 only; the v1 discovery exposes IAM methods only): `https://cloud.google.com/run/docs/reference/rest/v2/projects.locations.instances`
 > - Known Issues / release notes for Cloud Run Instances (Preview)
 > - `https://github.com/hashicorp/terraform-provider-google/issues` — for when a `google_cloud_run_instance` resource ships; once it does, promote `run_instances.tf.example` → `run_instances.tf` and delete this manual step.
 
@@ -252,44 +262,67 @@ umask 077
 BODY="$(mktemp)"; trap 'rm -f "$BODY"' EXIT
 cat > "$BODY" <<EOF
 {
-  "template": {
-    "containers": [{
-      "image": "${IMAGE}",
-      "resources": { "cpu": 4, "memory": "8Gi" },
-      "ports": [{ "containerPort": 8080 }],
-      "env": [
-        { "name": "WORKSPACE_ID",  "value": "<workspace-id, e.g. the UUID from Step 7>" },
-        { "name": "CHECKPOINT_BUCKET", "value": "${BUCKET}" },
-        { "name": "DATABASE_URL",  "value": "postgresql://dsh_app:${DB_PASSWORD}@<cloudsql-private-ip>:5432/dsh" },
-        { "name": "GITHUB_APP_ID", "value": "<github-app-id>" },
-        { "name": "GITHUB_APP_PRIVATE_KEY_PEM", "value": "<pem, with \n escapes>" },
-        { "name": "REPOSITORY_OWNER", "value": "<repo-owner>" },
-        { "name": "REPOSITORY_NAME", "value": "<repo-name>" },
-        { "name": "BASE_BRANCH", "value": "main" },
-        { "name": "CONTROLLER_ID", "value": "<controller-id>" },
-        { "name": "USER_ID", "value": "<internal-user-id>" },
-        { "name": "INSTANCE_NAME", "value": "dsh-ws-demo" },
-        { "name": "GCP_PROJECT_ID", "value": "${PROJECT_ID}" },
-        { "name": "GCP_REGION", "value": "${REGION}" }
-      ]
-    }],
-    "serviceAccount": "${SA_EMAIL}",
-    "restartPolicy": "ON_FAILURE"
-  },
-  "sandboxLauncher": true
+  "containers": [{
+    "image": "${IMAGE}",
+    "resources": { "limits": { "cpu": "4", "memory": "8Gi" } },
+    "ports": [{ "containerPort": 8080 }],
+    "sandboxLauncher": true,
+    "env": [
+      { "name": "WORKSPACE_ID",  "value": "<workspace-id, e.g. the UUID from Step 7>" },
+      { "name": "CHECKPOINT_BUCKET", "value": "${BUCKET}" },
+      { "name": "DATABASE_URL",  "value": "postgresql://dsh_app:${DB_PASSWORD}@<cloudsql-private-ip>:5432/dsh" },
+      { "name": "GITHUB_APP_ID", "value": "<github-app-id>" },
+      { "name": "GITHUB_APP_PRIVATE_KEY_PEM", "value": "<pem, with \n escapes>" },
+      { "name": "REPOSITORY_OWNER", "value": "<repo-owner>" },
+      { "name": "REPOSITORY_NAME", "value": "<repo-name>" },
+      { "name": "BASE_BRANCH", "value": "main" },
+      { "name": "CONTROLLER_ID", "value": "<controller-id>" },
+      { "name": "USER_ID", "value": "<internal-user-id>" },
+      { "name": "INSTANCE_NAME", "value": "dsh-ws-demo" },
+      { "name": "GCP_PROJECT_ID", "value": "${PROJECT_ID}" },
+      { "name": "GCP_REGION", "value": "${REGION}" }
+    ]
+  }],
+  "serviceAccount": "${SA_EMAIL}",
+  "restartPolicy": "ON_FAILURE"
 }
 EOF
 
+# (0) FREE DRY-RUN FIRST — validate the request without creating anything.
+#     v2 create accepts `validateOnly=true`: the request is validated and
+#     default values are filled in, but nothing is persisted and no resource
+#     is created (no billing). Expect HTTP 200 and an empty operation body.
 curl -X POST \
   -H "Authorization: Bearer $(gcloud auth print-access-token)" \
   -H "Content-Type: application/json" \
-  "https://run.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/instances?instanceId=dsh-ws-demo" \
+  "https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/instances?instanceId=dsh-ws-demo&validateOnly=true" \
+  --data @"$BODY"
+
+# (1) Real create (BILLABLE — the instance bills while RUNNING).
+curl -X POST \
+  -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  -H "Content-Type: application/json" \
+  "https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/instances?instanceId=dsh-ws-demo" \
   --data @"$BODY"
 ```
 
 > 🚨 **`restartPolicy` must stay `"ON_FAILURE"`** — never `ALWAYS` (see the warning above / 仕様書 §23).
 
-Exact field names for sandbox launcher, instance-level settings, and the DATABASE_URL scheme for private-IP Cloud SQL are Preview surface — **verify against the current REST reference before running**, and prefer the SDK's typed client (`packages/cloud-run-instance-client`) as the source of truth for the shape the control plane actually sends.
+Exact field names for sandbox launcher, instance-level settings, and the DATABASE_URL scheme for private-IP Cloud SQL are Preview surface — **verify against the current v2 REST reference before running**, and prefer the SDK's typed client (`packages/cloud-run-instance-client`) as the source of truth for the shape the control plane actually sends.
+
+The v2 `GoogleCloudRunV2Instance` shape (verified against the live discovery document on 2026-09-03) differs from the Services/Revisions shape this runbook previously showed:
+
+| v2 field (Instances) | Notes |
+|---|---|
+| `containers[]` | top-level — there is **no `template` wrapper** on Instances (that is the Services shape) |
+| `containers[].image` | **Required** |
+| `containers[].resources.limits.cpu` / `.memory` | limit **strings** (`"4"`, `"8Gi"`) — no top-level numeric `resources.cpu` |
+| `containers[].sandboxLauncher` | lives **on the container**, not the instance |
+| `containers[].ports[].containerPort` | array of port objects |
+| `restartPolicy` | top-level; API enum `ON_FAILURE` / `NEVER` / `ALWAYS` (never `ALWAYS`, see §23) |
+| `serviceAccount` | top-level instance field |
+| instance id | passed as the `?instanceId=` **query parameter**; the body `name` field is ignored in create |
+| readOnly fields | `name` (output), `createTime`, `uid`, `urls`, `terminalCondition`, etc. — never send these; the API rejects readOnly payloads |
 
 ### 5.3 Via gcloud (if your SDK version ships the Preview command group)
 
@@ -316,12 +349,12 @@ If `gcloud run instances` is rejected ("Invalid choice"), your SDK predates the 
 ```bash
 gcloud auth print-access-token | xargs -I{} curl -s \
   -H "Authorization: Bearer {}" \
-  "https://run.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/instances/dsh-ws-demo"
+  "https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/instances/dsh-ws-demo"
 
 # When done with a manual instance — it bills while RUNNING:
 gcloud run instances stop dsh-ws-demo --location="$REGION" 2>/dev/null || \
 curl -X POST -H "Authorization: Bearer $(gcloud auth print-access-token)" \
-  "https://run.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/instances/dsh-ws-demo:stop"
+  "https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/instances/dsh-ws-demo:stop"
 ```
 
 ---
@@ -481,7 +514,7 @@ This runbook was authored against a machine with **no gcloud credentials and no 
 | Step 2 (IAP resources) | `google_iap_brand` creation behavior + deprecation warnings observed only in docs; actual warning text/resource behavior unverified. |
 | Step 3 | `docker build` of the agent-host image was not run here; the Dockerfile's `bun run typecheck` stage depends on the workspace installing cleanly in-container. |
 | Step 4 | Migration runner against real Cloud SQL (proxy, private-IP path, `DATABASE_URL` with the Cloud SQL connection name) — untested against a live instance; the runner itself is covered by unit tests. |
-| Step 5 | **Highest risk.** The Instance create call (REST field names, `gcloud run instances` availability, sandbox-launcher flag spelling, private-IP `DATABASE_URL` scheme inside the instance) is Preview surface that could not be probed at all without a Preview-enabled project. Verify every field against the current REST reference before running. |
+| Step 5 | **Highest risk.** The create body shape, `validateOnly` dry-run, and the v2 REST paths were verified against the live discovery document and read-only probes on 2026-09-03 (see PR verification: v1 paths return HTML 404, v2 list returns 200). Still unproven: an actual create/start/stop against a live instance (billable), and the `gcloud run instances` Preview command-group availability. |
 | Step 6 | Control-plane image build + `gcloud run deploy` + IAP frontend wiring — unexecuted; the control-plane app has no dedicated Dockerfile in this baseline (called out above). |
 | Step 7 | Smoke checks — depend on Steps 4–6. |
 | Step 8 | `terraform destroy` behavior with real state; Instance stop/delete endpoint names under the Preview API. |

@@ -54,7 +54,11 @@ resource "google_sql_database_instance" "main" {
   deletion_protection = false
 
   settings {
-    tier              = var.db_tier
+    tier = var.db_tier
+    # MUST be explicit. Without it the API defaults this instance to
+    # ENTERPRISE_PLUS, which rejects db-custom-* tiers with
+    # "Invalid Tier (db-custom-1-3840) for (ENTERPRISE_PLUS) Edition".
+    edition           = var.db_edition
     availability_type = "ZONAL"
     disk_autoresize   = true
     disk_type         = var.db_disk_type
@@ -76,9 +80,26 @@ resource "google_sql_database_instance" "main" {
     }
 
     ip_configuration {
-      # Private IP preferred — do not assign a public IPv4.
-      # See comment at top of file for VPC requirements.
-      ipv4_enabled    = false
+      # Private IP is configured, but a public IPv4 is REQUIRED in practice.
+      #
+      # A Cloud Run Instance has no VPC connectivity of any kind: the v2 API
+      # drops vpcAccess.networkInterfaces and rejects vpcAccess.connector with
+      # "not supported on resources of kind 'instance'". Instances reach Cloud
+      # SQL through the built-in integration instead — a volume of type
+      # `cloudSqlInstance` mounted at /cloudsql, authorized by
+      # roles/cloudsql.client on the runtime service account (granted below).
+      # That path needs NO proxy sidecar and NO VPC connector, but it does dial
+      # the instance's public address: with ipv4_enabled = false it fails with
+      # "SFEClient is nil / refresh failed: context deadline exceeded".
+      # Both behaviours were measured against this project on 2026-09-03.
+      #
+      # `authorized_networks` is deliberately left EMPTY. A Cloud Run Instance
+      # egresses from Google's shared address pool, so any IP allowlist wide
+      # enough to admit it is effectively 0.0.0.0/0 — an allowlist here would
+      # be security theatre. Authorization is IAM plus an ephemeral client
+      # certificate, so reaching the address is not sufficient to connect
+      # (verified: a plain TCP connect from an unlisted host does not open).
+      ipv4_enabled    = var.db_enable_public_ip
       private_network = google_compute_network.sql.id
       # SSL is enforced at the instance level via require_ssl = true
       # on the connection; google provider v6 removed require_ssl from

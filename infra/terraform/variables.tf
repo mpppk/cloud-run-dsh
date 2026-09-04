@@ -182,3 +182,22 @@ variable "labels" {
   type        = map(string)
   default     = {}
 }
+
+variable "db_edition" {
+  description = "Cloud SQL edition. Must match var.db_tier: db-custom-* tiers require ENTERPRISE; ENTERPRISE_PLUS only accepts db-perf-optimized-N-* tiers. Left implicit the API picks ENTERPRISE_PLUS and rejects db-custom-*."
+  type        = string
+  default     = "ENTERPRISE"
+
+  validation {
+    condition     = contains(["ENTERPRISE", "ENTERPRISE_PLUS"], var.db_edition)
+    error_message = "db_edition must be ENTERPRISE or ENTERPRISE_PLUS."
+  }
+}
+
+
+
+variable "db_enable_public_ip" {
+  description = "Assign a public IPv4 to Cloud SQL in addition to the private IP. Required today because Cloud Run Instances have no VPC connectivity, so the Cloud SQL Auth Proxy must dial the public address. authorized_networks stays empty: access is authorized by IAM (roles/cloudsql.client) and an ephemeral client certificate, never by source IP."
+  type        = bool
+  default     = false
+}
