@@ -207,6 +207,10 @@ class FakeHandle implements WorkspaceRuntimeHandle {
     this.checkpointCalls++;
     this.recordActivity("checkpoint");
   }
+
+  async getInstanceUrl(): Promise<string | null> {
+    return null;
+  }
 }
 
 /** Throws when used — for tests that inject their own handle. */
@@ -346,11 +350,11 @@ describe("readiness endpoint", () => {
     }
   });
 
-  test("honest readiness: a not-ready probe (placeholder runtime registry) -> 503 with reason", async () => {
+  test("honest readiness: a not-ready probe -> 503 with reason", async () => {
     const h = startHarness({
       readiness: () => ({
         ready: false,
-        reason: "workspace runtime operations are unavailable: RuntimeRegistry is a placeholder",
+        reason: "workspace runtime operations are unavailable: RuntimeRegistry is not wired",
       }),
     });
     try {
@@ -358,7 +362,7 @@ describe("readiness endpoint", () => {
       expect(res.status).toBe(503);
       const body = await res.json();
       expect(body.status).toBe("not_ready");
-      expect(body.reason).toContain("RuntimeRegistry is a placeholder");
+      expect(body.reason).toContain("RuntimeRegistry is not wired");
     } finally {
       h.stop();
     }

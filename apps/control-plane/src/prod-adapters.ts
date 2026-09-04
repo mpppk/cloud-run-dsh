@@ -3,12 +3,7 @@
 // The SQL adapters mirror `apps/agent-host/src/adapters.ts` (BunSqlQueryExecutor,
 // BunSqlLeaseStore) — both apps talk to the same Cloud SQL schema over Bun.SQL.
 // Extracting them into a shared package is a deliberate follow-up; duplicating
-// here keeps P3 scoped to the Dockerfile + production entry.
-//
-// The runtime registry is an HONEST placeholder: the production composition of
-// the T8 WorkspaceRuntime (Cloud Run instance client + checkpoint storage +
-// GCS) is NOT wired in this milestone (P11a). Runtime-scoped operations fail
-// fast with a dedicated typed error instead of silently misbehaving.
+// here keeps the control-plane entry scoped to its own composition root.
 
 import type {
   ControllerLeaseRecord,
@@ -16,10 +11,19 @@ import type {
   LeaseTransaction,
 } from "@cloud-run-dsh/controller-lease";
 import type { QueryExecutor as SessionQueryExecutor } from "@cloud-run-dsh/session-persistence-postgres";
-import type { Workspace } from "@cloud-run-dsh/session-persistence-postgres";
 import type { MembershipStore } from "./membership.js";
-import { RuntimeRegistry } from "./deps.js";
-import { ApiError } from "./errors.js";
+import { IllegalTransitionError } from "@cloud-run-dsh/workspace-runtime";
+import type {
+  TransactionalStateStore,
+  WorkspaceRuntimeState,
+  WorkspaceStateTransaction,
+} from "@cloud-run-dsh/workspace-runtime";
+import type {
+  HttpTransport as InstanceHttpTransport,
+  HttpRequest as InstanceHttpRequest,
+  HttpResponse as InstanceHttpResponse,
+} from "@cloud-run-dsh/cloud-run-instance-client";
+import type { GcsClient } from "@cloud-run-dsh/workspace-checkpoint";
 
 // ---------------------------------------------------------------------------
 // Cloud SQL (Postgres) QueryExecutor via Bun's built-in SQL client
@@ -235,31 +239,251 @@ export class OwnerMembershipStore implements MembershipStore {
 }
 
 // ---------------------------------------------------------------------------
-// Placeholder runtime registry (P11a will wire the real composition).
+// Cloud SQL (Postgres) TransactionalStateStore — workspace state machine
+// persistence (T8 seam; 実装手順書 section 4: state transition in a DB
+// transaction). Mirrors apps/agent-host/src/adapters.ts
+// SqlTransactionalStateStore: the workspace's runtime_state lives in the
+// workspaces table; apply() performs a compare-and-set UPDATE inside a
+// SELECT ... FOR UPDATE transaction so concurrent transitions cannot
+// overwrite each other.
 // ---------------------------------------------------------------------------
 
-/**
- * Thrown when a runtime-scoped operation (open/stop/checkpoint/agent input)
- * reaches the not-yet-wired production runtime registry. Extends ApiError so
- * the route error mapper answers a typed 503 (`unavailable`) — never a
- * generic 500 or a silent success.
- */
-export class RuntimeNotWiredError extends ApiError {
-  readonly name = "RuntimeNotWiredError";
-  constructor() {
-    super(
-      503,
-      "unavailable",
-      "control-plane production RuntimeRegistry is not wired yet (planned for P11a): " +
-        "the T8 WorkspaceRuntime composition is missing its Cloud Run instance client, " +
-        "checkpoint storage and GCS collaborators, so workspace runtime operations are unavailable",
+const WORKSPACE_RUNTIME_STATES: readonly WorkspaceRuntimeState[] = [
+  "STOPPED",
+  "STARTING",
+  "RESTORING",
+  "READY",
+  "BUSY",
+  "CHECKPOINTING",
+  "STOPPING",
+  "ERROR",
+  "RESTORE_FAILED",
+  "CHECKPOINT_FAILED",
+];
+
+export class SqlTransactionalStateStore implements TransactionalStateStore {
+  constructor(private readonly executor: SessionQueryExecutor) {}
+
+  async load(workspaceId: string): Promise<WorkspaceRuntimeState | null> {
+    const rows = await this.executor.query<Record<string, unknown>>(
+      "SELECT runtime_state FROM workspaces WHERE id = $1",
+      [workspaceId],
     );
+    if (rows.length === 0) return null;
+    const value = rows[0]!["runtime_state"];
+    if (typeof value !== "string") return null;
+    return (WORKSPACE_RUNTIME_STATES as readonly string[]).includes(value)
+      ? (value as WorkspaceRuntimeState)
+      : null;
+  }
+
+  async apply(
+    workspaceId: string,
+    from: WorkspaceRuntimeState,
+    to: WorkspaceRuntimeState,
+    reason: string | undefined,
+    persist?: (tx: WorkspaceStateTransaction) => Promise<void>,
+  ): Promise<void> {
+    await this.executor.transaction(async (tx) => {
+      const rows = await tx.query<Record<string, unknown>>(
+        "SELECT runtime_state FROM workspaces WHERE id = $1 FOR UPDATE",
+        [workspaceId],
+      );
+      const current = rows.length === 0 ? null : rows[0]!["runtime_state"];
+      if (current !== from) {
+        throw new IllegalTransitionError(
+          from,
+          current === null ? "STOPPED" : (String(current) as WorkspaceRuntimeState),
+        );
+      }
+      await tx.exec(
+        "UPDATE workspaces SET runtime_state = $2, updated_at = now() WHERE id = $1",
+        [workspaceId, to],
+      );
+      if (persist) {
+        await persist({
+          record: { workspaceId, from, to, at: new Date(), reason },
+          persist: async (data) => {
+            // workspace_checkpoints schema (infra/migrations/0001_init.sql):
+            // id UUID PK, workspace_id, base_commit_sha NOT NULL, gcs_object
+            // NOT NULL — there is no `data` column. The persist payload must
+            // carry the T5 bundle reference (base commit + GCS object key).
+            const bundle = data as { baseCommitSha?: unknown; gcsObject?: unknown };
+            if (
+              typeof bundle?.baseCommitSha !== "string" ||
+              typeof bundle?.gcsObject !== "string"
+            ) {
+              throw new Error(
+                "persist payload must be { baseCommitSha: string; gcsObject: string } (workspace_checkpoints schema)",
+              );
+            }
+            await tx.exec(
+              "INSERT INTO workspace_checkpoints(id, workspace_id, base_commit_sha, gcs_object) VALUES (gen_random_uuid(), $1, $2, $3)",
+              [workspaceId, bundle.baseCommitSha, bundle.gcsObject],
+            );
+          },
+        });
+      }
+    });
   }
 }
 
-/** A registry whose factory fail-fasts with `RuntimeNotWiredError`. */
-export function createPlaceholderRuntimeRegistry(): RuntimeRegistry {
-  return new RuntimeRegistry((_workspace: Workspace) => {
-    throw new RuntimeNotWiredError();
-  });
+// ---------------------------------------------------------------------------
+// GCP access token — Instances API + GCS authentication.
+// ---------------------------------------------------------------------------
+
+/** Provides a GCP OAuth2 access token for REST calls (Instances API, GCS JSON API). */
+export type GcpTokenProvider = () => Promise<string>;
+
+export type FetchFn = (
+  url: string,
+  init?: RequestInit,
+) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+
+/**
+ * Resolves the token from `GCP_ACCESS_TOKEN` when set (local runs, short-lived
+ * operator tokens), otherwise from the GCP metadata server (Cloud Run / GCE —
+ * the production path; no secret to rotate). The metadata lookup has a short
+ * timeout so a non-GCP environment fails fast with a clear error instead of
+ * hanging the first Instance operation.
+ *
+ * NOTE (#27): a production-grade metadata-server implementation (caching,
+ * refresh, ADC fallback) is #27's scope. This is the minimal stopgap that
+ * keeps the control plane shippable until then — same shape as the
+ * agent-host's envGcsTokenProvider precedent.
+ */
+export function createGcpAccessTokenProvider(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+  fetchFn: FetchFn = fetch as unknown as FetchFn,
+): GcpTokenProvider {
+  return async () => {
+    const fromEnv = env["GCP_ACCESS_TOKEN"]?.trim();
+    if (fromEnv) return fromEnv;
+    let res: { ok: boolean; status: number; json(): Promise<unknown> };
+    try {
+      res = await fetchFn(
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+        {
+          headers: { "Metadata-Flavor": "Google" },
+          signal: AbortSignal.timeout(2000),
+        },
+      );
+    } catch (e) {
+      throw new Error(
+        "no GCP credentials: GCP_ACCESS_TOKEN is not set and the metadata server is unreachable " +
+          `(are you running outside GCP without a token? ${e instanceof Error ? e.message : String(e)})`,
+      );
+    }
+    if (!res.ok) {
+      throw new Error(
+        `no GCP credentials: GCP_ACCESS_TOKEN is not set and the metadata server answered ${res.status}`,
+      );
+    }
+    const body = (await res.json()) as { access_token?: unknown };
+    if (typeof body.access_token !== "string" || body.access_token === "") {
+      throw new Error("no GCP credentials: metadata server returned no access_token");
+    }
+    return body.access_token;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Authenticated Instances API transport (fetch-based, JSON bodies).
+// Mirrors apps/agent-host/src/adapters.ts instanceHttpTransport plus the
+// Authorization header (the agent-host transport sends none — the control
+// plane must authenticate as its run.admin service account).
+// ---------------------------------------------------------------------------
+
+export function createAuthenticatedInstanceTransport(
+  tokenProvider: GcpTokenProvider,
+  fetchFn: typeof fetch = fetch,
+): InstanceHttpTransport {
+  return {
+    request: async (req: InstanceHttpRequest): Promise<InstanceHttpResponse> => {
+      const token = await tokenProvider();
+      const res = await fetchFn(req.url, {
+        method: req.method,
+        headers: { ...(req.headers ?? {}), Authorization: `Bearer ${token}` },
+        body: req.body === undefined ? undefined : JSON.stringify(req.body),
+      });
+      const headers: Record<string, string> = {};
+      res.headers.forEach((value, key) => {
+        headers[key] = value;
+      });
+      const text = await res.text();
+      let body: unknown = text;
+      try {
+        body = JSON.parse(text) as unknown;
+      } catch {
+        // non-JSON body — keep raw text
+      }
+      return { status: res.status, headers, body };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// GCS checkpoint storage (JSON API via fetch; token provider injected).
+// Mirrors apps/agent-host/src/adapters.ts FetchGcsClient.
+// ---------------------------------------------------------------------------
+
+export class FetchGcsClient implements GcsClient {
+  constructor(
+    private readonly options: {
+      readonly apiBaseUrl?: string;
+      readonly tokenProvider: GcpTokenProvider;
+      readonly fetchFn?: typeof fetch;
+    },
+  ) {}
+
+  private fetchFn(): typeof fetch {
+    return this.options.fetchFn ?? fetch;
+  }
+
+  private baseUrl(): string {
+    return this.options.apiBaseUrl ?? "https://storage.googleapis.com/storage/v1";
+  }
+
+  private uploadUrl(bucket: string, key: string): string {
+    return `https://storage.googleapis.com/upload/storage/v1/b/${encodeURIComponent(bucket)}/o?uploadType=media&name=${encodeURIComponent(key)}`;
+  }
+
+  private async authorized(init: RequestInit): Promise<RequestInit> {
+    const token = await this.options.tokenProvider();
+    return {
+      ...init,
+      headers: {
+        ...(init.headers as Record<string, string> | undefined),
+        Authorization: `Bearer ${token}`,
+      },
+    };
+  }
+
+  async getObject(bucket: string, key: string): Promise<Uint8Array | null> {
+    const url = `${this.baseUrl()}/b/${encodeURIComponent(bucket)}/o/${encodeURIComponent(key)}?alt=media`;
+    const res = await this.fetchFn()(url, await this.authorized({ method: "GET" }));
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`gcs get failed: ${res.status}`);
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
+  async uploadObject(bucket: string, key: string, data: Uint8Array): Promise<void> {
+    const res = await this.fetchFn()(
+      this.uploadUrl(bucket, key),
+      await this.authorized({
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: new Blob([new Uint8Array(data)]),
+      }),
+    );
+    if (!res.ok) throw new Error(`gcs upload failed: ${res.status}`);
+  }
+
+  async objectExists(bucket: string, key: string): Promise<boolean> {
+    const url = `${this.baseUrl()}/b/${encodeURIComponent(bucket)}/o/${encodeURIComponent(key)}`;
+    const res = await this.fetchFn()(url, await this.authorized({ method: "GET" }));
+    if (res.status === 404) return false;
+    if (!res.ok) throw new Error(`gcs head failed: ${res.status}`);
+    return true;
+  }
 }

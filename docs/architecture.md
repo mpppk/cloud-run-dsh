@@ -148,7 +148,7 @@ sequenceDiagram
 |---|---|---|---|
 | 認可（IAP + メンバーシップ） | あり | 未 | control-plane は本番デプロイしていない。 |
 | コントローラリース | あり | 未 | ローカルでは検証済み。 |
-| Instance の作成 | 半分 | API は実行 | クライアントは動くが、control-plane の `RuntimeRegistry` が未結線のため control-plane からは作れない（[#23](https://github.com/mpppk/cloud-run-dsh/issues/23)）。今回は API を直接叩いた。 |
+| Instance の作成 | あり | API は実行 | control-plane の `RuntimeRegistry` 本番ファクトリが結線済み（[#23](https://github.com/mpppk/cloud-run-dsh/issues/23)）。GCP 上での実作成は未実行。 |
 | clone・checkout・チェックポイント復元 | あり | 未 | `bootstrap.ts` / `recovery.ts`。ENTRYPOINT を上書きしたため GCP では動いていない（[#24](https://github.com/mpppk/cloud-run-dsh/issues/24)）。 |
 | Harness の構成 | あり | **実行** | `createHarnessComposition()` を Instance 内で直接呼び、拒否の挙動まで確認した。 |
 | **入力の転送（control-plane → agent-host）** | **なし** | 未 | **両者を結ぶコードが存在しない**（[#22](https://github.com/mpppk/cloud-run-dsh/issues/22)）。control-plane は DB にイベントを書くだけ、agent-host は自分のゲートウェイで 202 を返すだけで、互いに通信しない。 |
@@ -536,7 +536,7 @@ gcloud 呼び出しが失敗するので解除する。
 |---|---|---|
 | **エージェントのターン（LLM 呼び出し）** | **未実装。** リポジトリ内に LLM クライアントが存在しない。 | [#21](https://github.com/mpppk/cloud-run-dsh/issues/21) |
 | **control-plane と agent-host の連携** | **未実装。** 両者を繋ぐコードが無く、同じ DB を共有する別々のサービスとして並んでいる。 | [#22](https://github.com/mpppk/cloud-run-dsh/issues/22) |
-| control-plane の `RuntimeRegistry` 本番ファクトリ | 未結線。専用エラーで即座に失敗し、起動時に警告を出し、`/readyz` は 503 を返す。 | [#23](https://github.com/mpppk/cloud-run-dsh/issues/23) |
+| control-plane の `RuntimeRegistry` 本番ファクトリ | 結線済み。`open`/`stop` が Cloud Run Instance を駆動し、`/readyz` は 200 を返す。GCP 上での実作成は未実行（コーディネータが検証）。 | [#23](https://github.com/mpppk/cloud-run-dsh/issues/23) |
 | agent-host 本体の GCP 上での起動 | 未実行（ENTRYPOINT を上書きしていたため）。 | [#24](https://github.com/mpppk/cloud-run-dsh/issues/24) |
 | Cloud SQL へのマイグレーション実行 | 実 runner を通していない。 | [#25](https://github.com/mpppk/cloud-run-dsh/issues/25) |
 | 実 GCS でのチェックポイント保存・復元 | 未実行。 | [#26](https://github.com/mpppk/cloud-run-dsh/issues/26) |
