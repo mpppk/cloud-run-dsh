@@ -7,7 +7,7 @@
 > ユーザーのメッセージから LLM がハーネスのツールを呼び、clone 済みリポジトリのファイルを読み、
 > イベントが SSE で返るまでを確認した。残る差分は
 > [#72](https://github.com/mpppk/cloud-run-dsh/issues/72)（stop → restart → 復元の実機確認。
-> 停止時の tar.gz 保存自体は実装済み）と
+> 停止時のチェックポイント保存は実機で確認済み）と
 > [#73](https://github.com/mpppk/cloud-run-dsh/issues/73)（撤収時の `terraform destroy`）。
 > `stop` が Instance を delete しないのは意図した設計
 > （[#85](https://github.com/mpppk/cloud-run-dsh/issues/85)）。
@@ -20,7 +20,7 @@
 | | |
 |---|---|
 | デプロイ単位 | 2 |
-| Terraform リソース | 48（2026-09-05 の apply 実測。VPC コネクタ廃止で 52 から減） |
+| Terraform リソース | 50（2026-09-05 の apply 実測。48 から増えたのは Artifact Registry の reader 2 件） |
 | リージョン | asia-northeast1 |
 | DB | PostgreSQL 16 |
 
@@ -50,7 +50,7 @@ flowchart TB
   CP -->|"作成・起動・停止<br/>run.googleapis.com v2"| AH
   CP -->|"/cloudsql ソケット"| SQL
   AH -->|"/cloudsql ソケット"| SQL
-  AH -->|"tar.gz"| GCS
+  AH -->|"チェックポイント"| GCS
   AH -->|"短命トークン"| GH
   AH --> LLM
   AH -.->|"イメージ取得"| AR
@@ -80,7 +80,7 @@ flowchart TB
 |---|---|---|---|
 | `cloud-run-instance-client` | 両方 | control-plane → Cloud Run v2 API → agent-host | Instances API の型付きクライアント。create / get / start / stop / delete と `validateOnly`。 |
 | `session-persistence-postgres` | 両方 | → Cloud SQL（両方から出る矢印） | 追記専用のワークスペース・セッション・イベントストア。 |
-| `workspace-checkpoint` | 両方 | agent-host → GCS | ワークスペースを ustar tar.gz にして保存・復元。復元時のパストラバーサル防御。 |
+| `workspace-checkpoint` | 両方 | agent-host → GCS | ベースコミット + 差分 + 未追跡ファイルの tar を1つの JSON にまとめて保存・復元（丸ごとのアーカイブではない。実形式は下記）。復元時のパストラバーサル防御。 |
 | `workspace-runtime` | 両方 | （状態機械。図には現れない） | 状態遷移、アイドル検知、open の合流。 |
 | `controller-lease` | 両方 | （Cloud SQL 上のリース。図には現れない） | ワークスペースあたりコントローラ1つを保証。 |
 | `observability` | 両方 | （横断。図には現れない） | 秘密情報を伏せる構造化ログ。 |
@@ -126,7 +126,7 @@ sequenceDiagram
   AH->>AH: clone → ベースブランチを checkout
   Note over AH: トークンは finally で破棄。argv に載せない
   AH->>GCS: 最新チェックポイントを取得
-  GCS-->>AH: tar.gz（無ければ素の clone のまま）
+  GCS-->>AH: チェックポイント（無ければ素の clone のまま）
   AH->>AH: Harness を構成<br/>workspace-write / workspaceRoot=/workspace
   AH->>DB: セッションとイベントを復元
   CP-->>U: 200 ワークスペース状態
@@ -142,7 +142,7 @@ sequenceDiagram
   alt アイドル検知 または POST /stop
     CP->>AH: POST 停止準備（prepare-stop）
     Note over CP,AH: ターンをドレインし、停止中の新規入力を拒否
-    AH->>GCS: ワークスペースを tar.gz で保存
+    AH->>GCS: チェックポイントを保存
     Note over AH,GCS: clean tree のときは何も書かず成功（仕様）
     AH-->>CP: 200 prepared（失敗時は 502。CP は止めない）
     CP->>RUN: stop
@@ -163,7 +163,7 @@ sequenceDiagram
 | 入力の転送（control-plane → agent-host） | あり | **実行** | [#22](https://github.com/mpppk/cloud-run-dsh/issues/22)。停止中は 409、転送失敗は 502。 |
 | **エージェントのターン（LLM 呼び出し）** | あり | **実行** | [#21](https://github.com/mpppk/cloud-run-dsh/issues/21)。OpenRouter 経由で LLM がツールを呼び、`/workspace` の実ファイルを読んで応答した。 |
 | SSE 配信 | あり | **実行** | `turn/start` から `turn/end` までのイベント列を実機で受信した。 |
-| チェックポイントして停止 | あり | **一部** | `stop` は agent-host の停止準備（ドレイン→tar.gz 保存→sandbox 破棄）を経て `STOPPED`（[#72](https://github.com/mpppk/cloud-run-dsh/issues/72)）。チェックポイント失敗時は Cloud Run の stop を呼ばず `CHECKPOINT_FAILED`。delete しないのは意図した設計（[#85](https://github.com/mpppk/cloud-run-dsh/issues/85)）。stop → restart → 復元の実機確認は未実施。 |
+| チェックポイントして停止 | あり | **一部** | `stop` は agent-host の停止準備（ドレイン→tar.gz 保存→sandbox 破棄）を経て `STOPPED`（[#72](https://github.com/mpppk/cloud-run-dsh/issues/72)）。チェックポイント失敗時は Cloud Run の stop を呼ばず `CHECKPOINT_FAILED`。delete しないのは意図した設計（[#85](https://github.com/mpppk/cloud-run-dsh/issues/85)）。stop → restart → 復元は 2026-09-05 に GCP 実機で確認済み（[レポート](./stop-restore-verification-report.md)）。 |
 
 > **2026-09-05、この図の全経路が GCP 実機で動いた。** ユーザーのメッセージが
 > control-plane から agent-host に届き、LLM がハーネスのツールで clone 済みリポジトリの
@@ -192,7 +192,7 @@ sequenceDiagram
 | `POST /v1/workspaces` | ワークスペースを作成する。id はサーバが採番する。 |
 | `GET /v1/workspaces/:id` | 状態を取得する。 |
 | `POST /v1/workspaces/:id/open` | Instance を起動する（同時実行は合流）。 |
-| `POST /v1/workspaces/:id/stop` | 停止する。agent-host の停止準備（`POST 停止準備`→tar.gz 保存）が成功してから Instance を stop する。準備に失敗したら `CHECKPOINT_FAILED` で stop しない（#72）。Instance は delete せず残す（#85）。 |
+| `POST /v1/workspaces/:id/stop` | 停止する。agent-host の停止準備（`POST 停止準備`→チェックポイント保存）が成功してから Instance を stop する。準備に失敗したら `CHECKPOINT_FAILED` で stop しない（#72）。Instance は delete せず残す（#85）。 |
 | `POST /v1/workspaces/:id/checkpoints` | 手動チェックポイント。agent-host で実スナップショットを取ってから `checkpointed: true` を返す（#75）。clean tree のスキップは成功扱い。Instance が止まっているときは 409。 |
 | `POST /v1/workspaces/:id/controller/{acquire,heartbeat,release}` | コントローラリースの取得・延長・解放。 |
 | `GET` / `POST /v1/workspaces/:id/sessions` | セッションの一覧と作成。 |
@@ -221,8 +221,12 @@ Cloud SQL 上の追記専用ストア。イベントには連番が付き、SSE 
 SSE のハートビートは意図的に「活動」として数えない（数えるとアイドル判定が働かなくなる）。
 
 **チェックポイント**
-ワークスペースを ustar 形式の tar.gz にして GCS へ。復元時にパストラバーサルを防ぐ。
+`workspaces/<id>/checkpoint.bin` に1つの JSON として GCS へ。中身は
+`manifest`（version / baseCommit / createdAt）、追跡ファイルの差分 `patchDiff`、
+未追跡ファイルの一覧と ustar tar（base64）。**ワークスペースを丸ごと固めるのではなく、
+clone で戻せる部分は持たず差分だけを運ぶ。** 復元時にパストラバーサルを防ぐ。
 バケットはバージョニング有効で、非現行バージョンは30日で削除される。
+実測例は [stop→復元レポート](./stop-restore-verification-report.md) §1.3。
 
 **永続性の境界**
 Instance は使い捨て。ワークスペースの中身はチェックポイント、会話とイベントは Cloud SQL に残る。
@@ -413,10 +417,10 @@ Cloud SQL の作成に10〜15分かかる。ここを越えると、何も動か
 cd infra/terraform
 terraform init -input=false
 terraform plan  -input=false -var-file=~/.dsh.tfvars
-# → Plan: 48 to add, 0 to change, 0 to destroy.（2026-09-05 実測）
+# → Plan: 50 to add, 0 to change, 0 to destroy.（2026-09-05 実測）
 
 terraform apply -input=false -var-file=~/.dsh.tfvars
-# → Apply complete! Resources: 48 added.（2026-09-05 実測）
+# → Apply complete! Resources: 50 added.（2026-09-05 実測）
 ```
 
 既にサービスアカウントが手動で作られている場合は、先に state へ取り込まないと 409 で衝突する
