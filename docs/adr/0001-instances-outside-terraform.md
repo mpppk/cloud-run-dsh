@@ -54,4 +54,20 @@ Terraform が持つのは**静的な土台**（API 有効化、Cloud SQL、GCS�
 - この決定を見直す条件: ワークスペースと Instance の対応が 1:1 でなくなる
   （常駐プール化など）、または Instances API が GA 化し provider が安定したうえで
   drift 問題の解（`ignore_changes` では済まない lifecycle 分離）が見つかった場合。
-  そのときは本 ADR を Superseded として新しい ADR を切る。
+   そのときは本 ADR を Superseded として新しい ADR を切る。
+
+## 追記: 2026-09-05 の実機検証による裏付け
+
+2026-09-05 の GCP 実機検証（`docs/e2e-verification-report.md`）で、control-plane が
+実際に Instance を **create → start** し、アイドル／明示操作で **stop** した。
+ライフサイクルの主体がアプリケーションであるという本 ADR の前提は実証された。
+
+ただし2点、未検証・未決の残件がある（いずれも本決定を覆すものではない）:
+
+- **delete は未実施。** 実装は `stop` のみ呼び、停止した Instance が残る。
+  図（`docs/architecture.md`）と実装の差として
+  [#72](https://github.com/mpppk/cloud-run-dsh/issues/72) が open のままである。
+  本 ADR の「stop / delete する」という記述のうち delete 側はまだ実証されていない。
+- **停止した Instance の GC（いつ誰が消すか）とコスト影響は未決。** #72 で決める。
+  1:1 対応が崩れる常駐プール化などに至れば、本 ADR の見直し条件に該当するため
+  新しい ADR を切る。

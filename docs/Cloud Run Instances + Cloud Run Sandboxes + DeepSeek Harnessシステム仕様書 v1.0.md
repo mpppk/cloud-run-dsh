@@ -168,6 +168,8 @@ Cloud Run Sandboxはデフォルトで親workloadのenvironment variables、Secr
 Harness本体はforkしない。
 
 HarnessのCapability Seamを利用する。
+（以下の素の名称は能力名の略称であり、npm パッケージは `@deepseek-ai/` スコープ付き
+`@deepseek-ai/dsh-*`（例: `@deepseek-ai/dsh-fs-sandbox`）を指す）
 
 ```text
 ctx.fs
@@ -326,6 +328,15 @@ RESTORE_FAILED
 ```
 
 としAgent入力を受け付けない。
+
+> 補足（2026-09-05 [#60](https://github.com/mpppk/cloud-run-dsh/issues/60) /
+> [#61](https://github.com/mpppk/cloud-run-dsh/issues/61) での確定事項）。
+> 上の復元ステップの駆動主体は分割する。control-plane が `openInstance()`
+>（`STOPPED → STARTING` + Instance 起動 + ヘルス観測。`STARTING` で停止）と、
+> agent-host が `completeRestore()`（`STARTING → RESTORING → READY`）を担い、
+> 単一プロセス利用向けの `open()` は両者の合成として残す。
+> agent-host が `open()` を呼ぶと共有行が既に `STARTING` のため失敗するので、
+> `completeRestore()` を呼ぶこと。
 
 ---
 
@@ -715,6 +726,19 @@ lease expiry: 45 seconds
 
 takeover時は旧controllerをobserverへ降格する。
 
+> 補足（2026-09-05 実機検証 [#60](https://github.com/mpppk/cloud-run-dsh/issues/60) /
+> [#61](https://github.com/mpppk/cloud-run-dsh/issues/61) での確定事項）。
+> 本節のリース（どのユーザが入力を送れるか）と §26-8 のリース
+> （どのホストプロセスが workspace を所有するか）は**実装では1つのリースで表現する**
+>（`controller_leases` の世代ごと UUID）。
+> `POST /v1/workspaces/:id/open` がリースを確立し、その `controllerId` を
+> Instance 環境変数 `CONTROLLER_ID` に注入する。agent-host は自力で新規取得せず、
+> その ID を引き継ぐ（無ければ取得・同一 ID なら heartbeat・別 ID なら
+> `LeaseAlreadyHeldError` で拒否し、2つ目のホストの起動を拒否する）。
+> 既知の制限: リースが handover された後に古い `CONTROLLER_ID` のままの Instance が
+> 再起動すると、新ホストは自分を拒否するため Instance の作り直しが必要。
+> 根本解決（ホスト fencing とユーザ controller の分離）は将来課題とする。
+
 ---
 
 # 21. Authentication
@@ -809,6 +833,17 @@ Agent streamingはSSEを採用する。
 
 PTY導入時にWebSocketを追加検討する。
 
+> 補足（2026-09-05 [#22](https://github.com/mpppk/cloud-run-dsh/issues/22) /
+> [#68](https://github.com/mpppk/cloud-run-dsh/issues/68) での確定事項）。
+> `POST /v1/sessions/:id/messages` は control-plane が共有 DB へ `user_message` を
+> 追記した後（single-writer は control-plane のみ）、workspace の Instance URL へ
+> 転送する（ID トークン認証。§3 の control-plane → Instance の矢印がこの経路）。
+> agent-host は `user_message` を再追記しない。URL が無い停止中 Instance への送信は
+> 409、追記成功後の転送失敗は 502 とする。
+> ヘルス観測と readiness は `/readyz` で行う。完全一致の `/healthz` は Cloud Run の
+> frontend が予約しておりコンテナにルーティングされないため使用しない
+>（control-plane の `/livez` / `/readyz` 分割も同理由）。
+
 ---
 
 # 25. Observability
@@ -876,6 +911,13 @@ Sandbox lifecycleはCloud Loggingにも記録される。citeturn989520sea
 10. Cloud Run Preview APIへの依存をAdapterへ限定する。
 11. command argvはshell文字列連結せずstructured argvで渡す。
 12. stdout / stderrへsecret redactionを適用する。
+
+> 補足（2026-09-05 [#42](https://github.com/mpppk/cloud-run-dsh/issues/42) の教訓）。
+> redaction はアプリケーションが出すログに適用される。Bun ランタイム内部が投げる
+> 例外など redactor を通らない経路があるため、secret を含みうる値自体を
+> ランタイム API に渡さないこと（例: パスワード入り DSN 文字列を `Bun.SQL` に
+> 渡さず、username / password / database を分けた options オブジェクトで接続し、
+> 失敗時のメッセージに DSN を含めない）。
 
 ---
 
