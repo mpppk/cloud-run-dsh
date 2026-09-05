@@ -192,6 +192,53 @@ export const stopWorkspace: RouteHandler = async (ctx) => {
   return json({ workspaceId: workspace.id, state });
 };
 
+/**
+ * Deletes a workspace and its Cloud Run Instance (issue #85 案B).
+ *
+ * Membership is checked FIRST (like every other workspace-scoped route): a
+ * non-member gets 403 and nothing is touched. The Instance is deleted BEFORE
+ * the row: if the Instances API call fails the row is kept so the delete is
+ * retryable (a STOPPED workspace will also be picked up by the hourly #85 GC
+ * reaper). A missing Instance is success. Sessions, events, checkpoints and
+ * the controller lease go with the row (repo.deleteWorkspace cascades).
+ */
+export const deleteWorkspace: RouteHandler = async (ctx) => {
+  const id = requireSegment(ctx.params.id, "id");
+  const workspace = await loadWorkspace(ctx.deps, id);
+  await assertMember(ctx.deps, workspace.id, ctx.user.id);
+  const handle = await ctx.deps.runtimes.get(workspace);
+  try {
+    await handle.deleteInstance();
+  } catch (e) {
+    ctx.deps.logger?.error("control-plane.workspace-delete.instance-failed", {
+      workspaceId: workspace.id,
+      instanceName: workspace.instanceName ?? undefined,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    throw badGateway(
+      "workspace instance could not be deleted — the workspace was kept; retry later",
+    );
+  }
+  const deleted = await ctx.deps.repo.deleteWorkspace(workspace.id);
+  // Lost a race with a concurrent delete: the workspace is gone, which is
+  // the requested end state, but report it honestly as 404.
+  if (!deleted) throw notFound(`workspace ${id} not found`);
+  // Best-effort membership cleanup. The owner-only production store derives
+  // membership from the (now deleted) row, so failures here change nothing.
+  try {
+    for (const memberId of await ctx.deps.membership.listMembers(workspace.id)) {
+      await ctx.deps.membership.removeMember(workspace.id, memberId).catch(() => undefined);
+    }
+  } catch {
+    // ignore — the workspace row (the source of truth) is already gone.
+  }
+  ctx.deps.logger?.info("control-plane.workspace-deleted", {
+    workspaceId: workspace.id,
+    instanceName: workspace.instanceName ?? undefined,
+  });
+  return json({ workspaceId: workspace.id, deleted: true });
+};
+
 export const listSessions: RouteHandler = async (ctx) => {
   const id = requireSegment(ctx.params.id, "id");
   const workspace = await loadWorkspace(ctx.deps, id);

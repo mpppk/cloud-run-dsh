@@ -56,6 +56,7 @@ export {
 export {
   createWorkspace,
   getWorkspace,
+  deleteWorkspace,
   openWorkspace,
   stopWorkspace,
   listSessions,

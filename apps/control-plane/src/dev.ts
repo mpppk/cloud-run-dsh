@@ -73,6 +73,11 @@ export class LoggingWorkspaceRuntimeHandle implements WorkspaceRuntimeHandle {
     return { skipped: false };
   }
 
+  async deleteInstance(): Promise<void> {
+    // Local dev never creates a real Instance — nothing to delete.
+    console.log(`[dev] workspace ${this.workspaceId}: deleteInstance -> no-op`);
+  }
+
   async getInstanceUrl(): Promise<string | null> {
     // Local dev never creates a real Instance — there is no URL to forward to.
     return null;

@@ -516,6 +516,9 @@ CHECKPOINT_BUCKET: "${BUCKET}"
 AGENT_HOST_DATABASE_URL: "postgresql://dsh_app:${DB_PASSWORD_URLENC}@/dsh?host=/cloudsql/${SQL_CONNECTION}"
 CLOUD_SQL_CONNECTION_NAME: "${SQL_CONNECTION}"
 GITHUB_APP_ID: "${GH_APP_ID}"
+# 停止済み Instance の GC（#85。任意。書かなければ 1時間おき / 30日無触）。
+# INSTANCE_GC_INTERVAL_MS: "3600000"
+# INSTANCE_GC_STALE_AFTER_MS: "2592000000"
 EOF
 
 gcloud run deploy control-plane \

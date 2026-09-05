@@ -18,6 +18,15 @@
 export const DEFAULT_PORT = 8080;
 
 /**
+ * Stopped-Instance GC defaults (issue #85 案A). The sweeper deletes the
+ * Cloud Run Instance objects of STOPPED workspaces untouched for
+ * `staleAfterMs`, every `intervalMs`. An interval of 0 disables the sweeper
+ * (explicit deletes via DELETE /v1/workspaces/:id still work).
+ */
+export const DEFAULT_INSTANCE_GC_INTERVAL_MS = 60 * 60 * 1000;
+export const DEFAULT_INSTANCE_GC_STALE_AFTER_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
  * Default Cloud Run Instances API origin + version (issue #47). Overridable
  * via `INSTANCES_API_BASE_URL` for tests and emulators. Kept in sync with
  * `DEFAULT_INSTANCES_API_BASE_URL` in
@@ -125,6 +134,16 @@ export interface ControlPlaneConfig {
   readonly llmBaseUrl?: string;
   readonly llmModel?: string;
   readonly llmApprovalPolicy?: "ask" | "never";
+  /**
+   * Stopped-Instance GC sweep cadence in ms (issue #85 案A). 0 disables the
+   * background sweeper. Defaults to hourly.
+   */
+  readonly instanceGcIntervalMs: number;
+  /**
+   * How long a STOPPED workspace must be untouched before its Instance is
+   * GC-deleted. Defaults to 30 days.
+   */
+  readonly instanceGcStaleAfterMs: number;
 }
 
 export function readControlPlaneConfig(
@@ -162,7 +181,39 @@ export function readControlPlaneConfig(
     openrouterApiKey: env["OPENROUTER_API_KEY"]!.trim(),
     cloudSqlConnectionName: env["CLOUD_SQL_CONNECTION_NAME"]!.trim(),
     ...readLlmOverrides(env),
+    instanceGcIntervalMs: readOptionalMs(
+      env["INSTANCE_GC_INTERVAL_MS"],
+      "INSTANCE_GC_INTERVAL_MS",
+      DEFAULT_INSTANCE_GC_INTERVAL_MS,
+      0,
+    ),
+    instanceGcStaleAfterMs: readOptionalMs(
+      env["INSTANCE_GC_STALE_AFTER_MS"],
+      "INSTANCE_GC_STALE_AFTER_MS",
+      DEFAULT_INSTANCE_GC_STALE_AFTER_MS,
+      1,
+    ),
   };
+}
+
+/**
+ * Optional millisecond duration (issue #85 GC tuning). Blank/unset means the
+ * default. Must be an integer >= `min`, otherwise boot fails fast with the
+ * variable named.
+ */
+function readOptionalMs(
+  raw: string | undefined,
+  name: string,
+  fallback: number,
+  min: number,
+): number {
+  const trimmed = raw?.trim();
+  if (trimmed === undefined || trimmed === "") return fallback;
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isInteger(parsed) || parsed < min) {
+    throw new Error(`invalid ${name}: ${JSON.stringify(raw)} (want an integer >= ${min})`);
+  }
+  return parsed;
 }
 
 /**

@@ -26,6 +26,7 @@ import {
 import { HttpAgentHostForwarder, createIdTokenProvider } from "./forwarding.js";
 import { OwnerMembershipStore } from "./prod-adapters.js";
 import { createProductionRuntimeRegistry } from "./runtime-factory.js";
+import { startStoppedInstanceSweeper } from "./instance-gc.js";
 
 async function main(): Promise<void> {
   const config = readControlPlaneConfig();
@@ -97,8 +98,35 @@ async function main(): Promise<void> {
   const server = startControlPlane(deps, config.port);
   logger.info(`listening on 0.0.0.0:${server.port} (DATABASE_URL configured)`);
 
+  // Issue #85 案A: background GC of stopped-Instance objects. Only deletes
+  // the Instances of long-idle STOPPED workspaces (rows + checkpoints stay;
+  // the next open() recreates). Interval 0 disables the sweeper; explicit
+  // DELETE /v1/workspaces/:id still deletes Instances on demand.
+  const sweeper =
+    config.instanceGcIntervalMs > 0
+      ? startStoppedInstanceSweeper(
+          {
+            repo,
+            runtimes,
+            clock,
+            logger,
+            staleAfterMs: config.instanceGcStaleAfterMs,
+          },
+          { intervalMs: config.instanceGcIntervalMs },
+        )
+      : null;
+  if (sweeper) {
+    logger.info(
+      "stopped-instance GC sweeper enabled " +
+        `(every ${config.instanceGcIntervalMs}ms, stale after ${config.instanceGcStaleAfterMs}ms)`,
+    );
+  } else {
+    logger.info("stopped-instance GC sweeper disabled (INSTANCE_GC_INTERVAL_MS=0)");
+  }
+
   const shutdown = (signal: string): void => {
     logger.info(`${signal} received; shutting down`);
+    sweeper?.stop();
     server.stop();
     void executor.close().finally(() => process.exit(0));
   };
