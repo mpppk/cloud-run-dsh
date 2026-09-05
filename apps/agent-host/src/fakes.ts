@@ -258,6 +258,7 @@ export function makeConfig(overrides: Partial<AgentHostConfig> = {}): AgentHostC
     instanceName: "dsh-ws-1",
     gcpProjectId: "fake-project",
     gcpRegion: "us-central1",
+    instancesApiBaseUrl: "https://run.googleapis.com/v2",
     sandboxCliPath: "/usr/local/gcp/bin/sandbox",
     allowEgress: true,
     llmBaseUrl: "https://openrouter.ai/api/v1",

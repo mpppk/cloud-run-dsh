@@ -11,8 +11,9 @@ the two.
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
 | `DATABASE_URL` | **yes** | — | Postgres connection string for the control plane itself. Cloud SQL in production (`postgres://user:pass@host:5432/db`); locally the docker compose Postgres: `postgres://dsh:dsh@localhost:5432/dsh`. The schema must be applied first (`bun run db:migrate`). |
-| `GCP_PROJECT_ID` | **yes** | — | GCP project hosting the workspace Cloud Run Instances (`projects/<id>/locations/<region>` base path). |
+| `GCP_PROJECT_ID` | **yes** | — | GCP project hosting the workspace Cloud Run Instances (absolute base `https://run.googleapis.com/v2/projects/<id>/locations/<region>` — issue #47). |
 | `GCP_REGION` | **yes** | — | Region for every created Instance (unified with the rest of the deployment, e.g. `asia-northeast1`). |
+| `INSTANCES_API_BASE_URL` | no | `https://run.googleapis.com/v2` | Cloud Run Instances API origin + version (issue #47). Override for tests/emulators (e.g. `http://localhost:8080/v2`); a relative value fails startup. |
 | `AGENT_HOST_IMAGE` | **yes** | — | Agent-host container image for created Instances (v2 `containers[].image`), e.g. `${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-host/agent-host:v1`. |
 | `AGENT_HOST_SERVICE_ACCOUNT` | **yes** | — | Service account that created Instances run as (v2 top-level `serviceAccount`). |
 | `CHECKPOINT_BUCKET` | **yes** | — | GCS checkpoint bucket (Terraform output `checkpoint_bucket_name`). Also injected into Instances. |

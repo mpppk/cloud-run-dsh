@@ -2,7 +2,7 @@
 // composes all collaborators, runs the restart recovery path (実装手順書
 // section 30 — the normal path), and serves the Agent Gateway on 0.0.0.0:$PORT.
 
-import { CloudRunInstanceClient } from "@cloud-run-dsh/cloud-run-instance-client";
+import { CloudRunInstanceClient, buildInstancesBasePath } from "@cloud-run-dsh/cloud-run-instance-client";
 import { createLogger } from "@cloud-run-dsh/observability";
 import { composeAgentHost } from "./composition.js";
 import type { AgentHostDependencies } from "./composition.js";
@@ -56,7 +56,13 @@ export async function createProductionDependencies(
     repository,
     instanceRuntime: new CloudRunInstanceClient({
       transport: instanceHttpTransport,
-      basePath: `projects/${config.gcpProjectId}/locations/${config.gcpRegion}`,
+      // Issue #47: absolute URL — a relative "projects/.../locations/..."
+      // makes fetch() throw "URL is invalid".
+      basePath: buildInstancesBasePath({
+        apiBaseUrl: config.instancesApiBaseUrl,
+        projectId: config.gcpProjectId,
+        region: config.gcpRegion,
+      }),
     }),
     sandboxRunner: new ExecSandboxCliRunner(config.sandboxCliPath),
     secretProvider: createEnvSecretProvider(env),
