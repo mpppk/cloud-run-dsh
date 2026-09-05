@@ -594,6 +594,45 @@ describe("WorkspaceRuntime — graceful stop (実装手順書 section 29)", () =
     expect(h.steps.calls.filter((c) => c === "runLifecycleCheckpoint")).toHaveLength(1);
   });
 
+  test("issue #88: concurrent stops from two runtimes sharing one store — loser throws IllegalTransitionError, retry recovers", async () => {
+    // The reviewer's 20/20 repro: two runtime objects (e.g. a rebuilt
+    // control-plane handle cache, or control plane vs agent-host idle-stop)
+    // against the SAME row. Unlike same-runtime stops above, there is no
+    // shared stopPromise to coalesce on, so both attempt READY -> STOPPING
+    // and the compare-and-set lets exactly one through.
+    const clock = new FakeClock();
+    const store = new InMemoryTransactionalStore();
+    const makeRuntime = () =>
+      new WorkspaceRuntime({
+        workspaceId: "ws-1",
+        store,
+        clock,
+        instanceRuntime: new FakeInstanceRuntime(),
+        instanceName: "dsh-ws-1",
+        steps: new FakeSteps(),
+        idle: new IdleManager(clock),
+      });
+    const first = makeRuntime();
+    const second = makeRuntime();
+    await first.open();
+    expect(await store.load("ws-1")).toBe("READY");
+
+    const [a, b] = await Promise.allSettled([first.stop(), second.stop()]);
+    const fulfilled = [a, b].filter((r) => r.status === "fulfilled");
+    const rejected = [a, b].filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect((fulfilled[0] as PromiseFulfilledResult<WorkspaceRuntimeState>).value).toBe("STOPPED");
+    const loserError = (rejected[0] as PromiseRejectedResult).reason;
+    expect(loserError).toBeInstanceOf(IllegalTransitionError);
+
+    // The row converges and STOPPING re-entry is allowed, so a retry heals:
+    // no stuck state, no lost work — the caller just retries.
+    expect(await store.load("ws-1")).toBe("STOPPED");
+    const loser = a.status === "rejected" ? first : second;
+    await expect(loser.stop()).resolves.toBe("STOPPED");
+  });
+
   test("stop is refused in STARTING/RESTORING", async () => {
     const h = makeHarness();
     const gate = deferred<void>();

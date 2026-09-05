@@ -16,6 +16,7 @@ import {
 import {
   AgentInputRefusedError,
   IdleManager,
+  IllegalTransitionError,
   InMemoryTransactionalStore,
   InvalidOperationError,
   WorkspaceRuntime,
@@ -1183,6 +1184,48 @@ describe("open/stop composition with the T8 runtime", () => {
   test("typed runtime errors map to 409", () => {
     const res = toErrorResponse(new InvalidOperationError("open", "BUSY"));
     expect(res.status).toBe(409);
+  });
+
+  test("issue #88: IllegalTransitionError maps to 409, not 500", async () => {
+    // A lost compare-and-set race on the shared row (concurrent stops from
+    // two runtimes) is a caller-visible state conflict — retryable — so it
+    // must read as a conflict, never as an internal server error.
+    const res = toErrorResponse(new IllegalTransitionError("STOPPING", "STOPPING"));
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("conflict");
+  });
+
+  test("issue #88 end-to-end: concurrent-stop loser gets 409 from POST /stop", async () => {
+    // The reviewer's repro at the HTTP layer: the handle's stop() rejects
+    // with the exact error the losing runtime throws (IllegalTransitionError
+    // from the shared-row compare-and-set), and the route must answer 409.
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      const losing: WorkspaceRuntimeHandle = {
+        open: async () => "READY",
+        stop: async () => {
+          throw new IllegalTransitionError("STOPPING", "STOPPING");
+        },
+        getState: () => "STOPPING",
+        recordActivity: () => {},
+        assertAgentInputAllowed: () => {},
+        runManualCheckpoint: async () => {},
+        getInstanceUrl: async () => null,
+      };
+      h.deps.runtimes.set(ws.id, losing);
+
+      const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/stop`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: { code: string; message: string } };
+      expect(body.error.code).toBe("conflict");
+    } finally {
+      h.stop();
+    }
   });
 
   test("unexpected errors map to a generic 500 without internals", () => {

@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { InMemoryLogger } from "@cloud-run-dsh/observability";
-import { AGENT_HOST_HEALTH_PATH } from "@cloud-run-dsh/workspace-runtime";
+import {
+  AGENT_HOST_HEALTH_PATH,
+  IllegalTransitionError,
+} from "@cloud-run-dsh/workspace-runtime";
+import type { WorkspaceRuntime } from "@cloud-run-dsh/workspace-runtime";
 import { composeTestHost, seedWorkspace } from "./fakes.js";
 import { AgentGateway } from "./gateway.js";
 import type { AgentTurnInput, TurnStarter } from "./gateway.js";
@@ -373,6 +377,31 @@ describe("lifecycle routes (issues #72/#75)", () => {
     expect(await res.json()).toMatchObject({ prepared: false, state: "CHECKPOINT_FAILED" });
     expect(th.host.runtime.getState()).toBe("CHECKPOINT_FAILED");
     expect(th.instance.calls).not.toContainEqual(expect.stringContaining("stop"));
+  });
+
+  test("issue #88: prepare-stop lost-row race -> 409 prepared:false (never 500)", async () => {
+    // Another stop won the shared-row compare-and-set while this
+    // prepare-stop was in flight, so runtime.prepareStop() throws
+    // IllegalTransitionError. That is a caller-visible state conflict —
+    // the control plane retries — so the gateway answers 409, matching
+    // this route's contract ("wrong state/generation, operator action
+    // needed"), instead of leaking a 500.
+    const th = await gatewayWithReadyHost();
+    const racing = new AgentGateway({
+      config: th.host.config,
+      health: th.host.health,
+      runtime: {
+        prepareStop: async () => {
+          throw new IllegalTransitionError("STOPPING", "STOPPING");
+        },
+        getState: () => th.host.runtime.getState(),
+      } as unknown as WorkspaceRuntime,
+      lease: th.host.lease,
+      logger: th.host.logger,
+    });
+    const res = await racing.handle(request("POST", "/workspaces/ws-1/prepare-stop", IAP));
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ prepared: false });
   });
 
   test("POST checkpoint on a clean tree -> 200 checkpointed:true skipped:true (success, not a bug)", async () => {
