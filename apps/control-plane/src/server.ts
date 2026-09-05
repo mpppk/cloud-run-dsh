@@ -259,11 +259,26 @@ export interface RunningControlPlane {
   stop(): void;
 }
 
+/**
+ * Bun's maximum `idleTimeout` (seconds). See the note at the Bun.serve call:
+ * the 10s default kills long lifecycle requests such as open/stop.
+ */
+export const SERVER_IDLE_TIMEOUT_SECONDS = 255;
+
 /** Starts the control-plane server on 0.0.0.0:$PORT. */
 export function startControlPlane(deps: ControlPlaneDeps, port: number): RunningControlPlane {
   const server = Bun.serve({
     hostname: "0.0.0.0",
     port,
+    // Bun.serve defaults idleTimeout to 10 SECONDS and closes the connection
+    // when it elapses. POST /v1/workspaces/:id/open legitimately runs for
+    // ~60s (Instance create + start + agent-host readiness poll), so with the
+    // default every open died mid-flight and Cloud Run turned the truncated
+    // response into a bare-text 503 ("The request failed because either the
+    // HTTP response was malformed or connection to the instance had an
+    // error") — measured on GCP 2026-09-05. 255 is Bun's maximum and sits
+    // under Cloud Run's own 300s request timeout, which stays the real bound.
+    idleTimeout: SERVER_IDLE_TIMEOUT_SECONDS,
     fetch: createFetchHandler(deps),
   });
   return {
