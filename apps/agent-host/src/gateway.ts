@@ -9,7 +9,7 @@ import { AgentInputRefusedError } from "@cloud-run-dsh/workspace-runtime";
 import type { InvalidOperationError } from "@cloud-run-dsh/workspace-runtime";
 import type { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
 import type { Logger } from "@cloud-run-dsh/observability";
-import { newErrorId } from "@cloud-run-dsh/observability";
+import { describeError, newErrorId } from "@cloud-run-dsh/observability";
 import type { AgentHostConfig } from "./config.js";
 import type { HealthService } from "./health.js";
 import { healthzResponse } from "./health.js";
@@ -89,27 +89,11 @@ export interface TurnStarter {
 export type ApprovalDecision = "approved" | "rejected";
 
 /**
- * Error class/message/stack as plain strings (never the raw error object —
- * it may carry secret fields; issue #42). The gateway logger applies the
- * observability redactor on top.
+ * Historic alias kept for backward compat: the implementation lives in
+ * @cloud-run-dsh/observability, shared with the control plane's
+ * describeError (PR #49 MINOR-1).
  */
-export function describeGatewayError(e: unknown): {
-  errorClass: string;
-  errorMessage: string;
-  errorStack?: string;
-} {
-  if (e instanceof Error) {
-    const out: { errorClass: string; errorMessage: string; errorStack?: string } = {
-      errorClass: e.name || e.constructor?.name || "Error",
-      errorMessage: e.message,
-    };
-    if (typeof e.stack === "string" && e.stack.length > 0) {
-      out.errorStack = e.stack;
-    }
-    return out;
-  }
-  return { errorClass: typeof e, errorMessage: String(e) };
-}
+export const describeGatewayError = describeError;
 
 const GATEWAY_ROUTE_RE =
   /^\/workspaces\/([^/]+)(?:\/sessions\/([^/]+))?\/(messages|approvals|cancel|events)$/;
@@ -200,7 +184,7 @@ export class AgentGateway {
       return this.json(401, { error: "unauthenticated: missing IAP identity" });
     }
 
-    const match = url.pathname.match(/^\/workspaces\/([^/]+)(?:\/sessions\/([^/]+))?\/(messages|approvals|cancel|events)$/);
+    const match = url.pathname.match(GATEWAY_ROUTE_RE);
     if (!match) return this.json(404, { error: "not found" });
     const [, workspaceId, sessionId, action] = match as unknown as [
       string,

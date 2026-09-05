@@ -2,7 +2,7 @@
 // Every collaborator is faked — no real GCP, DB or network.
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { InMemoryLogger } from "@cloud-run-dsh/observability";
+import { ERROR_ID_RE, InMemoryLogger } from "@cloud-run-dsh/observability";
 import {
   AgentHostConflictError,
   AgentHostForwardError,
@@ -1702,10 +1702,12 @@ describe("unexpected error observability (issue #48)", () => {
     };
     expect(body.error.code).toBe("internal");
     expect(body.error.message).toBe("internal server error");
-    // 16 hex chars by design (not a UUID): a UUID-shaped ID would be masked
-    // to [REDACTED] by the entropy redactor in the very log line meant to
-    // carry it. See newErrorId in @cloud-run-dsh/observability.
-    expect(body.error.errorId).toMatch(/^[0-9a-f]{16}$/);
+    // 16 hex chars by design (not a UUID) — WORKAROUND for issue #51: a
+    // UUID-shaped ID would be masked to [REDACTED] by the entropy redactor
+    // in the very log line meant to carry it. See newErrorId in
+    // @cloud-run-dsh/observability. The shape lives there (ERROR_ID_RE), not
+    // here, so a post-#51 return to UUIDs touches one place.
+    expect(body.error.errorId).toMatch(ERROR_ID_RE);
 
     // The response carries no internals.
     expect(JSON.stringify(body)).not.toContain("boom details here");
@@ -1789,10 +1791,12 @@ describe("unexpected error observability (issue #48)", () => {
       const line = logger.parsed.find((e) => e["event"] === "http.unexpected_error");
       expect(line).toBeTruthy();
       expect(line!["errorId"]).toBe(body.error.errorId);
-      // NOTE (known redactor behavior, not a bug in this change): workspace
-      // UUIDs are masked to [REDACTED] by the high-entropy net, so the
-      // errorId — not the workspaceId — is the correlation key operators use.
-      // The field is still passed to the logger per 仕様書 §25.
+      // NOTE (known redactor behavior tracked in issue #51 — #52 was closed
+      // as its duplicate — not a bug in this change): workspace UUIDs are
+      // masked to [REDACTED] by the high-entropy net, so the errorId — not
+      // the workspaceId — is the correlation key operators use until #51 is
+      // fixed. The field is still passed to the logger per 仕様書 §25.
+      // After #51 lands, this expectation must move to the raw UUID.
       expect(line!["workspaceId"]).toBe("[REDACTED]");
       expect(line!["userId"]).toBe("alice");
       expect(line!["method"]).toBe("POST");

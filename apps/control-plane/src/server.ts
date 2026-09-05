@@ -6,7 +6,7 @@ import type { InternalUser } from "./auth.js";
 import type { ControlPlaneDeps } from "./deps.js";
 import { ApiError, badRequest, internalError, notFound } from "./errors.js";
 import type { Logger } from "@cloud-run-dsh/observability";
-import { newErrorId } from "@cloud-run-dsh/observability";
+import { describeError, newErrorId } from "@cloud-run-dsh/observability";
 import * as handlers from "./handlers.js";
 import { handleSessionEvents } from "./sse.js";
 import {
@@ -105,33 +105,20 @@ export interface ToErrorResponseOptions {
   readonly context?: ErrorLogContext;
 }
 
-/** Extracts error class/message/stack as plain strings (never the raw object). */
-export function describeError(e: unknown): {
-  errorClass: string;
-  errorMessage: string;
-  errorStack?: string;
-} {
-  if (e instanceof Error) {
-    const errorClass = e.name || e.constructor?.name || "Error";
-    const out: { errorClass: string; errorMessage: string; errorStack?: string } = {
-      errorClass,
-      errorMessage: e.message,
-    };
-    if (typeof e.stack === "string" && e.stack.length > 0) {
-      out.errorStack = e.stack;
-    }
-    return out;
-  }
-  return { errorClass: typeof e, errorMessage: String(e) };
-}
+// Re-exported for backward compat: the implementation lives in
+// @cloud-run-dsh/observability, shared with the agent host (PR #49 MINOR-1).
+export { describeError };
 
 /**
  * Maps any thrown error to a typed JSON error response. No stack traces leak.
  *
- * Unexpected errors -> generic 500 with no internals (仕様書 section 26 item
- * 7) AND a structured server-side log line (issue #48). The 500 body carries
- * a random `errorId` that matches the log line so an operator can correlate
- * a client report with Cloud Logging without the response leaking anything.
+ * Unexpected errors -> generic 500 with no internals (仕様書 §26 の秘密保全の
+ * 要請による。NOTE: §26 item 7 は workspace 所有権検証であり 500 の根拠では
+ * ない — #48 の記載を引き継いだ誤引用だったので番号付けを外した。PR #49
+ * MINOR-2) AND a structured server-side log line (issue #48). The 500 body
+ * carries a random `errorId` that matches the log line so an operator can
+ * correlate a client report with Cloud Logging without the response leaking
+ * anything.
  */
 export function toErrorResponse(e: unknown, opts: ToErrorResponseOptions = {}): Response {
   if (e instanceof ApiError) {
@@ -141,8 +128,10 @@ export function toErrorResponse(e: unknown, opts: ToErrorResponseOptions = {}): 
   if (e instanceof AgentInputRefusedError || e instanceof InvalidOperationError) {
     return errorResponse(409, "conflict", e.message);
   }
-  // Unexpected errors -> generic 500 with no internals (仕様書 section 26 item 7).
-  // newErrorId (not a UUID) so the ID survives the entropy redactor in the log.
+  // Unexpected errors -> generic 500 with no internals (仕様書 §26; see the
+  // MINOR-2 note on toErrorResponse — item 7 is NOT the 500 rule).
+  // 16hex newErrorId (not a UUID) so the ID survives the entropy redactor in
+  // the log — WORKAROUND for issue #51 (see newErrorId). Revisit when #51 is fixed.
   const errorId = newErrorId();
   opts.logger?.error("http.unexpected_error", {
     errorId,
@@ -162,6 +151,11 @@ export function toErrorResponse(e: unknown, opts: ToErrorResponseOptions = {}): 
  * Best-effort correlation ids for the unexpected-error log. Route params use
  * `:id` for both workspace and session scopes, so the pathname decides which
  * is which. Never throws (used on the failure path itself).
+ *
+ * NOTE (PR #49 MINOR-3): only the /v1/sessions/ and /v1/workspaces/ prefixes
+ * are distinguished; a future top-level route falls back to method/path/user
+ * only. Best-effort by design — the errorId (not these ids) is the
+ * correlation key — so no logic change; recorded here instead.
  */
 export function errorContextFromRequest(
   method: string,
