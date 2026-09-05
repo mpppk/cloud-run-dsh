@@ -38,6 +38,7 @@ import {
 } from "@cloud-run-dsh/session-persistence-postgres";
 import type { QueryExecutor } from "@cloud-run-dsh/session-persistence-postgres";
 import type { Clock } from "@cloud-run-dsh/workspace-checkpoint";
+import { createDbReadinessProbe } from "./prod-adapters.js";
 import {
   badRequest,
   createControlPlaneDeps,
@@ -411,6 +412,54 @@ describe("readiness endpoint", () => {
       const res = await fetch(h.url("/readyz"));
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({ status: "ready" });
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("issue #97: async probe is awaited — unreachable DB -> 503, never 200", async () => {
+    const h = startHarness({
+      readiness: createDbReadinessProbe({
+        async query() {
+          // The measured production shape: the database is gone entirely.
+          throw new Error("Connection timeout after 30s");
+        },
+        async exec() {},
+        async transaction(fn) {
+          throw new Error("unreachable");
+        },
+      } satisfies QueryExecutor),
+    });
+    try {
+      const res = await fetch(h.url("/readyz"));
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body.status).toBe("not_ready");
+      expect(typeof body.reason).toBe("string");
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("issue #97: async probe is awaited — reachable DB -> 200, one SELECT 1 for two checks", async () => {
+    let queries = 0;
+    const h = startHarness({
+      readiness: createDbReadinessProbe({
+        async query() {
+          queries++;
+          return [{ "?column?": 1 }];
+        },
+        async exec() {},
+        async transaction(fn) {
+          throw new Error("unused");
+        },
+      } satisfies QueryExecutor),
+    });
+    try {
+      expect((await fetch(h.url("/readyz"))).status).toBe(200);
+      expect((await fetch(h.url("/readyz"))).status).toBe(200);
+      // Result cache: steady-state health checks cost no extra queries.
+      expect(queries).toBe(1);
     } finally {
       h.stop();
     }

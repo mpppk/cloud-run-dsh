@@ -13,6 +13,8 @@ import type {
   LeaseTransaction,
 } from "@cloud-run-dsh/controller-lease";
 import type { QueryExecutor as SessionQueryExecutor } from "@cloud-run-dsh/session-persistence-postgres";
+import type { Logger } from "@cloud-run-dsh/observability";
+import type { ControlPlaneReadiness } from "./deps.js";
 import {
   createBunSqlClient,
   resolveBunSqlTarget,
@@ -367,6 +369,89 @@ export class SqlTransactionalStateStore implements TransactionalStateStore {
         });
       }
     });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Database readiness probe for GET /readyz (issue #97).
+//
+// Measured on GCP 2026-09-05: /readyz answered 200 {"status":"ready"} while
+// the database was unreachable, and the first real query then failed after
+// 30s. Readiness that never touches the database sends the first page of
+// triage in the wrong direction, so production probes it for real — but:
+// - the probe is a single `SELECT 1`, never a full connection cycle;
+// - it races a short timeout (default 2s): a hung database must not hang
+//   the endpoint (the incident's 30s connection timeout is the shape being
+//   avoided — a hanging /readyz is worse than a 503);
+// - results are cached for a short TTL (default 10s) so steady-state health
+//   checks cost ~zero queries while a recovered database is noticed promptly.
+//
+// No startup grace period is special-cased: a process whose database is not
+// yet reachable is genuinely not ready to serve, and Cloud Run withholds
+// traffic until this endpoint says otherwise. Liveness (/livez) stays
+// independent so a slow database can never look like a dead process.
+//
+// The 503 body reason is a FIXED string. /readyz is served before auth, so
+// no error text (not even hostnames) is echoed to the prober; details go
+// to the structured log only.
+// ---------------------------------------------------------------------------
+
+export interface DbReadinessProbeOptions {
+  /** Probe timeout in ms (default 2000). A probe slower than this is not_ready. */
+  readonly timeoutMs?: number;
+  /** How long a probe result is reused in ms (default 10000). */
+  readonly cacheTtlMs?: number;
+  /** Clock seam for tests (default Date.now). */
+  readonly nowMs?: () => number;
+  /** Structured logger for probe-failure details (never client-visible). */
+  readonly logger?: Logger;
+}
+
+/** Fixed /readyz reason — pre-auth endpoint, so no error text is echoed. */
+export const DB_READINESS_NOT_READY_REASON =
+  "database unreachable: readiness probe (SELECT 1) failed or timed out";
+
+export function createDbReadinessProbe(
+  executor: Pick<SessionQueryExecutor, "query">,
+  opts: DbReadinessProbeOptions = {},
+): () => Promise<ControlPlaneReadiness> {
+  const timeoutMs = opts.timeoutMs ?? 2000;
+  const cacheTtlMs = opts.cacheTtlMs ?? 10_000;
+  const nowMs = opts.nowMs ?? Date.now;
+  let cached: { report: ControlPlaneReadiness; probedAtMs: number } | null = null;
+
+  return async (): Promise<ControlPlaneReadiness> => {
+    const now = nowMs();
+    if (cached && now - cached.probedAtMs < cacheTtlMs) {
+      return cached.report;
+    }
+    const report = await runDbProbe(executor, timeoutMs, opts.logger);
+    cached = { report, probedAtMs: nowMs() };
+    return report;
+  };
+}
+
+async function runDbProbe(
+  executor: Pick<SessionQueryExecutor, "query">,
+  timeoutMs: number,
+  logger: Logger | undefined,
+): Promise<ControlPlaneReadiness> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      executor.query("SELECT 1", []),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("readiness probe timed out")), timeoutMs);
+      }),
+    ]);
+    return { ready: true };
+  } catch (e) {
+    logger?.error("readyz.db_probe_failed", {
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return { ready: false, reason: DB_READINESS_NOT_READY_REASON };
+  } finally {
+    if (timer !== null) clearTimeout(timer);
   }
 }
 

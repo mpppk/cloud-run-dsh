@@ -20,6 +20,7 @@ import {
   FetchGcsClient,
   SqlTransactionalStateStore,
   createAuthenticatedInstanceTransport,
+  createDbReadinessProbe,
   createGcpAccessTokenProvider,
 } from "./prod-adapters.js";
 import { HttpAgentHostForwarder, createIdTokenProvider } from "./forwarding.js";
@@ -74,6 +75,11 @@ async function main(): Promise<void> {
     runtimes,
     clock,
     logger,
+    // Issue #97: /readyz probes the database for real (short-timeout
+    // SELECT 1 + result cache — see createDbReadinessProbe). Before this,
+    // no probe was wired, so a deployment that could never reach its
+    // database still answered 200 {"status":"ready"} (measured 2026-09-05).
+    readiness: createDbReadinessProbe(executor, { logger }),
     // Issue #22: forward appended user_message events to the workspace
     // Instance (ID-token auth for invoker IAM). The forwarder makes
     // postMessage 409 when the Instance has no URL (open first) and 502
