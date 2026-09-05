@@ -859,6 +859,13 @@ num_backends sample 3: 0 (from 1 series)    ← 4周目は 8 サンプル必要�
 
 ローカルの秘密（DB パスワード、LLM キー、DATABASE_URL）は 3 回上書きして破棄した。
 
+> 数字の出どころ: `52 added` は `apply5.log`、revision 00001 は
+> `deploy-c5.log`、stop 1.3 秒・再 `open` の 200（36.9 秒）・`RESULT` 2 件・
+> `/readyz` 20 プローブ・188 イベントは `c5-verify.log`、
+> マーカーの読み取りは `c5-sse-restore.txt`、
+> Step 8.1 の 4 回・ゲートの 3 サンプル・`47 destroyed` は `teardown-c5.log`。
+> `num_backends` のピーク 10 は §7.1 と同じ手順で Monitoring の保持データから確認した。
+
 ---
 
 ## 10. 1周目レポート（open まで）との差分
