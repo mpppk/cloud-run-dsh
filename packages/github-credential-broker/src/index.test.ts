@@ -264,13 +264,23 @@ describe("github-credential-broker", () => {
       transport,
       clock,
     });
-    const args = broker.gitAuthArgs("ghs_headerToken1234567890");
+    const token = "ghs_headerToken1234567890";
+    const args = broker.gitAuthArgs(token);
     expect(args.join(" ")).toContain("http.https://github.com/.extraheader");
-    expect(args.join(" ")).toContain("Authorization: Bearer ghs_headerToken1234567890");
-    // Args themselves contain token (needed for git), but they are NOT a persisted remote URL.
-    // The persisted URL must not contain token.
+    // Issue #62: git-over-HTTPS requires Basic x-access-token, not Bearer.
+    const expectedB64 = Buffer.from(`x-access-token:${token}`, "utf8").toString("base64");
+    expect(args.join(" ")).toContain(`Authorization: Basic ${expectedB64}`);
+    expect(args.join(" ")).not.toContain("Bearer");
+    // The shape alone is not enough — decode must round-trip to the token.
+    const header = args.find((a) => a.includes("extraheader"))!;
+    const b64 = header.split("Authorization: Basic ")[1]!.trim();
+    expect(Buffer.from(b64, "base64").toString("utf8")).toBe(`x-access-token:${token}`);
+    // Args themselves contain the secret (needed for git), but they are NOT a persisted remote URL.
+    // The persisted URL must not contain the token NOR its base64 form.
     const url = buildSafeRemoteUrl(repo());
-    assertNoTokenInValue(url, "ghs_headerToken1234567890");
+    assertNoTokenInValue(url, token);
+    expect(url).not.toContain(b64);
+    expect(url).not.toContain(token);
     // But args are ephemeral — we don't assertNoTokenInValue on them.
   });
 
