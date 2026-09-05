@@ -322,6 +322,163 @@ describe("observability", () => {
     expect(out["db_pw"]).toBe("[REDACTED]");
   });
 
+  test("i51: RFC 4122 UUIDs survive redaction (spec section 25 correlation keys)", () => {
+    // Repro for #51: UUIDs are identifiers, not secrets — but 36 chars /
+    // 2 classes / entropy > 3 tripped the entropy net and wiped every §25
+    // correlation key from structured logs.
+    const uuid = "d7383605-d479-47f9-bfef-8d62f82b729c"; // v4 (version 4, variant b)
+    expect(redactValue(uuid)).toBe(uuid);
+    expect(redactValue(`opened workspace ${uuid} ok`) as string).toContain(uuid);
+    // Case-insensitive: some producers emit uppercase UUIDs.
+    expect(redactValue(uuid.toUpperCase())).toBe(uuid.toUpperCase());
+    // A freshly generated ID (what the codebase actually logs) always passes:
+    // crypto.randomUUID() is v4, which the strict shape requires.
+    const fresh = crypto.randomUUID();
+    expect(redactValue(fresh)).toBe(fresh);
+    expect(redactValue(`dsh-${fresh}`)).toBe(`dsh-${fresh}`);
+    // Composite: instance_name is `dsh-${workspaceId}` — one 40-char token to
+    // the entropy net because `-` is in its character class.
+    const inst = `dsh-${uuid}`;
+    expect(redactValue(inst)).toBe(inst);
+    expect(redactValue(`instance ${inst} started`) as string).toContain(inst);
+    // The exact §25 field set from the issue report, via redactLogFields.
+    const fields = redactLogFields({
+      severity: "INFO",
+      event: "workspace_open",
+      workspace_id: uuid,
+      session_id: uuid,
+      user_id: "verify",
+      controller_id: uuid,
+      instance_name: inst,
+    } as unknown as LogFields) as unknown as Record<string, unknown>;
+    expect(fields["workspace_id"]).toBe(uuid);
+    expect(fields["session_id"]).toBe(uuid);
+    expect(fields["user_id"]).toBe("verify");
+    expect(fields["controller_id"]).toBe(uuid);
+    expect(fields["instance_name"]).toBe(inst);
+    // camelCase LogFields keys (the typed interface) keep UUIDs too.
+    const camel = redactLogFields({
+      severity: "INFO",
+      event: "workspace_open",
+      workspaceId: uuid,
+      sessionId: uuid,
+      sandboxId: inst,
+      toolCallId: uuid,
+      controllerId: uuid,
+      processId: uuid,
+      instanceName: inst,
+    });
+    expect(camel.workspaceId).toBe(uuid);
+    expect(camel.sessionId).toBe(uuid);
+    expect(camel.sandboxId).toBe(inst);
+    expect(camel.toolCallId).toBe(uuid);
+    expect(camel.controllerId).toBe(uuid);
+    expect(camel.processId).toBe(uuid);
+    expect(camel.instanceName).toBe(inst);
+  });
+
+  test("i51: UUID exemption is strict (near-UUID secrets still redacted)", () => {
+    // The exemption requires the version nibble (1-8) and variant nibble
+    // (8/9/a/b) — a loose `[0-9a-f-]{36}` would let hyphenated hex secrets
+    // through. Same 8-4-4-4-12 skeleton, bad version nibble (f), high entropy.
+    const badVersion = "d7383605-d479-f47f9-bfef-8d62f82b729c";
+    const outBadV = redactValue(`token ${badVersion} here`) as string;
+    expect(outBadV).not.toContain(badVersion);
+    expect(outBadV).toContain("[REDACTED]");
+    // Same skeleton, bad variant nibble (c).
+    const badVariant = "d7383605-d479-47f9-ceef-8d62f82b729c";
+    const outBadVar = redactValue(`token ${badVariant} here`) as string;
+    expect(outBadVar).not.toContain(badVariant);
+    expect(outBadVar).toContain("[REDACTED]");
+    // `dsh-` prefix does not blanket-exempt: high-entropy non-UUID content
+    // after the prefix is still a secret.
+    const outDsh = redactValue(`id dsh-${badVersion} end`) as string;
+    expect(outDsh).not.toContain(badVersion);
+    expect(outDsh).toContain("[REDACTED]");
+    // A UUID glued to more hex is not a valid identifier — redact it
+    // (hex-run boundaries in UUID_FIND_RE).
+    const uuid = "d7383605-d479-47f9-bfef-8d62f82b729c";
+    const glued = `${uuid}deadbeef`;
+    const outGlued = redactValue(`x ${glued} y`) as string;
+    expect(outGlued).not.toContain(glued);
+    expect(outGlued).toContain("[REDACTED]");
+    // A secret glued to a UUID redacts the whole token (remainder is itself
+    // secret-shaped), it does not ride the UUID's exemption.
+    const tail = "Xk9mPq3vT8RtY2wQ5sL7Zz";
+    const gluedSecret = `${uuid}${tail}`;
+    const outTail = redactValue(`x ${gluedSecret} y`) as string;
+    expect(outTail).not.toContain(tail);
+    expect(outTail).toContain("[REDACTED]");
+    // Documented bounding (consistent with the pre-existing `a` x 20 case):
+    // low-entropy repetition is not secret-shaped, exemption or not.
+    const low = `dsh-${"a".repeat(36)}`;
+    expect(redactValue(`id ${low} end`) as string).toContain(low);
+  });
+
+  test("i51: secret regression — every real shape still redacted after UUID exemption", () => {
+    // OpenRouter, the key format this project actually uses (48-hex tail).
+    const orKey = `sk-or-v1-${"0123456789abcdef".repeat(3)}`;
+    const outOr = redactValue(`key ${orKey} leaked`) as string;
+    expect(outOr).not.toContain("sk-or-v1");
+    expect(outOr).toContain("[REDACTED]");
+    // DeepSeek-style sk- keys.
+    expect(redactValue("key is sk-1234567890abcdefghij1234 ok") as string).toContain(
+      "[REDACTED]",
+    );
+    // PEM / Bearer / connection strings / GitHub prefixes / SA private_key.
+    const pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC...\n-----END PRIVATE KEY-----";
+    expect(redactValue(`k ${pem} e`) as string).toContain("[REDACTED]");
+    expect(
+      redactValue("Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.sig") as string,
+    ).toContain("[REDACTED]");
+    expect(redactValue("postgres://user:pass@db.example.com:5432/mydb") as string).toContain(
+      "[REDACTED]",
+    );
+    expect(redactValue("ghp_1234567890abcdef1234567890abcdef1234") as string).toContain(
+      "[REDACTED]",
+    );
+    expect(
+      redactValue("token ghs_abc123DEF456ghi789JKL012mno345pq end") as string,
+    ).toContain("[REDACTED]");
+    expect(
+      redactValue("my pat github_pat_1234567890ABCDEFGHIJ_1234567890 here") as string,
+    ).toContain("[REDACTED]");
+    const sa = redactValue({
+      type: "service_account",
+      private_key: "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCABCDEF1234567890abcdef",
+    }) as Record<string, unknown>;
+    expect(sa["private_key"]).toBe("[REDACTED]");
+    // Bearer-less Google token / free-text JWT / AWS AKIA.
+    const outYa = redactValue(
+      "Error: request failed with token ya29.a0AfH6SMBx9mPq3vT8rY2nZ5bJ7hL0cF4dW6aG1sE2qX9zAbCdEfGh",
+    ) as string;
+    expect(outYa).not.toContain("a0AfH6SMB");
+    expect(outYa).toContain("[REDACTED]");
+    const jwt =
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+    const outJwt = redactValue(`auth ${jwt} rejected`) as string;
+    expect(outJwt).not.toContain("eyJhbGciOi");
+    expect(outJwt).toContain("[REDACTED]");
+    expect(redactValue("saw key AKIAIOSFODNN7EXAMPLE in log") as string).toContain(
+      "[REDACTED]",
+    );
+    // High-entropy values under unknown keys.
+    const hi36 = "xK9mPq3vT8rY2nZ5bJ7hL0cF4dW6aG1sE2qX9z";
+    expect((redactValue({ db_pw: hi36 }) as Record<string, unknown>)["db_pw"]).toBe(
+      "[REDACTED]",
+    );
+    expect((redactValue({ pwd: hi36 }) as Record<string, unknown>)["pwd"]).toBe("[REDACTED]");
+    // secrets.token_hex(32) real output with NO commit context (the #29
+    // 3rd-round context-limited SHA rescue must keep catching this).
+    const hex64 = "625636386d8d6cff17fd2c37ba055ae206d9b53f589f4f1311f19abac2bee5cf";
+    const outHex = redactValue(`token is ${hex64} here`) as string;
+    expect(outHex).not.toContain(hex64);
+    expect(outHex).toContain("[REDACTED]");
+    expect((redactValue({ foo: hex64 }) as Record<string, unknown>)["foo"]).toBe(
+      "[REDACTED]",
+    );
+  });
+
   // -----------------------------------------------------------------------
   // NEVER log full command line or full environment
   // -----------------------------------------------------------------------
