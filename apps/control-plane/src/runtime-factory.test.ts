@@ -60,6 +60,10 @@ function testConfig(): ControlPlaneConfig {
     // Issue #56: must agree with the host= of agentHostDatabaseUrl above
     // (/cloudsql/<connection-name>) — the consistency guard enforces it.
     cloudSqlConnectionName: "test-proj:test-region:main",
+    // Issue #109: pool budget, injected into created Instances.
+    dbPoolMax: 5,
+    dbPoolIdleTimeout: 30,
+    dbPoolConnectionTimeout: 30,
     instanceGcIntervalMs: 3_600_000,
     instanceGcStaleAfterMs: 30 * 24 * 3_600_000,
     instanceGcMaxDeletesPerSweep: 10,
@@ -1292,6 +1296,9 @@ describe("buildInstanceEnv — agent-host env contract", () => {
         "CHECKPOINT_BUCKET",
         "CONTROLLER_ID",
         "DATABASE_URL",
+        "DB_POOL_CONNECTION_TIMEOUT",
+        "DB_POOL_IDLE_TIMEOUT",
+        "DB_POOL_MAX",
         "GCP_PROJECT_ID",
         "GCP_REGION",
         "GITHUB_APP_ID",
@@ -1305,6 +1312,11 @@ describe("buildInstanceEnv — agent-host env contract", () => {
       ].sort(),
     );
     expect(env["DATABASE_URL"]).toBe(config.agentHostDatabaseUrl);
+    // Issue #109: the Instance pool budget is dictated by the control plane
+    // (same 25-slot db-f1-micro budget — Bun defaults would re-exhaust it).
+    expect(env["DB_POOL_MAX"]).toBe("5");
+    expect(env["DB_POOL_IDLE_TIMEOUT"]).toBe("30");
+    expect(env["DB_POOL_CONNECTION_TIMEOUT"]).toBe("30");
     expect(env["GITHUB_APP_PRIVATE_KEY_PEM"]).toBe(config.githubAppPrivateKeyPem);
     // Issue #41: the Instance env carries the LLM key value (agent-host
     // resolves it per request via its default LLM_API_KEY_ENV).

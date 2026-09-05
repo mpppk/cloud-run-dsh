@@ -275,7 +275,7 @@ Baseline configuration (仕様書 §22 / 実装手順書 §6): `cpu: 4`, `memory
 | 12 | `GCP_PROJECT_ID` | `$PROJECT_ID`. |
 | 13 | `GCP_REGION` | `$REGION`. |
 
-Optional (not required, have defaults in `config.ts`): `PORT` (8080), `WORKSPACE_ROOT` (`/workspace`), `CHECKPOINT_KEY`, `SANDBOX_CLI_PATH`, `SANDBOX_ALLOW_EGRESS`, `INSTANCES_API_BASE_URL` (`https://run.googleapis.com/v2` — issue #47; the Instances API basePath must stay absolute, override only for emulators), plus the LLM settings below.
+Optional (not required, have defaults in `config.ts`): `PORT` (8080), `WORKSPACE_ROOT` (`/workspace`), `CHECKPOINT_KEY`, `SANDBOX_CLI_PATH`, `SANDBOX_ALLOW_EGRESS`, `INSTANCES_API_BASE_URL` (`https://run.googleapis.com/v2` — issue #47; the Instances API basePath must stay absolute, override only for emulators), `DB_POOL_MAX` (5), `DB_POOL_IDLE_TIMEOUT` (30s), `DB_POOL_CONNECTION_TIMEOUT` (30s — issue #109; the Instance pool budget. In normal operation the control plane injects its own values, so manual creates only need these when deviating from them), plus the LLM settings below.
 
 > **Bun.SQL socket note (#42):** Bun.SQL rejects Unix-socket DSNs passed as
 > URL strings outright (`TypeError: Invalid URL` — and the thrown error
@@ -520,6 +520,12 @@ GITHUB_APP_ID: "${GH_APP_ID}"
 # INSTANCE_GC_INTERVAL_MS: "3600000"
 # INSTANCE_GC_STALE_AFTER_MS: "2592000000"
 # INSTANCE_GC_MAX_DELETES_PER_SWEEP: "10"
+# DB プール予算（#109。任意。書かなければ 5本 / アイドル30秒で解放 / 接続リトライ30秒）。
+# db-f1-micro (max_connections 25) の既定配分は control-plane 5 + agent-host 5 = 10。
+# tier を上げる場合はここも上げる（docs/cost.md「DB 接続数: tier とプール予算」）。
+# DB_POOL_MAX: "5"
+# DB_POOL_IDLE_TIMEOUT: "30"
+# DB_POOL_CONNECTION_TIMEOUT: "30"
 EOF
 
 gcloud run deploy control-plane \
@@ -544,7 +550,10 @@ returned 201 on the first DB request after this change).
 Created Instances receive their environment (including `DATABASE_URL` with the
 DB password AND `OPENROUTER_API_KEY` with the LLM key — issue #41, plus
 whichever of `LLM_BASE_URL` / `LLM_MODEL` / `LLM_APPROVAL_POLICY` the control
-plane was configured with) as plain `value` pairs — the same posture as the
+plane was configured with, plus the pool budget `DB_POOL_MAX` /
+`DB_POOL_IDLE_TIMEOUT` / `DB_POOL_CONNECTION_TIMEOUT` — issue #109, always
+injected so an Instance can never run Bun defaults against the shared
+25-slot db-f1-micro) as plain `value` pairs — the same posture as the
 manual create in Step 5.2. Switching to secret references (`valueSource`)
 once the v2 Instances API shape for secrets is verified is follow-up work
 (the typed client in `packages/cloud-run-instance-client` only sends plain

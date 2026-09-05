@@ -289,6 +289,13 @@ export function buildInstanceEnv(
     WORKSPACE_ID: workspace.id,
     CHECKPOINT_BUCKET: config.checkpointBucket,
     DATABASE_URL: config.agentHostDatabaseUrl,
+    // Issue #109: the Instance's pool draws from the same 25-slot budget
+    // (db-f1-micro), so the control plane dictates it — an Instance with
+    // Bun defaults (max 10 eager, never reap) re-exhausts the tier alone.
+    // The agent-host reads the same names (see its config.ts).
+    DB_POOL_MAX: String(config.dbPoolMax),
+    DB_POOL_IDLE_TIMEOUT: String(config.dbPoolIdleTimeout),
+    DB_POOL_CONNECTION_TIMEOUT: String(config.dbPoolConnectionTimeout),
     GITHUB_APP_ID: config.githubAppId,
     GITHUB_APP_PRIVATE_KEY_PEM: config.githubAppPrivateKeyPem,
     OPENROUTER_API_KEY: config.openrouterApiKey,

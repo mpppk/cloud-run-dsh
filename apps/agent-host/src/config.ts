@@ -3,6 +3,8 @@
 // Cloud Run Instance restart loses all local state (the recovery path IS the
 // normal path).
 
+import { resolveBunSqlPoolOptions } from "@cloud-run-dsh/session-persistence-postgres";
+
 export const DEFAULT_WORKSPACE_ROOT = "/workspace";
 
 export const DEFAULT_SANDBOX_CLI_PATH = "/usr/local/gcp/bin/sandbox";
@@ -70,6 +72,23 @@ export interface AgentHostConfig {
   readonly checkpointKey: string;
   /** Cloud SQL connection string — host-only, never passed to a sandbox. */
   readonly databaseUrl: string;
+  /**
+   * Bun.SQL pool cap for this process (issue #109: `DB_POOL_MAX`, default
+   * 5 — the control plane injects the same value into every Instance it
+   * creates). db-f1-micro has 25 slots: control-plane 5 + agent-host 5 =
+   * 10, leaving room for operator psql. Raise with the DB tier.
+   */
+  readonly dbPoolMax: number;
+  /**
+   * Idle-backend reap in seconds (issue #109: `DB_POOL_IDLE_TIMEOUT`,
+   * default 30). Bun's default 0 never reaps.
+   */
+  readonly dbPoolIdleTimeout: number;
+  /**
+   * Connect-failure retry budget in seconds (issue #109:
+   * `DB_POOL_CONNECTION_TIMEOUT`, default 30). NOT a queue-wait cap.
+   */
+  readonly dbPoolConnectionTimeout: number;
   readonly githubAppId: string;
   /** GitHub App private key PEM — host-only, never written to disk or sandbox. */
   readonly githubAppPrivateKeyPem: string;
@@ -123,7 +142,9 @@ export function readAgentHostConfig(
   }
 
   const workspaceId = env["WORKSPACE_ID"]!.trim();
-  const portRaw = env["PORT"]?.trim();
+  // Issue #109: pool budget, same env names as the control plane (which
+  // injects them into created Instances — see its buildInstanceEnv).
+  const pool = resolveBunSqlPoolOptions(env);  const portRaw = env["PORT"]?.trim();
   const port = portRaw === undefined || portRaw === "" ? DEFAULT_PORT : Number.parseInt(portRaw, 10);
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
     throw new Error(`invalid PORT: ${portRaw}`);
@@ -136,6 +157,9 @@ export function readAgentHostConfig(
     checkpointBucket: env["CHECKPOINT_BUCKET"]!.trim(),
     checkpointKey: env["CHECKPOINT_KEY"]?.trim() || defaultCheckpointKey(workspaceId),
     databaseUrl: env["DATABASE_URL"]!.trim(),
+    dbPoolMax: pool.max,
+    dbPoolIdleTimeout: pool.idleTimeout,
+    dbPoolConnectionTimeout: pool.connectionTimeout,
     githubAppId: env["GITHUB_APP_ID"]!.trim(),
     githubAppPrivateKeyPem: env["GITHUB_APP_PRIVATE_KEY_PEM"]!,
     repositoryOwner: env["REPOSITORY_OWNER"]!.trim(),
