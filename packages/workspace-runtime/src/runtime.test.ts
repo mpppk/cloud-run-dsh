@@ -950,3 +950,61 @@ describe("WorkspaceRuntime — split open phases (issue #60 案C/案D)", () => {
     expect(h.instance.calls.filter((c) => c === "start")).toHaveLength(1);
   });
 });
+
+describe("WorkspaceRuntime — issue #122: the turn gate must not stick on a stale in-memory state", () => {
+  test("a turn is accepted after another process restores the row to READY (no re-open)", async () => {
+    // The #122 timeline: this runtime (the control plane) fails its health
+    // observation and records RESTORE_FAILED — in memory AND in the store.
+    const h = makeHarness();
+    h.steps.failures.set("waitForInstanceHealth", () => new Error("agent-host never became healthy"));
+    await expect(h.runtime.openInstance()).rejects.toThrow("agent-host never became healthy");
+    expect(h.runtime.getState()).toBe("RESTORE_FAILED");
+    expect(await h.store.load("ws-1")).toBe("RESTORE_FAILED");
+
+    // ... then the agent-host (a DIFFERENT process over the SAME row)
+    // recovers late and persists READY — the `workspace.restore.completed`
+    // that the issue observed 44s after the control plane gave up.
+    const agent = new WorkspaceRuntime({
+      workspaceId: "ws-1",
+      store: h.store,
+      clock: h.clock,
+      instanceRuntime: h.instance,
+      instanceName: "dsh-ws-1",
+      steps: new FakeSteps(),
+      idle: new IdleManager(h.clock),
+    });
+    await expect(agent.completeRestore()).resolves.toBe("READY");
+
+    // The DB read (what GET /v1/workspaces/:id serves) now says READY.
+    expect(await h.store.load("ws-1")).toBe("READY");
+
+    // So the turn gate on THIS runtime must agree — without calling open()
+    // again here. Before the fix this threw
+    // AgentInputRefusedError(RESTORE_FAILED) off the stale in-memory cache
+    // while GET answered READY.
+    await h.runtime.assertAgentInputAllowed();
+    await h.runtime.beginAgentTurn();
+    expect(h.runtime.getState()).toBe("BUSY");
+    await h.runtime.endAgentTurn();
+    expect(h.runtime.getState()).toBe("READY");
+  });
+
+  test("the gate still refuses while the row itself is RESTORE_FAILED", async () => {
+    // The reload must not invent READY: when nobody recovered the row, the
+    // gate keeps refusing (仕様書 section 8).
+    const h = makeHarness();
+    h.steps.failures.set("restoreCheckpoint", () => new Error("checkpoint download failed"));
+    await expect(h.runtime.open()).rejects.toThrow("checkpoint download failed");
+    expect(await h.store.load("ws-1")).toBe("RESTORE_FAILED");
+    // try/catch (not rejects) so this holds for both the old sync gate and
+    // the fixed async gate.
+    let gateError: unknown = null;
+    try {
+      await h.runtime.assertAgentInputAllowed();
+    } catch (e) {
+      gateError = e;
+    }
+    expect(gateError).toBeInstanceOf(AgentInputRefusedError);
+    await expect(h.runtime.beginAgentTurn()).rejects.toThrow(AgentInputRefusedError);
+  });
+});
