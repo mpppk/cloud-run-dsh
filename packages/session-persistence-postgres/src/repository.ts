@@ -9,6 +9,20 @@ import type {
   NewSessionEvent,
 } from "./types.js";
 
+/**
+ * Real PostgreSQL returns TIMESTAMPTZ columns as Date objects while the
+ * in-memory fake returns the strings it was given. The row types promise
+ * ISO strings, so normalize here — otherwise the two backends return
+ * different shapes for the same row.
+ */
+function toIsoString(value: unknown): string {
+  return value instanceof Date ? value.toISOString() : String(value);
+}
+
+function toIsoStringOrNull(value: unknown): string | null {
+  return value === null || value === undefined ? null : toIsoString(value);
+}
+
 function rowToWorkspace(row: Record<string, unknown>): Workspace {
   return {
     id: row["id"] as string,
@@ -19,9 +33,9 @@ function rowToWorkspace(row: Record<string, unknown>): Workspace {
     instanceName: (row["instance_name"] as string | null) ?? null,
     instanceUrl: (row["instance_url"] as string | null) ?? null,
     runtimeState: row["runtime_state"] as Workspace["runtimeState"],
-    lastActivityAt: (row["last_activity_at"] as string | null) ?? null,
-    createdAt: row["created_at"] as string,
-    updatedAt: row["updated_at"] as string,
+    lastActivityAt: toIsoStringOrNull(row["last_activity_at"]),
+    createdAt: toIsoString(row["created_at"]),
+    updatedAt: toIsoString(row["updated_at"]),
   };
 }
 
@@ -30,8 +44,8 @@ function rowToSession(row: Record<string, unknown>): Session {
     id: row["id"] as string,
     workspaceId: row["workspace_id"] as string,
     metadata: (row["metadata"] as Record<string, unknown>) ?? {},
-    createdAt: row["created_at"] as string,
-    updatedAt: row["updated_at"] as string,
+    createdAt: toIsoString(row["created_at"]),
+    updatedAt: toIsoString(row["updated_at"]),
   };
 }
 
@@ -187,23 +201,39 @@ export class PostgresSessionPersistenceRepository implements SessionPersistenceR
   }
 
   /**
-   * Append events atomically: allocates contiguous seq inside a transaction via
-   * `SELECT max(seq) ... FOR UPDATE`. Never produces gaps or duplicates under concurrency.
-   * Persisted events are immutable (no UPDATE path).
+   * Append events atomically inside a transaction: allocates a contiguous seq
+   * range and inserts the batch before commit. Never produces gaps or
+   * duplicates under concurrency. Persisted events are immutable (no UPDATE path).
+   *
+   * Serialization comes from locking the PARENT `sessions` row
+   * (`SELECT ... FOR UPDATE`) — never from locking `session_events` rows.
+   * PostgreSQL rejects `FOR UPDATE` on aggregate queries
+   * (`SELECT max(seq) ... FOR UPDATE` fails with
+   * "FOR UPDATE is not allowed with aggregate functions", issue #70), and
+   * locking the newest event row instead would not serialize the zero-events
+   * case (no row exists to lock). The parent row always exists here (append
+   * to a missing session is rejected), so concurrent appends to the same
+   * session always serialize on that lock: a follower blocks until the
+   * leader commits, then reads the fresh `max(seq)`.
    */
   async append(sessionId: string, events: NewSessionEvent[]): Promise<SessionEvent[]> {
     if (events.length === 0) return [];
     return this.executor.transaction(async (tx) => {
-      // Verify session exists
+      // Lock the parent session row FIRST: this serializes concurrent
+      // appends to the same session (the lock is held until commit, so a
+      // follower's max(seq) read below observes the leader's inserts).
+      // Doubles as the existence check. Must precede the max(seq) read.
       const sessionRows = await tx.query<Record<string, unknown>>(
-        "SELECT * FROM sessions WHERE id = $1",
+        "SELECT id FROM sessions WHERE id = $1 FOR UPDATE",
         [sessionId],
       );
       if (sessionRows.length === 0) throw new Error(`session not found: ${sessionId}`);
 
-      // Allocate seq atomically. FOR UPDATE serializes concurrent appends.
+      // Plain aggregate read — NO locking clause. PostgreSQL rejects
+      // `FOR UPDATE` alongside aggregates (issue #70). Safe without it:
+      // the parent-row lock above already serialized concurrent writers.
       const maxRows = await tx.query<{ max: number | null }>(
-        "SELECT max(seq) as max FROM session_events WHERE session_id = $1 FOR UPDATE",
+        "SELECT max(seq) as max FROM session_events WHERE session_id = $1",
         [sessionId],
       );
       const currentMax = maxRows[0]?.max ?? null;
@@ -236,8 +266,13 @@ export class PostgresSessionPersistenceRepository implements SessionPersistenceR
         });
       }
 
-      // Validate contiguity was preserved (defensive: if max was stale due to race without FOR UPDATE)
-      // This is redundant when FOR UPDATE works, but guards against misconfigured executor.
+      // Validate contiguity was preserved inside the same transaction.
+      // This is NOT redundant: it is the backstop that turns a lost
+      // serialization guarantee into a loud error instead of silent
+      // corruption. If the parent-row lock above ever stops working (e.g.
+      // it is removed, or a new executor ignores the locking clause — cf.
+      // issue #70, where the fake silently skipped it), the append fails
+      // here rather than persisting a gap or duplicate.
       const all = await tx.query<Record<string, unknown>>(
         "SELECT seq FROM session_events WHERE session_id = $1 ORDER BY seq ASC",
         [sessionId],
