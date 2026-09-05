@@ -27,6 +27,7 @@ Durable state: GitHub (canonical), Cloud SQL (metadata/sessions/checkpoints), GC
 | Document | What it covers |
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | **Start here.** The architecture as measured on GCP: components and how they map to the diagram, the open-workspace sequence with per-step implementation status, network and security model, and the create-and-verify procedure. |
+| [`docs/e2e-verification-report.md`](docs/e2e-verification-report.md) | **The 2026-09-05 end-to-end verification on GCP: the full sequence diagram ran, and the 13 production-only bugs found on the way.** |
 | [`docs/bringup-report.md`](docs/bringup-report.md) | The 2026-09-03 bring-up: what was proven on GCP, what was not, and 11 gotchas with their evidence. |
 | [`docs/deployment-runbook.md`](docs/deployment-runbook.md) | The full deployment runbook (canonical). |
 | [`docs/cost.md`](docs/cost.md) | Cost breakdown and the minimal profile. |
@@ -34,9 +35,15 @@ Durable state: GitHub (canonical), Cloud SQL (metadata/sessions/checkpoints), GC
 | [`docs/gcp-ai-agent-impersonation.md`](docs/gcp-ai-agent-impersonation.md) | The `ai-agent` operator identity and its escalation path. |
 | `docs/システム仕様書 v1.0`, `docs/実装手順書 v1.0` | Original spec and implementation guide (Japanese). |
 
-> **Status:** the platform and the sandbox run on GCP; the agent itself does not exist yet.
-> There is no LLM client in the repository, and control-plane and agent-host do not talk to each other.
-> See [#31](https://github.com/mpppk/cloud-run-dsh/issues/31) for the remaining work.
+> **Status (2026-09-05):** the full open-workspace sequence has run end to end on GCP.
+> A real agent turn completed there — the LLM called a harness tool, read a file from the
+> cloned repository, and the events streamed back over SSE. Getting there took 13 fixes for
+> bugs that only appear in production; see
+> [`docs/e2e-verification-report.md`](docs/e2e-verification-report.md).
+>
+> Known gaps: `stop` does not delete the Instance and writes no workspace tarball
+> ([#72](https://github.com/mpppk/cloud-run-dsh/issues/72)), and `terraform destroy` fails
+> after migrations have run ([#73](https://github.com/mpppk/cloud-run-dsh/issues/73)).
 
 ## Monorepo
 
