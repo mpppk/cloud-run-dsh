@@ -86,6 +86,11 @@ export async function main(): Promise<void> {
   const server = Bun.serve({
     port: host.config.port,
     hostname: "0.0.0.0",
+    // Same reason as the control plane (see SERVER_IDLE_TIMEOUT_SECONDS
+    // there): Bun's 10s default closes the connection under any long
+    // lifecycle call. prepare-stop drains the live turn and writes the
+    // workspace tar.gz before it answers, which routinely exceeds 10s.
+    idleTimeout: 255,
     fetch: (request) => host.gateway.handle(request),
   });
   host.logger.info("agent.host.listening", { event_detail: `port=${server.port}` });
