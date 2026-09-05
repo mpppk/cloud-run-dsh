@@ -217,10 +217,16 @@ export class RuntimeRegistry {
 
 /**
  * Readiness report served by GET /readyz. Unlike /livez (liveness: the
- * process is up), readiness must honestly reflect degraded capability —
+ * process is up), readiness honestly reflects degraded capability —
  * e.g. the database being unreachable. (An earlier revision named "the
  * production runtime registry being a placeholder" as the example; the
  * placeholder was removed in #23, so the example was updated.)
+ *
+ * Issue #97: this honesty is load-bearing, not aspirational. Production
+ * wires a real database probe here (createDbReadinessProbe in
+ * prod-adapters.ts); a deployment whose database is unreachable answers
+ * 503, never 200, so Cloud Run withholds traffic instead of serving 500s
+ * behind a "ready" badge.
  */
 export interface ControlPlaneReadiness {
   readonly ready: boolean;
@@ -251,8 +257,11 @@ export interface ControlPlaneDeps extends AuthDeps {
    * Optional readiness probe (GET /readyz). When absent, /readyz reports
    * ready. When present it must report honestly — a control plane that has
    * lost its database reports NOT ready with the reason.
+   *
+   * May be async: the production database probe (issue #97) issues a
+   * short-timeout `SELECT 1` and the server awaits it before answering.
    */
-  readonly readiness?: () => ControlPlaneReadiness;
+  readonly readiness?: () => ControlPlaneReadiness | Promise<ControlPlaneReadiness>;
   /**
    * Forwards appended events to the workspace Instance (issues #22/#39:
    * `user_message` + `approval` + `cancel`). Optional so unit tests and the

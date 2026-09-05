@@ -80,9 +80,12 @@ bucket (`workspaces/<id>/manual-checkpoints/`).
 
 Honest and observable behavior — never silent:
 
-- `GET /readyz` returns **200** `ready` (no degraded capability to report;
-  a failed `open`/`stop` surfaces per-request as before: state conflicts as
-  **409**, unreachable infrastructure as **5xx** with no internals leaked).
+- `GET /readyz` probes the database for real (`SELECT 1` with a 2s timeout,
+  result cached 10s — `createDbReadinessProbe`, issue #97): **200** `ready`
+  when reachable, **503** `not_ready` when unreachable (a failed `open`/`stop`
+  surfaces per-request as before: state conflicts as **409**, unreachable
+  infrastructure as **5xx** with no internals leaked; the 503 reason is a
+  fixed string because `/readyz` is served before auth).
 - The Instance URL of an opened workspace is available two ways for the
   #22 forwarding work: `WorkspaceRuntimeHandle.getInstanceUrl()` (live
   Instances API lookup, falls back to the durable row) and the

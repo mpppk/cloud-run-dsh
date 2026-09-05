@@ -226,8 +226,16 @@ export function createFetchHandler(deps: ControlPlaneDeps): (request: Request) =
       // placeholder was removed in #23). Served before auth,
       // like /livez — it must be probeable by the platform (/readyz reaches
       // the container; only the exact "/healthz" is reserved, see above).
+      //
+      // Issue #97: the probe may be async — production checks the database
+      // with a short-timeout SELECT 1 (createDbReadinessProbe) and the
+      // server awaits it. A deployment that answers 200 here while its
+      // database is unreachable sends operators down the wrong path (every
+      // request 500s behind a "ready" badge), so the honest answer matters
+      // more than a fast one. The probe itself caps its latency (timeout +
+      // result cache), so awaiting it never hangs this endpoint.
       if (url.pathname === "/readyz" && request.method === "GET") {
-        const report = deps.readiness?.();
+        const report = await deps.readiness?.();
         if (report && !report.ready) {
           return new Response(
             JSON.stringify({ status: "not_ready", reason: report.reason }),
