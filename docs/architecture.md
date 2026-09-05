@@ -163,7 +163,7 @@ sequenceDiagram
 | 入力の転送（control-plane → agent-host） | あり | **実行** | [#22](https://github.com/mpppk/cloud-run-dsh/issues/22)。停止中は 409、転送失敗は 502。 |
 | **エージェントのターン（LLM 呼び出し）** | あり | **実行** | [#21](https://github.com/mpppk/cloud-run-dsh/issues/21)。OpenRouter 経由で LLM がツールを呼び、`/workspace` の実ファイルを読んで応答した。 |
 | SSE 配信 | あり | **実行** | `turn/start` から `turn/end` までのイベント列を実機で受信した。 |
-| チェックポイントして停止 | あり | **一部** | `stop` は agent-host の停止準備（ドレイン→tar.gz 保存→sandbox 破棄）を経て `STOPPED`（[#72](https://github.com/mpppk/cloud-run-dsh/issues/72)）。チェックポイント失敗時は Cloud Run の stop を呼ばず `CHECKPOINT_FAILED`。delete しないのは意図した設計（[#85](https://github.com/mpppk/cloud-run-dsh/issues/85)）。stop → restart → 復元は 2026-09-05 に GCP 実機で確認済み（[レポート](./stop-restore-verification-report.md)）。 |
+| チェックポイントして停止 | あり | **一部** | `stop` は agent-host の停止準備（ドレイン→チェックポイント保存→sandbox 破棄）を経て `STOPPED`（[#72](https://github.com/mpppk/cloud-run-dsh/issues/72)）。チェックポイント失敗時は Cloud Run の stop を呼ばず `CHECKPOINT_FAILED`。delete しないのは意図した設計（[#85](https://github.com/mpppk/cloud-run-dsh/issues/85)）。stop → restart → 復元は 2026-09-05 に GCP 実機で確認済み（[レポート](./stop-restore-verification-report.md)）。 |
 
 > **2026-09-05、この図の全経路が GCP 実機で動いた。** ユーザーのメッセージが
 > control-plane から agent-host に届き、LLM がハーネスのツールで clone 済みリポジトリの
