@@ -29,6 +29,10 @@ CREATE TABLE sessions (
 
 CREATE TABLE session_events (
   session_id UUID NOT NULL REFERENCES sessions(id),
+  -- seq has no DB-side DEFAULT/sequence: the application assigns a gapless
+  -- per-session seq under a parent-row lock (see
+  -- packages/session-persistence-postgres/src/repository.ts, #70). Do not add
+  -- a serial/identity default here — it would mask gaps the app must prevent.
   seq BIGINT NOT NULL,
   event_type TEXT NOT NULL,
   event_time BIGINT NOT NULL,

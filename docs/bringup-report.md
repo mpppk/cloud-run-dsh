@@ -228,3 +228,26 @@ reviewer には「worker の『テストが通りました』を信用するな�
 - **CI** が全ての PR で、型検査・テスト・Terraform 検証・両イメージのネイティブ amd64 ビルドを実行する。
 - **次の作業** は [#31](https://github.com/mpppk/cloud-run-dsh/issues/31) に集約。
   順序は `#23 RuntimeRegistry 結線` → `#22 入力の転送経路` → `#21 エージェントのターン`。
+
+---
+
+## 2026-09-05 追記（本書は 2026-09-03 時点の記録であり、本文は書き換えない）
+
+上記「確認していないこと」は 2026-09-05 の端から端までの動作確認で覆った。
+詳細は [動作確認レポート](./e2e-verification-report.md)。差分のみ記す:
+
+- 「ENTRYPOINT を上書きしたので `index.ts` は動いていない」→ 2026-09-05 に動いた。
+  `command` を外して必須の環境変数を全て与えた起動で `workspace.restore.completed` に到達
+  （[#24](https://github.com/mpppk/cloud-run-dsh/issues/24)）。
+- 「LLM クライアントが無い」「転送経路・エージェントループが未実装」→ 実装された。
+  control-plane → agent-host の入力転送（[#22](https://github.com/mpppk/cloud-run-dsh/issues/22)）と
+  実エージェントループのターン（[#21](https://github.com/mpppk/cloud-run-dsh/issues/21)）が
+  OpenRouter 経由の LLM 呼び出し・ツール実行・SSE 配信まで実機で動いた。
+- 残作業 [#31](https://github.com/mpppk/cloud-run-dsh/issues/31)（`#23` → `#22` → `#21`）は
+  2026-09-05 に CLOSED。残件は
+  [#72](https://github.com/mpppk/cloud-run-dsh/issues/72)（`stop` の delete / tar.gz 未保存）と
+  [#73](https://github.com/mpppk/cloud-run-dsh/issues/73)（マイグレーション後の `terraform destroy` 失敗）。
+- G2 / G3（`/cloudsql` ボリュームは動き、公開 IPv4 が要る）は 2026-09-05 に再実証された。
+  G8（`/tmp` への書き込み）は仕様書 §6.2 とアダプタのコメントが訂正済み
+  （[#30](https://github.com/mpppk/cloud-run-dsh/issues/30)）。
+  リソース数は VPC コネクタ廃止で 52 → **48**（2026-09-05 の apply 実測）。

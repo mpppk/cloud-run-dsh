@@ -92,6 +92,10 @@ resource "google_sql_database_instance" "main" {
       # the instance's public address: with ipv4_enabled = false it fails with
       # "SFEClient is nil / refresh failed: context deadline exceeded".
       # Both behaviours were measured against this project on 2026-09-03.
+      # Re-verified on 2026-09-05: the production agent-host Instance mounted
+      # the `cloudSqlInstance` volume at /cloudsql and reached PostgreSQL 16
+      # (INSERT + SELECT as dsh_app) with db_enable_public_ip = true; see
+      # docs/e2e-verification-report.md section 1.1 and docs/architecture.md.
       #
       # `authorized_networks` is deliberately left EMPTY. A Cloud Run Instance
       # egresses from Google's shared address pool, so any IP allowlist wide
