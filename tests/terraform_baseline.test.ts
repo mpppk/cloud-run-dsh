@@ -285,4 +285,20 @@ describe("content checks", () => {
     const literals = [...allTf.matchAll(/project_id\s*=\s*"[^"]+"/g)];
     expect(literals.length).toBe(0);
   });
+
+  test("cloudsql.tf pins destroy order database-before-user for issue #73", () => {
+    const c = tfContents["cloudsql.tf"];
+    // The DATABASE must depend on the USER so that destroy runs
+    // database -> user (destroy is the inverse of creation order).
+    // The reverse direction (user depending on database) would destroy the
+    // user first and reproduce the `role "dsh_app" cannot be dropped` 400.
+    const dbBlock = c.match(/resource "google_sql_database" "dsh" \{[\s\S]*?\n\}/);
+    expect(dbBlock).not.toBeNull();
+    expect(dbBlock![0]).toMatch(/depends_on\s*=\s*\[google_sql_user\.app\]/);
+    // The user must NOT carry the reverse edge — that would flip destroy
+    // order back to user-first.
+    const userBlock = c.match(/resource "google_sql_user" "app" \{[\s\S]*?\n\}/);
+    expect(userBlock).not.toBeNull();
+    expect(userBlock![0]).not.toMatch(/depends_on\s*=\s*\[google_sql_database\.dsh\]/);
+  });
 });
