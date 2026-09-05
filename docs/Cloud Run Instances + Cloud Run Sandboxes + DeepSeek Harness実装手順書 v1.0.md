@@ -275,7 +275,8 @@ tool-fs
 tool-fs-search
 ```
 
-を組み込む。
+を組み込む（能力名の略称。npm パッケージは `@deepseek-ai/` スコープ付き
+`@deepseek-ai/dsh-*`（例: `@deepseek-ai/dsh-fs-sandbox`）。素のパッケージ名は誤り）。
 
 policy:
 
