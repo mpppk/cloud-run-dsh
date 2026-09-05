@@ -510,7 +510,9 @@ export class CloudRunInstanceClient implements InstanceRuntime {
   }
 
   /**
-   * v2 GoogleCloudRunV2Instance create body (live discovery, 2026-09-03):
+   * v2 GoogleCloudRunV2Instance create body (live discovery 2026-09-03; shape
+   * re-validated with `validateOnly=true` on 2026-09-05 — see the launchStage
+   * and volumes notes below):
    *   - launchStage        (top-level; issue #53 — BETA is required when
    *     `containers[].sandboxLauncher` is set, the API default rejects it)
    *   - containers[]       (Required; exactly one container)
