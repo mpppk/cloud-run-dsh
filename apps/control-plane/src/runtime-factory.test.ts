@@ -1483,3 +1483,119 @@ describe("assertCloudSqlSocketConsistency — issue #56 mount/DATABASE_URL contr
     expect(h.transport.requests).toEqual([]);
   });
 });
+
+describe("issue #121 — the Cloud Run shutdown window vs the readiness budget", () => {
+  /**
+   * What the Instance URL serves while Cloud Run is still shutting the old
+   * generation down (the real 2026-09-05 report): a Google-frontend HTML
+   * error page — NOT an agent-host JSON answer. The agent-host itself
+   * answers JSON (e.g. 503 {"status":"RESTORING"}) once its URL is live.
+   */
+  const FRONTEND_500_HTML =
+    `<html><head><meta http-equiv="content-type" content="text/html;charset=utf-8">` +
+    `<title>500 Server Error</title></head>` +
+    `<body text=#000000 bgcolor=#ffffff><h1>Error: Server Error</h1>` +
+    `<h2>The service you requested is not available at this time.</h2></body></html>`;
+  const HOST_RESTORING_JSON = JSON.stringify({ status: "RESTORING", workspaceId: "ws-1" });
+
+  function readyInstanceHandler() {
+    return async (req: { method: string }) => {
+      if (req.method === "GET") {
+        return { status: 200, body: instanceBody("dsh-ws-1", "https://dsh-ws-1.run.app") };
+      }
+      return { status: 200, body: {} };
+    };
+  }
+
+  function registryWithHealth(
+    h: Harness,
+    healthFetch: HealthFetch,
+    agentHealthPoll: { maxAttempts: number; intervalMs: number },
+  ) {
+    return createProductionRuntimeRegistry({
+      config: testConfig(),
+      repo: h.repo,
+      stateStore: new SqlTransactionalStateStore(h.executor),
+      clock: new SystemClock(),
+      instanceTransport: h.transport,
+      gcsClient: h.gcs,
+      healthFetch,
+      instancePoll: { maxAttempts: 3, intervalMs: 0 },
+      agentHealthPoll,
+      sleep: async () => {},
+    });
+  }
+
+  test("late recovery after a frontend-500 shutdown window succeeds (budget is not spent on 500s)", async () => {
+    // stop -> open 1s later: the first 5 polls hit the shutting-down URL
+    // (frontend 500s), then the new generation answers healthy. The health
+    // budget is only 3 — if frontend 500s consumed it, this open would fail
+    // exactly like the 2026-09-05 incident. Before the fix this rejects with
+    // "never became healthy".
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(readyInstanceHandler());
+    let calls = 0;
+    const shutdownThenHealthy: HealthFetch = async (url: string) => {
+      calls++;
+      h.healthCalls.push(url);
+      if (calls <= 5) {
+        return { ok: false, status: 500, text: async () => FRONTEND_500_HTML };
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ status: "READY" }) };
+    };
+    const registry = registryWithHealth(h, shutdownThenHealthy, { maxAttempts: 3, intervalMs: 0 });
+    const handle = await registry.get(workspace);
+    await expect(handle.open()).resolves.toBe("STARTING");
+    expect(h.healthCalls).toHaveLength(6);
+  });
+
+  test("a genuinely broken host still fails within budget (no unbounded waiting)", async () => {
+    // The agent-host itself keeps answering 503 JSON — that IS evidence of
+    // unhealth, so the poll must give up after maxAttempts, not wait forever.
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(readyInstanceHandler());
+    const broken: HealthFetch = async (url: string) => {
+      h.healthCalls.push(url);
+      return { ok: false, status: 503, text: async () => HOST_RESTORING_JSON };
+    };
+    const registry = registryWithHealth(h, broken, { maxAttempts: 3, intervalMs: 0 });
+    const handle = await registry.get(workspace);
+    const err = await handle.open().then(
+      (): Error | null => null,
+      (e: unknown) => e as Error,
+    );
+    expect(err).not.toBeNull();
+    expect(err!.message).toMatch(/never became healthy/);
+    // Bounded: exactly the health budget was spent — no more, no endless loop.
+    expect(h.healthCalls).toHaveLength(3);
+    expect(handle.getState()).toBe("RESTORE_FAILED");
+  });
+
+  test("an endless frontend-500 window still fails bounded (the shutdown budget is finite)", async () => {
+    // If the URL never comes alive, open() must still reject instead of
+    // polling forever — the shutdown-window allowance is a second finite
+    // budget, not an infinite pass.
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(readyInstanceHandler());
+    const alwaysFrontend: HealthFetch = async (url: string) => {
+      h.healthCalls.push(url);
+      return { ok: false, status: 500, text: async () => FRONTEND_500_HTML };
+    };
+    const registry = registryWithHealth(h, alwaysFrontend, { maxAttempts: 3, intervalMs: 0 });
+    const handle = await registry.get(workspace);
+    const err = await handle.open().then(
+      (): Error | null => null,
+      (e: unknown) => e as Error,
+    );
+    expect(err).not.toBeNull();
+    expect(err!.message).toMatch(/never became healthy/);
+    // Finite: generous ceiling so the shutdown allowance fits, but an
+    // unbounded loop would blow past it (and hang the suite).
+    expect(h.healthCalls.length).toBeGreaterThan(0);
+    expect(h.healthCalls.length).toBeLessThanOrEqual(200);
+    expect(handle.getState()).toBe("RESTORE_FAILED");
+  });
+});
