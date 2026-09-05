@@ -12,6 +12,10 @@ import {
 } from "@cloud-run-dsh/session-persistence-postgres";
 import { InMemoryFakeExecutor } from "@cloud-run-dsh/session-persistence-postgres/testing";
 import type { GcsClient } from "@cloud-run-dsh/workspace-checkpoint";
+import {
+  IdleManager,
+  WorkspaceRuntime,
+} from "@cloud-run-dsh/workspace-runtime";
 import { SystemClock } from "./deps.js";
 import { SqlTransactionalStateStore } from "./prod-adapters.js";
 import type { ControlPlaneConfig } from "./config.js";
@@ -148,17 +152,60 @@ function makeRegistry(h: Harness, configOverride?: Partial<ControlPlaneConfig>) 
   });
 }
 
+/**
+ * Agent-host role on the SHARED row (issue #60): a second WorkspaceRuntime
+ * over the same executor, with no-op restore steps and a stub instance that
+ * reports READY (the host is alive exactly when this code runs). Drives the
+ * completeRestore() phase the control-plane handle deliberately skips.
+ */
+function makeAgentRuntime(h: Harness, workspaceId = "ws-1"): WorkspaceRuntime {
+  const noop = async () => {};
+  return new WorkspaceRuntime({
+    workspaceId,
+    store: new SqlTransactionalStateStore(h.executor),
+    clock: new SystemClock(),
+    instanceRuntime: {
+      create: async () => ({ name: "dsh-ws-1", state: "READY" }),
+      start: async () => {},
+      stop: async () => {},
+      get: async () => ({ name: "dsh-ws-1", state: "READY" }),
+      delete: async () => {},
+    },
+    instanceName: "dsh-ws-1",
+    steps: {
+      waitForInstanceHealth: noop,
+      cloneRepository: noop,
+      checkoutBase: noop,
+      restoreCheckpoint: noop,
+      createSandbox: noop,
+      restoreHarness: noop,
+      runLifecycleCheckpoint: noop,
+      flushSessionPersistence: noop,
+      deleteSandbox: noop,
+    },
+    idle: new IdleManager(new SystemClock()),
+  });
+}
+
+/** Runs the agent-host restore phase to completion on the shared row. */
+function driveAgentRestore(h: Harness, workspaceId = "ws-1"): Promise<string> {
+  return makeAgentRuntime(h, workspaceId).completeRestore();
+}
+
 describe("createProductionRuntimeRegistry — open() drives the Instances API", () => {
-  test("first open creates, starts, waits for health, persists name+url, returns READY", async () => {
+  test("first open creates, starts, waits for health (stays STARTING); the agent phase drives READY", async () => {
     const h = makeHarness();
     const workspace = await seedWorkspace(h.repo);
     h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
 
     const registry = makeRegistry(h);
 
+    // Issue #60 案C: the control plane stops after the health observation —
+    // it must NOT move the shared row past STARTING.
     const handle = await registry.get(workspace);
     const state = await handle.open();
-    expect(state).toBe("READY");
+    expect(state).toBe("STARTING");
+    expect((await h.repo.getWorkspace("ws-1"))!.runtimeState).toBe("STARTING");
 
     const methods = h.transport.requests.map((r) => `${r.method} ${r.url}`);
     expect(methods[0]).toBe(`GET ${BASE_PATH}/instances/dsh-ws-1`);
@@ -221,6 +268,14 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     expect(row!.instanceName).toBe("dsh-ws-1");
     expect(row!.instanceUrl).toBe("https://dsh-ws-1.run.app");
     expect(await handle.getInstanceUrl()).toBe("https://dsh-ws-1.run.app");
+
+    // The agent-host phase completes the shared row: RESTORING -> READY.
+    expect(await driveAgentRestore(h)).toBe("READY");
+    expect((await h.repo.getWorkspace("ws-1"))!.runtimeState).toBe("READY");
+    // A later open observes the agent-persisted READY without new API calls.
+    const callsBefore = h.transport.requests.length;
+    expect(await handle.open()).toBe("READY");
+    expect(h.transport.requests.length).toBe(callsBefore);
   });
 
   test("second open skips create (instance exists) and just starts", async () => {
@@ -237,6 +292,8 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     });
     const registry = makeRegistry(h);
     const handle = await registry.get(workspace);
+    expect(await handle.open()).toBe("STARTING");
+    expect(await driveAgentRestore(h)).toBe("READY");
     expect(await handle.open()).toBe("READY");
     expect(gets).toBeGreaterThanOrEqual(1);
     expect(
@@ -260,7 +317,8 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     });
     const registry = makeRegistry(h);
     const handle = await registry.get(workspace);
-    expect(await handle.open()).toBe("READY");
+    expect(await handle.open()).toBe("STARTING");
+    expect(await driveAgentRestore(h)).toBe("READY");
     expect(await handle.stop()).toBe("STOPPED");
     expect(
       h.transport.requests.some(
@@ -284,6 +342,7 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     const registry = makeRegistry(h);
     const handle = await registry.get(workspace);
     await handle.open();
+    await driveAgentRestore(h);
     await expect(handle.stop()).resolves.toBe("STOPPED");
   });
 
@@ -305,7 +364,8 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     });
     const registry = makeRegistry(h);
     const handle = await registry.get(workspace);
-    await expect(handle.open()).resolves.toBe("READY");
+    await expect(handle.open()).resolves.toBe("STARTING");
+    await expect(driveAgentRestore(h)).resolves.toBe("READY");
   });
 
   test("open fails honestly when the instance never becomes READY", async () => {
@@ -356,6 +416,91 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     const handle = await registry.get(workspace);
     await expect(handle.open()).rejects.toThrow(/never became healthy/);
     expect(handle.getState()).toBe("RESTORE_FAILED");
+  });
+});
+
+describe("issue #60 — one lease, split state machine", () => {
+  test("the open-established lease id reaches the Instance env (not a second random id)", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
+    // No controllerIdForWorkspace hook here: production passes the
+    // open-established lease id explicitly, exactly like handlers.openWorkspace.
+    const registry = createProductionRuntimeRegistry({
+      config: testConfig(),
+      repo: h.repo,
+      stateStore: new SqlTransactionalStateStore(h.executor),
+      clock: new SystemClock(),
+      instanceTransport: h.transport,
+      gcsClient: h.gcs,
+      healthFetch: h.healthFetch,
+      instancePoll: { maxAttempts: 3, intervalMs: 0 },
+      agentHealthPoll: { maxAttempts: 3, intervalMs: 0 },
+      sleep: async () => {},
+    });
+    const handle = await registry.get(workspace, "lease-ctrl-from-open");
+    expect(await handle.open()).toBe("STARTING");
+
+    const createReq = h.transport.requests.find(
+      (r) => r.method === "POST" && r.url.includes("/instances?instanceId="),
+    )!;
+    const containers = (createReq.body as Record<string, unknown>)["containers"] as Array<
+      Record<string, unknown>
+    >;
+    const env = Object.fromEntries(
+      (containers[0]!["env"] as Array<{ name: string; value: string }>).map((e) => [
+        e.name,
+        e.value,
+      ]),
+    );
+    // The agent-host adopts THIS id (issue #60 案B). A second random id here
+    // is the old lease deadlock: the host's self-acquire would 409 against
+    // the user's lease on the same row.
+    expect(env["CONTROLLER_ID"]).toBe("lease-ctrl-from-open");
+  });
+
+  test("the agent-host must not run open(): it is refused from STARTING", async () => {
+    const h = makeHarness();
+    await seedWorkspace(h.repo);
+    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
+    const registry = makeRegistry(h);
+    const handle = await registry.get(await h.repo.getWorkspace("ws-1").then((w) => w!));
+    expect(await handle.open()).toBe("STARTING");
+
+    // This is the exact production crash from issue #60
+    // ("open is not allowed in state STARTING"): the shared row is already
+    // STARTING, so a full open() — instance start included — is illegal. The
+    // agent-host must call completeRestore() instead (案D).
+    const agentRuntime = makeAgentRuntime(h);
+    await expect(agentRuntime.open()).rejects.toThrow(/open is not allowed in state STARTING/);
+    // ... while the narrow restore operation proceeds to READY.
+    await expect(agentRuntime.completeRestore()).resolves.toBe("READY");
+  });
+
+  test("registry rebuilds the handle when a later open resolves a different lease", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
+    const registry = makeRegistry(h);
+
+    const first = await registry.get(workspace, "ctrl-A");
+    // Same lease id: the cached handle is reused (no rebuild churn for
+    // stop/message flows, which pass no id at all).
+    expect(await registry.get(workspace, "ctrl-A")).toBe(first);
+    expect(await registry.get(workspace)).toBe(first);
+    // A renewed lease (expiry + re-acquire): the stale env must not survive.
+    const second = await registry.get(workspace, "ctrl-B");
+    expect(second).not.toBe(first);
+    expect(await registry.get(workspace, "ctrl-B")).toBe(second);
+  });
+
+  test("completeRestore from STOPPED is refused (host without a control-plane open)", async () => {
+    const h = makeHarness();
+    await seedWorkspace(h.repo);
+    // No control-plane phase ran: the shared row is still STOPPED.
+    await expect(makeAgentRuntime(h).completeRestore()).rejects.toThrow(
+      /open is not allowed in state STOPPED/,
+    );
   });
 });
 
@@ -481,6 +626,11 @@ describe("runManualCheckpoint — GCS marker", () => {
     const registry = makeRegistry(h);
     const handle = await registry.get(workspace);
     await handle.open();
+    // Checkpoints require agent input, which is refused until the agent-host
+    // phase completes the restore (issue #60). The re-open observes the
+    // agent-persisted READY into this handle, like a real second open.
+    await driveAgentRestore(h);
+    expect(await handle.open()).toBe("READY");
     await handle.runManualCheckpoint();
     const keys = [...h.gcs.objects.keys()];
     expect(keys).toHaveLength(1);

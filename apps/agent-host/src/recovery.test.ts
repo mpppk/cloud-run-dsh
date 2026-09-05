@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { LeaseAlreadyHeldError } from "@cloud-run-dsh/controller-lease";
 import { InMemoryLogger } from "@cloud-run-dsh/observability";
+import { InvalidOperationError } from "@cloud-run-dsh/workspace-runtime";
 import { composeTestHost, seedWorkspace } from "./fakes.js";
 import type { AgentTurnInput, TurnStarter } from "./gateway.js";
 
@@ -19,6 +20,9 @@ class RecordingResumer implements TurnStarter {
 describe("RestartRecovery (実装手順書 section 30)", () => {
   test("happy path: metadata -> restore -> session -> sandbox -> READY", async () => {
     const th = await composeTestHost();
+    // The in-memory store is exposed for transition assertions only when no
+    // shared store was injected (always the case in this file).
+    const states = th.inMemoryStateStore!;
     await seedWorkspace(th);
     const sessionId = "sess-1";
     await th.repository.createSession({ id: sessionId, workspaceId: "ws-1" });
@@ -34,8 +38,20 @@ describe("RestartRecovery (実装手順書 section 30)", () => {
     // State machine is READY.
     expect(th.host.runtime.getState()).toBe("READY");
 
-    // Instance health checked.
-    expect(th.instance.calls.some((c) => c.startsWith("get:dsh-ws-1"))).toBe(true);
+    // Issue #60 案C: instance start/health observation is the control
+    // plane's job — the host must never touch the instance lifecycle of the
+    // instance it runs inside (no start, no health poll).
+    expect(th.instance.calls).toEqual([]);
+
+    // The host drove only its own phase on the shared row: the seed stands
+    // in for the control plane's STOPPED -> STARTING, and recovery must
+    // continue STARTING -> RESTORING -> READY (never re-run the open).
+    const transitions = states.getHistory().map((r) => `${r.from}->${r.to}`);
+    expect(transitions).toEqual([
+      "STOPPED->STARTING",
+      "STARTING->RESTORING",
+      "RESTORING->READY",
+    ]);
 
     // Sandbox created for the workspace.
     const runArgv = th.sandboxRunner.recorded.find((argv) => argv[1] === "run");
@@ -72,9 +88,16 @@ describe("RestartRecovery (実装手順書 section 30)", () => {
   test("restore failure -> RESTORE_FAILED, health failed, token discarded", async () => {
     const th = await composeTestHost();
     await seedWorkspace(th);
-    th.instance.state = "NOT_READY";
+    // Issue #60: instance health is the control plane's job now — the host
+    // fails in its OWN restore steps (here: git clone fails; the clone argv
+    // leads with broker auth args, so match on the verb, not argv[0]).
+    const originalRun = th.git.run.bind(th.git);
+    th.git.run = async (args, opts) => {
+      if (args.includes("clone")) throw new Error("git clone failed: connection refused");
+      return originalRun(args, opts);
+    };
 
-    await expect(th.host.recover()).rejects.toThrow(/not healthy/);
+    await expect(th.host.recover()).rejects.toThrow(/clone failed/);
     expect(th.host.health.snapshot().status).toBe("RESTORE_FAILED");
     expect(th.host.bootstrapper.isTokenDiscarded).toBe(true);
     expect(th.host.runtime.getState()).toBe("RESTORE_FAILED");
@@ -170,5 +193,79 @@ describe("agent resume on recovery (issue #39)", () => {
     // The failure went through the resume path exactly once — no fallback
     // create was attempted behind it.
     expect(resumer.resumedBatches).toEqual([["sess-1"]]);
+  });
+});
+
+describe("lease adoption on recovery (issue #60 案B)", () => {
+  test("no active lease: the host acquires its injected CONTROLLER_ID", async () => {
+    const th = await composeTestHost();
+    await seedWorkspace(th);
+
+    await th.host.recover();
+
+    // First boot / post-expiry failover: nobody holds the row, so the host
+    // takes it as self (its env identity, injected by the control plane).
+    const lease = await th.host.lease.getActive("ws-1");
+    expect(lease?.controllerId).toBe("ctrl-1");
+    expect(lease?.userId).toBe("user-1");
+    expect(th.host.runtime.getState()).toBe("READY");
+  });
+
+  test("active lease with the same id: the host heartbeats instead of re-acquiring", async () => {
+    const th = await composeTestHost();
+    await seedWorkspace(th);
+    // The control-plane open established this lease before the instance boot.
+    await th.host.lease.acquire("ws-1", "ctrl-1", "user-1");
+    // Time passes between the open and the host boot.
+    th.clock.advance(10_000);
+    const before = (await th.host.lease.getActive("ws-1"))!.expiresAt.getTime();
+
+    await th.host.recover();
+
+    // Adopted, not replaced: same controller, expiry extended, restore done.
+    const lease = await th.host.lease.getActive("ws-1");
+    expect(lease?.controllerId).toBe("ctrl-1");
+    expect(lease!.expiresAt.getTime()).toBeGreaterThan(before);
+    expect(th.host.runtime.getState()).toBe("READY");
+  });
+
+  test("active lease with another id: the second host is refused (§26-8)", async () => {
+    const first = await composeTestHost();
+    await seedWorkspace(first);
+    await first.host.recover();
+    expect((await first.host.lease.getActive("ws-1"))?.controllerId).toBe("ctrl-1");
+
+    // A second host generation (stale env, or a true duplicate) boots with a
+    // different identity against the SAME lease row.
+    const second = await composeTestHost(
+      { controllerId: "ctrl-2" },
+      { leaseStore: first.leaseStore },
+    );
+
+    await expect(second.host.recover()).rejects.toThrow(LeaseAlreadyHeldError);
+    expect(second.host.health.snapshot().status).toBe("RESTORE_FAILED");
+    expect(second.host.bootstrapper.isTokenDiscarded).toBe(true);
+    // The winner's lease is untouched — the refused host never overwrote it.
+    expect((await first.host.lease.getActive("ws-1"))?.controllerId).toBe("ctrl-1");
+    // ... and the refused host never ran a single restore step.
+    expect(second.host.runtime.getState()).toBe("STOPPED");
+  });
+
+  test("STOPPED workspace: recovery is refused — the control plane never started this generation", async () => {
+    const th = await composeTestHost();
+    // Workspace row exists but the control-plane phase never ran (no
+    // seedWorkspace STARTING transition): a host process here is anomalous —
+    // in production its instance would not exist.
+    await th.repository.createWorkspace({
+      id: "ws-1",
+      ownerId: "user-1",
+      repositoryOwner: "mpppk",
+      repositoryName: "cloud-run-dsh",
+      baseBranch: "main",
+      instanceName: "dsh-ws-1",
+    });
+
+    await expect(th.host.recover()).rejects.toThrow(InvalidOperationError);
+    expect(th.host.health.snapshot().status).toBe("RESTORE_FAILED");
   });
 });

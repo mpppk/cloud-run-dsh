@@ -133,11 +133,52 @@ export const openWorkspace: RouteHandler = async (ctx) => {
   await parseOptionalJsonBody(ctx.request);
   const workspace = await loadWorkspace(ctx.deps, id);
   await assertMember(ctx.deps, workspace.id, ctx.user.id);
+  // Issue #60 案B: the controller lease and the Instance share ONE controller
+  // identity. Establish it BEFORE touching the runtime and inject it into the
+  // Instance env, so the agent-host adopts this lease instead of
+  // self-acquiring a conflicting one on the same row (the old deadlock: the
+  // user's lease (A) vs the host's self-acquire (B), neither able to proceed).
+  // Open is lifecycle, not authorship: any active lease is reused whoever
+  // holds it (§20 still gates messages by userId); only a missing/expired
+  // lease is freshly acquired for the opener.
+  const controllerId = await ensureControllerLeaseForOpen(
+    ctx.deps.leases,
+    workspace.id,
+    ctx.user.id,
+  );
   // 実装手順書 section 27: concurrent opens coalesce inside the T8 runtime.
-  const handle = await ctx.deps.runtimes.get(workspace);
+  const handle = await ctx.deps.runtimes.get(workspace, controllerId);
   const state = await handle.open();
   return json({ workspaceId: workspace.id, state });
 };
+
+/**
+ * Resolves the single controller identity for an open (issue #60 案B).
+ *
+ * Reuses the active lease when one exists (whoever holds it — see above);
+ * otherwise acquires a fresh lease for the opener. A lost acquire race (a
+ * concurrent open won the CAS) falls back to the winner's lease instead of
+ * failing: both opens converge on the same controllerId, which is exactly
+ * what the agent-host needs to adopt.
+ */
+export async function ensureControllerLeaseForOpen(
+  leases: ControllerLeaseService,
+  workspaceId: string,
+  userId: string,
+): Promise<string> {
+  const active = await leases.getActive(workspaceId);
+  if (active) return active.controllerId;
+  try {
+    const lease = await leases.acquire(workspaceId, crypto.randomUUID(), userId);
+    return lease.controllerId;
+  } catch (e) {
+    if (e instanceof LeaseAlreadyHeldError) {
+      const winner = await leases.getActive(workspaceId);
+      if (winner) return winner.controllerId;
+    }
+    throw e;
+  }
+}
 
 export const stopWorkspace: RouteHandler = async (ctx) => {
   const id = requireSegment(ctx.params.id, "id");

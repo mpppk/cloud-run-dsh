@@ -127,6 +127,10 @@ const starter = await HarnessTurnStarter.create({ config, repository: repo, logg
 const th = await composeTestHost({ workspaceId }, { turnStarter: starter, repository: repo });
 // The workspace row already exists (created above); membership for the
 // host-side user is irrelevant to the gateway path.
+// Issue #60: the host owns only completeRestore(), so the control-plane
+// phase (STOPPED -> STARTING) is seeded before the boot — the live script
+// drives the gateway directly and never runs a control-plane open.
+await th.inMemoryStateStore!.apply(workspaceId, "STOPPED", "STARTING", "livecheck-control-plane-open");
 await th.host.recover();
 const ahServer = Bun.serve({ port: 0, fetch: (req) => th.host.gateway.handle(req) });
 

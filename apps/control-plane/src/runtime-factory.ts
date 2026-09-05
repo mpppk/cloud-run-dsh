@@ -25,6 +25,15 @@
 //   restoreHarness         The control plane observes their completion via the
 //                          agent-host /healthz poll above; READY here means
 //                          "instance healthy AND agent-host recovery complete".
+//
+// Issue #60 案C: the control plane owns ONLY the instance lifecycle and the
+// health observation above. Its WorkspaceRuntime runs openInstance()
+// (STOPPED -> STARTING, start, health poll) and deliberately NEVER the
+// RESTORING -> READY transitions — those belong to the agent-host's
+// completeRestore() on the same row. Running the full open() here (even with
+// the no-op steps above) is exactly the state-machine half of the #60
+// collision: the agent-host would find STARTING and fail with
+// "open is not allowed in state STARTING".
 //   runLifecycleCheckpoint NO-OP success: durable checkpoints are written
 //                          continuously by the agent-host periodic scheduler.
 //                          A control-plane-driven remote checkpoint trigger is
@@ -91,7 +100,13 @@ export interface ProductionRuntimeOptions {
   readonly instancePoll?: PollConfig;
   readonly agentHealthPoll?: PollConfig;
   readonly sleep?: (ms: number) => Promise<void>;
-  /** Defaults to crypto.randomUUID() per handle (the agent-host self-acquires on boot). */
+  /**
+   * Test override for the injected CONTROLLER_ID. Production callers pass the
+   * open-established lease id per open() (issue #60 案B) and this hook is
+   * only the fallback for paths that resolve no lease. Defaults to
+   * crypto.randomUUID() per handle — which MUST match the lease the
+   * agent-host adopts, otherwise the host refuses to boot (§26-8 fencing).
+   */
   readonly controllerIdForWorkspace?: (workspace: Workspace) => string;
 }
 
@@ -387,10 +402,17 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
   const instancePoll = opts.instancePoll ?? DEFAULT_INSTANCE_POLL;
   const agentHealthPoll = opts.agentHealthPoll ?? DEFAULT_AGENT_HEALTH_POLL;
 
-  return new RuntimeRegistry((workspace: Workspace) => {
+  // Issue #60 案B: the controllerId comes from the open-established lease
+  // (handlers.openWorkspace resolves it via the lease service and passes it
+  // through RuntimeRegistry.get). The hook/random fallback below only serves
+  // paths that bypass open(); the agent-host adopts THIS id, so it must be
+  // the lease id — a second random id here re-creates the #60 lease deadlock.
+  const resolveControllerId = (workspace: Workspace, controllerId?: string): string =>
+    controllerId ?? opts.controllerIdForWorkspace?.(workspace) ?? crypto.randomUUID();
+
+  return new RuntimeRegistry((workspace: Workspace, controllerId?: string) => {
     const instanceName = defaultInstanceName(workspace);
-    const controllerId =
-      opts.controllerIdForWorkspace?.(workspace) ?? crypto.randomUUID();
+    const resolvedControllerId = resolveControllerId(workspace, controllerId);
     // Issue #56: the volume's connection name and the DATABASE_URL socket
     // host must agree — fail here, before any Instances API call, not inside
     // the Instance with ERR_POSTGRES_CONNECTION_REFUSED.
@@ -401,7 +423,7 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
       image: config.agentHostImage,
       serviceAccount: config.agentHostServiceAccount,
       cloudSqlConnectionName: config.cloudSqlConnectionName,
-      env: buildInstanceEnv(config, workspace, instanceName, controllerId),
+      env: buildInstanceEnv(config, workspace, instanceName, resolvedControllerId),
     });
     const instanceRuntime = new EnsureCreatedInstanceRuntime(client, workspace, repo);
     const idle = new IdleManager(clock);

@@ -110,6 +110,8 @@ export class WorkspaceRuntime {
   private readonly machine: WorkspaceStateMachine;
   private readonly operations = new OperationTracker();
   private openPromise: Promise<WorkspaceRuntimeState> | null = null;
+  private openInstancePromise: Promise<WorkspaceRuntimeState> | null = null;
+  private completeRestorePromise: Promise<WorkspaceRuntimeState> | null = null;
   private stopPromise: Promise<WorkspaceRuntimeState> | null = null;
   private lastError: unknown = null;
   private idleTimer: ReturnType<typeof setInterval> | null = null;
@@ -118,6 +120,35 @@ export class WorkspaceRuntime {
   constructor(private readonly deps: WorkspaceRuntimeDeps) {
     this.machine = new WorkspaceStateMachine(deps.workspaceId, deps.store);
   }
+
+  /**
+   * States from which a fresh instance start is legal. Shared by open() and
+   * openInstance() (issue #60): STOPPED plus the recoverable failure states.
+   */
+  private static readonly OPENABLE_STATES: ReadonlySet<WorkspaceRuntimeState> = new Set([
+    "STOPPED",
+    "RESTORE_FAILED",
+    "ERROR",
+    "CHECKPOINT_FAILED",
+  ]);
+
+  /**
+   * States from which the agent-host restore phase may run (issue #60 案D).
+   * STARTING is the normal handoff from the control plane's openInstance();
+   * RESTORING resumes a host that crashed mid-restore (Cloud Run restarts the
+   * container with the same env); the failure states cover a host rebooted
+   * without a control-plane open. STOPPED is deliberately absent: a host
+   * process running while the workspace is STOPPED means the control plane
+   * never started this generation — proceeding would resurrect a stopped
+   * workspace behind the control plane's back.
+   */
+  private static readonly RESTORABLE_STATES: ReadonlySet<WorkspaceRuntimeState> = new Set([
+    "STARTING",
+    "RESTORING",
+    "RESTORE_FAILED",
+    "ERROR",
+    "CHECKPOINT_FAILED",
+  ]);
 
   getWorkspaceId(): string {
     return this.deps.workspaceId;
@@ -147,6 +178,11 @@ export class WorkspaceRuntime {
    *
    * Concurrent open requests coalesce into a single start operation
    * (実装手順書 section 27). An already-READY workspace resolves immediately.
+   *
+   * Single-process convenience: this is exactly openInstance() followed by
+   * completeRestore(). In production the two phases run in DIFFERENT
+   * processes against the SAME row (control plane, then agent-host — issue
+   * #60), so each side calls only its own phase.
    */
   async open(): Promise<WorkspaceRuntimeState> {
     if (this.openPromise) return this.openPromise;
@@ -158,6 +194,47 @@ export class WorkspaceRuntime {
   }
 
   private async doOpen(): Promise<WorkspaceRuntimeState> {
+    await this.doStartInstancePhase();
+    return this.doCompleteRestorePhase();
+  }
+
+  /**
+   * Control-plane phase (issue #60 案C): STOPPED -> STARTING, instance start,
+   * health observation. Returns while still STARTING — the RESTORING -> READY
+   * transitions belong to the agent-host's completeRestore().
+   *
+   * Concurrent calls coalesce into a single start operation (実装手順書
+   * section 27), same as open().
+   */
+  async openInstance(): Promise<WorkspaceRuntimeState> {
+    if (this.openInstancePromise) return this.openInstancePromise;
+
+    this.openInstancePromise = this.doStartInstancePhase().finally(() => {
+      this.openInstancePromise = null;
+    });
+    return this.openInstancePromise;
+  }
+
+  /**
+   * Agent-host phase (issue #60 案D): from STARTING (handed off by the control
+   * plane's openInstance()) through RESTORING and the restore steps to READY.
+   * Must NOT be called from STOPPED — that state means the control plane never
+   * started this generation. Calling open() here instead would re-run the
+   * instance start and collide with the control plane on the shared row
+   * (InvalidOperationError: open is not allowed in state STARTING).
+   *
+   * Concurrent calls coalesce into a single restore operation.
+   */
+  async completeRestore(): Promise<WorkspaceRuntimeState> {
+    if (this.completeRestorePromise) return this.completeRestorePromise;
+
+    this.completeRestorePromise = this.doCompleteRestorePhase().finally(() => {
+      this.completeRestorePromise = null;
+    });
+    return this.completeRestorePromise;
+  }
+
+  private async doStartInstancePhase(): Promise<WorkspaceRuntimeState> {
     await this.machine.reload();
     const state = this.machine.getState();
 
@@ -165,13 +242,7 @@ export class WorkspaceRuntime {
 
     // open is legal from STOPPED plus the recoverable failure states
     // (RESTORE_FAILED / ERROR / CHECKPOINT_FAILED -> STARTING edges exist).
-    const openable = new Set<WorkspaceRuntimeState>([
-      "STOPPED",
-      "RESTORE_FAILED",
-      "ERROR",
-      "CHECKPOINT_FAILED",
-    ]);
-    if (!openable.has(state)) {
+    if (!WorkspaceRuntime.OPENABLE_STATES.has(state)) {
       throw new InvalidOperationError("open", state);
     }
 
@@ -179,7 +250,38 @@ export class WorkspaceRuntime {
     try {
       await this.deps.instanceRuntime.start(this.deps.instanceName);
       await this.deps.steps.waitForInstanceHealth();
-      await this.machine.transition("RESTORING", "instance-healthy");
+      // Intentionally STAYS in STARTING: the agent-host drives
+      // STARTING -> RESTORING -> READY via completeRestore() (issue #60).
+      return this.machine.getState();
+    } catch (e) {
+      this.lastError = e;
+      if (this.machine.getState() === "STARTING") {
+        await this.machine.transition("RESTORE_FAILED", "restore-failed");
+      }
+      throw e;
+    }
+  }
+
+  private async doCompleteRestorePhase(): Promise<WorkspaceRuntimeState> {
+    await this.machine.reload();
+    const state = this.machine.getState();
+
+    if (state === "READY") return state;
+
+    if (!WorkspaceRuntime.RESTORABLE_STATES.has(state)) {
+      throw new InvalidOperationError("open", state);
+    }
+
+    try {
+      // A retry from a failure state re-enters through STARTING (the table
+      // has no direct failure -> RESTORING edge); a crash resume from
+      // RESTORING continues the steps directly.
+      if (state !== "STARTING" && state !== "RESTORING") {
+        await this.machine.transition("STARTING", "open");
+      }
+      if (this.machine.getState() === "STARTING") {
+        await this.machine.transition("RESTORING", "instance-healthy");
+      }
       // 仕様書 section 8: clone -> base checkout -> checkpoint restore ->
       // sandbox create -> harness restore -> READY
       await this.deps.steps.cloneRepository();
