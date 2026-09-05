@@ -77,23 +77,39 @@ describe("content checks", () => {
     expect(c).toMatch(/variable "iap_members"/);
   });
 
-  test("apis.tf enables 11 apis including IAM, Resource Manager, and servicenetworking", () => {
+  // The canonical API list lives in apis.tf (local.required_apis); this
+  // oracle pins it. The count in the test name is derived from the oracle's
+  // length — not a second hardcoded number — so enabling or dropping an API
+  // cannot silently drift the name again (issue #82: the name said 11 while
+  // apis.tf already had 12, and compute.googleapis.com was never asserted).
+  // The exact-set assertion below fails first on any list change, including
+  // the G6 compute API that once blocked the first apply.
+  const EXPECTED_APIS = [
+    "cloudresourcemanager.googleapis.com",
+    "compute.googleapis.com",
+    "iam.googleapis.com",
+    "run.googleapis.com",
+    "sqladmin.googleapis.com",
+    "secretmanager.googleapis.com",
+    "artifactregistry.googleapis.com",
+    "storage.googleapis.com",
+    "iap.googleapis.com",
+    "logging.googleapis.com",
+    "monitoring.googleapis.com",
+    "servicenetworking.googleapis.com",
+  ];
+  test(`apis.tf enables ${EXPECTED_APIS.length} apis including IAM, Resource Manager, and servicenetworking`, () => {
     const c = tfContents["apis.tf"];
-    for (const api of [
-      "cloudresourcemanager.googleapis.com",
-      "iam.googleapis.com",
-      "run.googleapis.com",
-      "sqladmin.googleapis.com",
-      "secretmanager.googleapis.com",
-      "artifactregistry.googleapis.com",
-      "storage.googleapis.com",
-      "iap.googleapis.com",
-      "logging.googleapis.com",
-      "monitoring.googleapis.com",
-      "servicenetworking.googleapis.com",
-    ]) {
+    for (const api of EXPECTED_APIS) {
       expect(c).toContain(api);
     }
+    // No more, no fewer: every *.googleapis.com literal in apis.tf must be
+    // exactly this set, so a future API addition/removal fails here instead
+    // of drifting silently.
+    const found = [...new Set(
+      [...c.matchAll(/"([a-z0-9-]+\.googleapis\.com)"/g)].map((m) => m[1]),
+    )].sort();
+    expect(found).toEqual([...EXPECTED_APIS].sort());
   });
 
   test("cloudsql.tf uses secret manager for password, no literal, conditional bootstrap", () => {
