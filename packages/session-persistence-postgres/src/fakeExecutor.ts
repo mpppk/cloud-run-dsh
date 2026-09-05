@@ -88,6 +88,20 @@ export class InMemoryFakeExecutor implements QueryExecutor {
     const normalized = sql.replace(/\s+/g, " ").trim();
     const lower = normalized.toLowerCase();
 
+    // Issue #70: fail fast on locking clauses real PostgreSQL rejects.
+    // `SELECT max(seq) ... FOR UPDATE` used to be silently treated as a
+    // plain select here, so invalid SQL passed every test and only failed
+    // against a real database. PostgreSQL rejects any locking clause
+    // combined with an aggregate function ("FOR UPDATE is not allowed with
+    // aggregate functions"), so the fake rejects it too instead of silently
+    // ignoring the lock. Plain `SELECT max(seq)` (no locking clause) and
+    // `SELECT ... FOR UPDATE` (no aggregate) remain accepted.
+    if (/\bfor\s+update\b/i.test(normalized) && /\b(max|min|sum|avg|count)\s*\(/i.test(normalized)) {
+      throw new Error(
+        `InMemoryFakeExecutor: locking clause with aggregate function is rejected by PostgreSQL: ${normalized}`,
+      );
+    }
+
     // schema_migrations DDL / inserts
     if (lower.includes("create table if not exists schema_migrations")) {
       return [] as T[];
@@ -366,8 +380,13 @@ class InMemoryFakeTransactionExecutor implements QueryExecutor {
     const tmp = new InMemoryFakeExecutor();
     // Share snapshot directly
     (tmp as unknown as { tables: FakeTables }).tables = this.snapshot;
-    // Avoid queueing nested transactions via parent queue — run directly on snapshot
-    // For SELECT max(seq) FOR UPDATE, we treat as normal select (serialization already via txQueue)
+    // Avoid queueing nested transactions via parent queue — run directly on snapshot.
+    // NOTE (issue #70): locking semantics are NOT silently skipped here.
+    // Plain `SELECT max(seq)` is answered from the snapshot (transaction
+    // serialization itself comes from txQueue), but a locking clause paired
+    // with an aggregate is rejected by the guard in query() above, exactly
+    // as real PostgreSQL rejects it — so such SQL can never pass tests
+    // against the fake and fail only in production again.
     return tmp.query<T>(sql, params);
   }
 

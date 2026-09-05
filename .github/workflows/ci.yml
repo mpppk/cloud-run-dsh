@@ -20,6 +20,25 @@ jobs:
   workspace:
     name: typecheck + tests
     runs-on: ubuntu-latest
+    # Real PostgreSQL for the session-persistence suite (issue #70): the
+    # in-memory fake silently ignored locking clauses, so SQL that real
+    # PostgreSQL rejects passed every test. The same behavior suite now runs
+    # against this service when TEST_POSTGRES_URL is set (and self-skips
+    # without it, so local `bun test` keeps working with no database).
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: dsh
+          POSTGRES_PASSWORD: dsh
+          POSTGRES_DB: dsh
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -28,7 +47,13 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Typecheck
         run: bunx tsc --build
-      - name: Tests
+      - name: Migrate test database
+        env:
+          DATABASE_URL: postgres://dsh:dsh@localhost:5432/dsh
+        run: bun run db:migrate
+      - name: Tests (incl. real-PostgreSQL suite)
+        env:
+          TEST_POSTGRES_URL: postgres://dsh:dsh@localhost:5432/dsh
         run: bun test
 
   terraform:

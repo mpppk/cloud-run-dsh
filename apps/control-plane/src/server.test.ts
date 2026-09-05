@@ -77,6 +77,13 @@ class FakeExecutor implements QueryExecutor {
         .sort((a, b) => String(a["created_at"]).localeCompare(String(b["created_at"])))
         .map((s) => structuredClone(s));
     }
+    if (sql.startsWith("SELECT id FROM sessions WHERE id")) {
+      // Parent-row lock for gapless append (issue #70): the lock itself is
+      // a no-op in the fake (transactions run inline here), but the row is
+      // returned so the existence check behaves identically.
+      const s = this.sessions.get(params[0] as string);
+      return s ? [structuredClone(s)] : [];
+    }
     if (sql.startsWith("SELECT * FROM sessions WHERE id")) {
       const s = this.sessions.get(params[0] as string);
       return s ? [structuredClone(s)] : [];
