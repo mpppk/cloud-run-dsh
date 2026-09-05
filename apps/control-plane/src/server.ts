@@ -2,8 +2,11 @@
 // No heavyweight framework — a small pattern router over Bun.serve.
 
 import { authenticate } from "./auth.js";
+import type { InternalUser } from "./auth.js";
 import type { ControlPlaneDeps } from "./deps.js";
 import { ApiError, badRequest, internalError, notFound } from "./errors.js";
+import type { Logger } from "@cloud-run-dsh/observability";
+import { describeError, newErrorId } from "@cloud-run-dsh/observability";
 import * as handlers from "./handlers.js";
 import { handleSessionEvents } from "./sse.js";
 import {
@@ -77,8 +80,47 @@ function errorResponse(status: number, code: string, message: string): Response 
   });
 }
 
-/** Maps any thrown error to a typed JSON error response. No stack traces leak. */
-export function toErrorResponse(e: unknown): Response {
+/**
+ * Correlation context attached to the unexpected-error log (仕様書 section 25
+ * keys, best-effort: whatever the catch site could recover). Never sent to
+ * the client.
+ */
+export interface ErrorLogContext {
+  readonly method?: string;
+  readonly path?: string;
+  readonly userId?: string;
+  readonly workspaceId?: string;
+  readonly sessionId?: string;
+}
+
+export interface ToErrorResponseOptions {
+  /**
+   * Structured logger for the unexpected-error path. The logger applies the
+   * observability redactor to every value, but callers must still avoid
+   * passing secret-carrying objects — only extracted strings (class name,
+   * message, stack) plus correlation ids are logged (issue #42 lesson).
+   * When absent the 500 mapping still applies, just without the log line.
+   */
+  readonly logger?: Logger;
+  readonly context?: ErrorLogContext;
+}
+
+// Re-exported for backward compat: the implementation lives in
+// @cloud-run-dsh/observability, shared with the agent host (PR #49 MINOR-1).
+export { describeError };
+
+/**
+ * Maps any thrown error to a typed JSON error response. No stack traces leak.
+ *
+ * Unexpected errors -> generic 500 with no internals (仕様書 §26 の秘密保全の
+ * 要請による。NOTE: §26 item 7 は workspace 所有権検証であり 500 の根拠では
+ * ない — #48 の記載を引き継いだ誤引用だったので番号付けを外した。PR #49
+ * MINOR-2) AND a structured server-side log line (issue #48). The 500 body
+ * carries a random `errorId` that matches the log line so an operator can
+ * correlate a client report with Cloud Logging without the response leaking
+ * anything.
+ */
+export function toErrorResponse(e: unknown, opts: ToErrorResponseOptions = {}): Response {
   if (e instanceof ApiError) {
     return errorResponse(e.status, e.code, e.message);
   }
@@ -86,14 +128,64 @@ export function toErrorResponse(e: unknown): Response {
   if (e instanceof AgentInputRefusedError || e instanceof InvalidOperationError) {
     return errorResponse(409, "conflict", e.message);
   }
-  // Unexpected errors -> generic 500 with no internals (仕様書 section 26 item 7).
-  return errorResponse(500, "internal", "internal server error");
+  // Unexpected errors -> generic 500 with no internals (仕様書 §26; see the
+  // MINOR-2 note on toErrorResponse — item 7 is NOT the 500 rule).
+  // 16hex newErrorId (not a UUID). History: this was a WORKAROUND for issue
+  // #51 (see newErrorId) — #51 is resolved since PR #54 (UUIDs now survive
+  // redaction). 16hex is retained as-is (compact, tested via ERROR_ID_RE);
+  // a follow-up may switch back to UUIDs.
+  const errorId = newErrorId();
+  opts.logger?.error("http.unexpected_error", {
+    errorId,
+    ...describeError(e),
+    ...opts.context,
+  });
+  return new Response(
+    JSON.stringify({ error: { code: "internal", message: "internal server error", errorId } }),
+    {
+      status: 500,
+      headers: { "content-type": "application/json; charset=utf-8" },
+    },
+  );
+}
+
+/**
+ * Best-effort correlation ids for the unexpected-error log. Route params use
+ * `:id` for both workspace and session scopes, so the pathname decides which
+ * is which. Never throws (used on the failure path itself).
+ *
+ * NOTE (PR #49 MINOR-3): only the /v1/sessions/ and /v1/workspaces/ prefixes
+ * are distinguished; a future top-level route falls back to method/path/user
+ * only. Best-effort by design — the errorId (not these ids) is the
+ * correlation key — so no logic change; recorded here instead.
+ */
+export function errorContextFromRequest(
+  method: string,
+  pathname: string | undefined,
+  params: Record<string, string> | undefined,
+  user: InternalUser | undefined,
+): ErrorLogContext {
+  const ctx: Record<string, string> = {};
+  if (method) ctx["method"] = method;
+  if (pathname) ctx["path"] = pathname;
+  if (user) ctx["userId"] = user.id;
+  const id = params?.["id"];
+  if (id && pathname) {
+    if (pathname.startsWith("/v1/sessions/")) ctx["sessionId"] = id;
+    else if (pathname.startsWith("/v1/workspaces/")) ctx["workspaceId"] = id;
+  }
+  return ctx;
 }
 
 export function createFetchHandler(deps: ControlPlaneDeps): (request: Request) => Promise<Response> {
   return async (request: Request): Promise<Response> => {
+    // Recovered on the failure path for the unexpected-error log (issue #48).
+    let pathname: string | undefined;
+    let user: InternalUser | undefined;
+    let params: Record<string, string> | undefined;
     try {
       const url = new URL(request.url);
+      pathname = url.pathname;
 
       // Health endpoint (実装手順書 section 24: health responsibility).
       // Not workspace-scoped and NOT meaningful activity (仕様書 section 11).
@@ -122,12 +214,13 @@ export function createFetchHandler(deps: ControlPlaneDeps): (request: Request) =
       const pathSegments = url.pathname.split("/").filter((s) => s.length > 0);
 
       // 1. Authentication: IAP identity -> internal user (仕様書 section 21).
-      const user = await authenticate(request.headers, deps);
+      user = await authenticate(request.headers, deps);
 
       const found = match(request.method, pathSegments);
       if (!found) {
         throw notFound(`no route for ${request.method} ${url.pathname}`);
       }
+      params = found.params;
 
       // 2. Handler performs membership + controller checks (仕様書 sections 20/26).
       return await found.handler({
@@ -138,7 +231,10 @@ export function createFetchHandler(deps: ControlPlaneDeps): (request: Request) =
         user,
       });
     } catch (e) {
-      return toErrorResponse(e);
+      return toErrorResponse(e, {
+        logger: deps.logger,
+        context: errorContextFromRequest(request.method, pathname, params, user),
+      });
     }
   };
 }

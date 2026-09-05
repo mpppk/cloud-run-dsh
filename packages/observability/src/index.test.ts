@@ -3,7 +3,10 @@ import {
   PLACEHOLDER_KIND,
   createPlaceholder,
   createLogger,
+  describeError,
+  ERROR_ID_RE,
   InMemoryLogger,
+  newErrorId,
   redactValue,
   redactLogFields,
   METRIC_NAMES,
@@ -477,6 +480,70 @@ describe("observability", () => {
     expect((redactValue({ foo: hex64 }) as Record<string, unknown>)["foo"]).toBe(
       "[REDACTED]",
     );
+  });
+
+  // -----------------------------------------------------------------------
+  // Error IDs for 500 correlation (issue #48; 16hex originated as a #51
+  // workaround, retained as-is after #51/PR #54)
+  // -----------------------------------------------------------------------
+
+  test("i48: newErrorId is 16 lowercase hex (ERROR_ID_RE, single source of truth)", () => {
+    for (let i = 0; i < 25; i++) {
+      const id = newErrorId();
+      expect(id).toMatch(ERROR_ID_RE);
+      expect(id).toHaveLength(16);
+    }
+    // Uniqueness sanity: 25 draws must not collide (64-bit space).
+    const ids = new Set(Array.from({ length: 25 }, () => newErrorId()));
+    expect(ids.size).toBe(25);
+  });
+
+  test("i48: newErrorId survives the redactor verbatim (16hex retained after #51/PR #54)", () => {
+    // Bare, embedded in free text, and under the real log field name —
+    // the log line carrying the errorId must keep it readable.
+    for (let i = 0; i < 25; i++) {
+      const id = newErrorId();
+      expect(redactValue(id)).toBe(id);
+      expect(redactValue(`unexpected error ${id} logged`) as string).toContain(id);
+      const obj = redactValue({ errorId: id }) as Record<string, unknown>;
+      expect(obj["errorId"]).toBe(id);
+    }
+    // Via the logger, as the 500 path actually emits it.
+    const logger = new InMemoryLogger();
+    const id = newErrorId();
+    logger.error("http.unexpected_error", { errorId: id } as unknown as LogFields);
+    expect((logger.parsed[0] as Record<string, unknown>)["errorId"]).toBe(id);
+    expect(logger.lines.join("\n")).toContain(id);
+  });
+
+  test("i48: 16hex errorIds never collide with the hex-40/64 SHA-rescue judgment (#29 3rd pass)", () => {
+    // The rescue path only triggers for exact 40/64 hex (COMMIT_SHA_RE) seen
+    // through the 20+-char entropy net. 16 chars clear both gates by length.
+    const id = newErrorId();
+    expect(id.length).toBeLessThan(20);
+    // Same sentence shape, no commit-ish word nearby: a bare 40-hex secret
+    // IS redacted here...
+    const hex40 = "35bad8143c8813c45ca9841750209525f5177ab2";
+    expect(redactValue(`token is ${hex40} here`) as string).not.toContain(hex40);
+    // ...while the 16hex errorId in the identical shape survives.
+    expect(redactValue(`token is ${id} here`) as string).toContain(id);
+    // And a commit-context sentence keeps working for real SHAs (no
+    // interference from the errorId path).
+    const sha40 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b";
+    expect(redactValue(`commit ${sha40} deployed`) as string).toContain(sha40);
+  });
+
+  test("i48/MINOR-1: describeError extracts class/message/stack without the raw object", () => {
+    const err = new TypeError("boom");
+    const d = describeError(err);
+    expect(d.errorClass).toBe("TypeError");
+    expect(d.errorMessage).toBe("boom");
+    expect(typeof d.errorStack).toBe("string");
+    expect(d.errorStack as string).toContain("TypeError");
+    expect(describeError("plain string throw")).toEqual({
+      errorClass: "string",
+      errorMessage: "plain string throw",
+    });
   });
 
   // -----------------------------------------------------------------------

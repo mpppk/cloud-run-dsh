@@ -266,6 +266,67 @@ export function redactLogFields(fields: LogFields): LogFields {
 }
 
 // ---------------------------------------------------------------------------
+// Error IDs for 500 correlation (issue #48)
+// ---------------------------------------------------------------------------
+
+/**
+ * Shape of the IDs issued by newErrorId below. Exported — not inlined at
+ * call sites — so the format lives in exactly one place: producers return
+ * `newErrorId()`, consumers/tests assert `ERROR_ID_RE.test(id)`. A future
+ * return to UUIDs (see below) then touches this file, not every call site.
+ */
+export const ERROR_ID_RE = /^[0-9a-f]{16}$/;
+
+/**
+ * Generates the random error ID shared by a generic 500 response and its
+ * server-side log line, so an operator can correlate a client report with
+ * Cloud Logging without the response leaking internals.
+ *
+ * Deliberately 16 hex chars (64-bit), NOT a full UUID. History: this started
+ * as a WORKAROUND for issue #51 (PR #49 review MAJOR-1; #52 was closed as its
+ * duplicate) — values of 20+ chars with 2+ character classes were masked to
+ * `[REDACTED]` by the high-entropy redactor net above, so a UUID errorId
+ * would have arrived redacted in the very log line meant to carry it. #51 is
+ * resolved since PR #54 (RFC 4122 UUID exemption; see UUID_RE above), so a
+ * UUID would survive today.
+ *
+ * 16hex is retained as-is: compact, unique enough for error correlation,
+ * below the net's 20-char minimum (so the hex-40/64 SHA-rescue path in
+ * redactString never sees it either), and already covered by ERROR_ID_RE +
+ * call-site tests. A follow-up may switch back to `crypto.randomUUID()` if
+ * UUID correlation is preferred — keep ERROR_ID_RE and all call sites in
+ * sync then.
+ */
+export function newErrorId(): string {
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+}
+
+/**
+ * Error class/message/stack as plain strings (never the raw error object —
+ * it may carry secret fields; issue #42). Shared by the control plane and
+ * the agent host (PR #49 review MINOR-1: was duplicated as `describeError`
+ * / `describeGatewayError`); each service's logger applies the observability
+ * redactor on top of the returned strings.
+ */
+export function describeError(e: unknown): {
+  errorClass: string;
+  errorMessage: string;
+  errorStack?: string;
+} {
+  if (e instanceof Error) {
+    const out: { errorClass: string; errorMessage: string; errorStack?: string } = {
+      errorClass: e.name || e.constructor?.name || "Error",
+      errorMessage: e.message,
+    };
+    if (typeof e.stack === "string" && e.stack.length > 0) {
+      out.errorStack = e.stack;
+    }
+    return out;
+  }
+  return { errorClass: typeof e, errorMessage: String(e) };
+}
+
+// ---------------------------------------------------------------------------
 // Logger
 // ---------------------------------------------------------------------------
 

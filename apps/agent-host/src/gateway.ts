@@ -9,6 +9,7 @@ import { AgentInputRefusedError } from "@cloud-run-dsh/workspace-runtime";
 import type { InvalidOperationError } from "@cloud-run-dsh/workspace-runtime";
 import type { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
 import type { Logger } from "@cloud-run-dsh/observability";
+import { describeError, newErrorId } from "@cloud-run-dsh/observability";
 import type { AgentHostConfig } from "./config.js";
 import type { HealthService } from "./health.js";
 import { healthzResponse } from "./health.js";
@@ -87,11 +88,68 @@ export interface TurnStarter {
 /** HTTP-facing approval decision vocabulary (matches the control plane). */
 export type ApprovalDecision = "approved" | "rejected";
 
+/**
+ * Historic alias kept for backward compat: the implementation lives in
+ * @cloud-run-dsh/observability, shared with the control plane's
+ * describeError (PR #49 MINOR-1).
+ */
+export const describeGatewayError = describeError;
+
+const GATEWAY_ROUTE_RE =
+  /^\/workspaces\/([^/]+)(?:\/sessions\/([^/]+))?\/(messages|approvals|cancel|events)$/;
+
+/**
+ * Best-effort route correlation ids for the unexpected-error log. Never
+ * throws (it runs on the failure path itself); yields {} when the URL or
+ * path cannot be parsed.
+ */
+export function tryParseRouteIds(request: Request): {
+  workspaceId?: string;
+  sessionId?: string;
+  userId?: string;
+} {
+  try {
+    const url = new URL(request.url);
+    const out: { workspaceId?: string; sessionId?: string; userId?: string } = {};
+    const match = url.pathname.match(GATEWAY_ROUTE_RE);
+    if (match?.[1]) out.workspaceId = match[1];
+    if (match?.[2]) out.sessionId = match[2];
+    const identity = request.headers.get(IAP_IDENTITY_HEADER);
+    if (identity) out.userId = identity;
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 export class AgentGateway {
   constructor(private readonly deps: AgentGatewayDeps) {}
 
-  /** Entry point for the HTTP server (Bun.serve fetch handler). */
+  /**
+   * Entry point for the HTTP server (Bun.serve fetch handler).
+   *
+   * Unexpected throws anywhere below used to escape to the runtime with no
+   * structured log (issue #48, same defect as the control plane): the client
+   * saw a bare 500 and Cloud Logging showed nothing. They are now logged
+   * (redacted, with class/message/stack + correlation ids) and answered with
+   * a generic 500 carrying the matching errorId.
+   */
   async handle(request: Request): Promise<Response> {
+    const preParsed = tryParseRouteIds(request);
+    try {
+      return await this.route(request);
+    } catch (e) {
+      const errorId = newErrorId();
+      this.deps.logger.error("gateway.unexpected_error", {
+        errorId,
+        ...describeGatewayError(e),
+        ...preParsed,
+      });
+      return this.json(500, { error: "internal server error", errorId });
+    }
+  }
+
+  private async route(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === "/healthz") {
@@ -126,7 +184,7 @@ export class AgentGateway {
       return this.json(401, { error: "unauthenticated: missing IAP identity" });
     }
 
-    const match = url.pathname.match(/^\/workspaces\/([^/]+)(?:\/sessions\/([^/]+))?\/(messages|approvals|cancel|events)$/);
+    const match = url.pathname.match(GATEWAY_ROUTE_RE);
     if (!match) return this.json(404, { error: "not found" });
     const [, workspaceId, sessionId, action] = match as unknown as [
       string,
@@ -245,6 +303,7 @@ export class AgentGateway {
         sessionId,
         event_detail: activity,
         error: e instanceof Error ? e.message : String(e),
+        ...describeGatewayError(e),
       });
     }
     return {};
@@ -298,14 +357,19 @@ export class AgentGateway {
     try {
       await starter.startTurn({ workspaceId, sessionId, seq, content });
     } catch (e) {
+      // Logged (not just counted): the control plane maps this to its 502,
+      // so without this line the turn failure would be untraceable (issue #48).
+      const errorId = newErrorId();
       this.deps.logger.error("gateway.turn.failed", {
+        errorId,
         userId: identity,
         workspaceId,
         sessionId,
         seq,
         error: e instanceof Error ? e.message : String(e),
+        ...describeGatewayError(e),
       });
-      return this.json(500, { error: "turn failed to start" });
+      return this.json(500, { error: "turn failed to start", errorId });
     }
     // Meaningful activity (仕様書 section 11).
     this.deps.runtime.recordActivity("user_message");

@@ -71,9 +71,13 @@ export {
 export { handleSessionEvents } from "./sse.js";
 export {
   createFetchHandler,
+  describeError,
+  errorContextFromRequest,
   startControlPlane,
   toErrorResponse,
+  type ErrorLogContext,
   type RunningControlPlane,
+  type ToErrorResponseOptions,
 } from "./server.js";
 
 export { PLACEHOLDER_KIND } from "./placeholder.js";
