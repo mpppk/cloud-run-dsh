@@ -27,7 +27,10 @@ db_disk_type = "PD_HDD"
 #   `vpcAccess` is rejected/silently dropped on Instances), so the native
 #   `cloudSqlInstance` volume dials the instance's PUBLIC address via /cloudsql.
 #   With ipv4_enabled = false the bring-up fails: `SFEClient is nil` /
-#   `refresh failed: context deadline exceeded` (measured 2026-09-03).
+#   `refresh failed: context deadline exceeded` (measured 2026-09-03,
+#   re-verified 2026-09-05: the production Instance reached Cloud SQL with
+#   this profile's db_enable_public_ip = true; see
+#   docs/e2e-verification-report.md).
 # - authorized_networks stays empty: an Instance egresses from Google's shared
 #   pool, so any allowlist wide enough to admit it is effectively 0.0.0.0/0.
 #   Authorization is IAM (roles/cloudsql.client) + a short-lived client

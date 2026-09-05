@@ -8,7 +8,7 @@ Terraform for the Google Cloud baseline described in 実装手順書 §2 and 仕
 |---|---|
 | `versions.tf` | `terraform >= 1.9`, `google` + `google-beta` providers `~> 6.0` |
 | `variables.tf` | Input variables — see table below |
-| `apis.tf` | Enables 11 required APIs (incl. IAM, Resource Manager, and Service Networking) |
+| `apis.tf` | Enables 12 required APIs (incl. IAM, Resource Manager, and Service Networking) |
 | `artifact_registry.tf` | Docker repo for the agent-host image |
 | `cloudsql.tf` | Cloud SQL for PostgreSQL (private IP), database, user |
 | `storage.tf` | GCS checkpoint bucket (uniform access, versioning, lifecycle) |
@@ -38,6 +38,12 @@ Terraform for the Google Cloud baseline described in 実装手順書 §2 and 仕
 | `llm_api_key_secret_id` | string | `llm-api-key` | no | Secret ID for LLM API key. |
 | `db_password_secret_id` | string | `db-password` | no | Secret ID for DB password. |
 | `db_password` | string | `null` | no | Direct DB password for bootstrapping; `null` → read from Secret Manager. See Bootstrap sequence below. |
+| `db_edition` | string | `ENTERPRISE` | no | Cloud SQL edition. `db-custom-*` tiers require `ENTERPRISE`; left implicit the API picks `ENTERPRISE_PLUS` and rejects them. |
+| `db_enable_public_ip` | bool | `false` | no | Public IPv4 for Cloud SQL. Default `false` is a deliberate safety valve; profiles opt in (`profiles/minimal.tfvars` sets `true`) because Cloud Run Instances dial the public address via the `cloudSqlInstance` volume. |
+| `db_backup_enabled` | bool | `true` | no | Automated backups. Verification-only profiles may disable (accepts total data loss). |
+| `db_point_in_time_recovery_enabled` | bool | `true` | no | PITR (requires backups). |
+| `db_transaction_log_retention_days` | number | `7` | no | WAL retention days for PITR (1-7). Only applied when backups are enabled. |
+| `db_query_insights_enabled` | bool | `true` | no | Query Insights. Verification-only profiles may disable. |
 | `checkpoint_live_delete_age_days` | number | `0` | no | Days after which LIVE objects are deleted. `0` = disabled (safe default). |
 | `iap_support_email` | string | `null` | conditional | Support email for IAP brand. Required to create `google_iap_brand`. |
 | `iap_members` | list(string) | `[]` | no | Members granted `roles/iap.httpsResourceAccessor` (e.g. `user:alice@example.com`). |
@@ -164,11 +170,13 @@ terraform apply
 ```
 
 After step 2 the password is sourced from Secret Manager again (conditional
-`data` with `count`), and `var.db_password` can be left unset.
+`data` with `count`), and `var.db_password` can be left unset. Secret
+*versions* are destroyed with the secrets (`terraform destroy` removes them),
+so every recreate needs step 2 again (G10).
 
 ### Enabled APIs
 
-`apis.tf` enables 11 APIs. `iam.googleapis.com` and
+`apis.tf` enables 12 APIs. `iam.googleapis.com` and
 `cloudresourcemanager.googleapis.com` are required for IAM and project
 resource operations. `servicenetworking.googleapis.com` is required for
 `google_service_networking_connection.private_vpc_connection`, which creates
@@ -194,12 +202,37 @@ Instance lifecycle is handled at runtime by the control plane's `InstanceRuntime
 
 ## Private IP choice (cloudsql.tf)
 
-Cloud SQL uses **private IP only** (`ipv4_enabled = false`, `private_network = <VPC>`). A minimal VPC + `VPC_PEERING` range + Service Networking connection is provisioned in `cloudsql.tf`. If the project already uses a Shared VPC, replace `google_compute_network.sql` with a data source and reuse the existing peering.
+Cloud SQL has a private IP (dedicated VPC + Service Networking peering in
+`cloudsql.tf`) **and** an opt-in public IPv4 (`var.db_enable_public_ip`,
+default `false` as a deliberate safety valve). The public address is required
+in practice: Cloud Run Instances have no VPC connectivity, so the native
+`cloudSqlInstance` volume at `/cloudsql` dials the public address (measured
+2026-09-03, re-verified 2026-09-05; with `ipv4_enabled = false` it fails with
+`SFEClient is nil`). `authorized_networks` stays empty — authorization is IAM
+(`roles/cloudsql.client`) plus an ephemeral client certificate, never source
+IP. If the project already uses a Shared VPC, replace
+`google_compute_network.sql` with a data source and reuse the existing peering.
+
+## Teardown traps (read before `terraform destroy`)
+
+Destroy can fail in two ways, and either one means billing does NOT stop:
+
+- **Checkpoint bucket not empty.** `force_destroy = false` with versioning on,
+  so any remaining object (live or noncurrent version) fails the destroy.
+  Empty it first: `bun run teardown:empty-bucket -- --yes`.
+- **DB user still referenced after migrations (#73).** `0001_init.sql` plus the
+  runner-created `schema_migrations` table reference the `dsh_app` role, so
+  deleting `google_sql_user.app` fails with `role "dsh_app" cannot be dropped
+  because some objects depend on it` (400). Observed on the 2026-09-05
+  teardown (first destroy failed, second passed after the database was gone —
+  order-dependent). Before destroy, drop the objects:
+  `psql "$DATABASE_URL" -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'`.
+  See also [architecture §09](../../docs/architecture.md).
 
 ## IAM least-privilege summary
 
-- `agent-host`: `cloudsql.client`, `storage.objectAdmin` (bucket-scoped) + `legacyBucketReader` (bucket-scoped), `secretmanager.secretAccessor` (three secrets), `logging.logWriter`, `monitoring.metricWriter`.
-- `control-plane`: same plus `run.admin`, `iam.serviceAccountUser` on the agent-host SA, and secret accessor for brokering. `legacyBucketReader` is granted symmetrically to both SAs so both can list checkpoints (agent_host restores, control_plane verifies).
+- `agent-host`: `cloudsql.client`, `storage.objectAdmin` (bucket-scoped) + `legacyBucketReader` (bucket-scoped), `secretmanager.secretAccessor` (three secrets), `logging.logWriter`, `monitoring.metricWriter`, plus `artifactregistry.reader` repo-scoped on the agent-host repository (image pull at Instance startup, #58).
+- `control-plane`: same plus `run.admin`, `iam.serviceAccountUser` on the agent-host SA, and secret accessor for brokering. `legacyBucketReader` is granted symmetrically to both SAs so both can list checkpoints (agent_host restores, control_plane verifies). The control-plane SA also holds repo-scoped `artifactregistry.reader`: it never calls the AR API itself, but Cloud Run verifies image access with the caller's permission at Instance create time (#64) — verified live, do not remove as "unused".
 - `ai-agent`: `run.admin` + `artifactregistry.writer` (project-level, via `ai_agent_project_roles`), `iam.serviceAccountTokenCreator` for members listed in `ai_agent_impersonators` (SA-scoped on the ai-agent SA), and scoped `iam.serviceAccountUser` (`actAs`) on both runtime SAs (`ai_agent_act_as_agent_host`, `ai_agent_act_as_control_plane`). See [AI-agent impersonation](#ai-agent-gcloud-impersonation): impersonating this account yields full runtime secrets.
 
 Bucket-level bindings use `google_storage_bucket_iam_member` (not project-wide `roles/storage.*`). Secret bindings use `google_secret_manager_secret_iam_member` per secret.

@@ -127,7 +127,7 @@ sequenceDiagram
   GCS-->>AH: tar.gz（無ければ素の clone のまま）
   AH->>AH: Harness を構成<br/>workspace-write / workspaceRoot=/workspace
   AH->>DB: セッションとイベントを復元
-  CP-->>U: 201 ワークスペース状態
+  CP-->>U: 200 ワークスペース状態
 
   loop エージェントのターン
     U->>CP: POST /v1/sessions/:id/messages
@@ -203,8 +203,10 @@ sequenceDiagram
 ## データと状態
 
 **ワークスペース状態**
-`STARTING` → `RUNNING` → `CHECKPOINTING` → `STOPPING` → `STOPPED`。
-復元経路として `RESTORING` と `RESTORE_FAILED` を持つ。`RESTORE_FAILED` はエージェントへの入力を拒否する。
+`STOPPED` → `STARTING` → `RESTORING` → `READY`（`READY` ↔ `BUSY` / `CHECKPOINTING`）→
+`STOPPING` → `STOPPED`。エラー状態として `ERROR`、`RESTORE_FAILED`、`CHECKPOINT_FAILED` を持つ。
+`RESTORE_FAILED` はエージェントへの入力を拒否する。完全な遷移表は
+`packages/workspace-runtime/src/state.ts`（`WORKSPACE_STATE_TRANSITIONS`）が正とする。
 
 **コントローラリース**
 ワークスペースあたり1つ。ハートビート15秒、失効45秒。単一書き手を保証し、
@@ -518,7 +520,8 @@ gcloud logging read \
 残っていると `force_destroy = false` のため destroy が失敗し、**課金が止まらない。**
 
 **さらに、マイグレーションを流したあとは DB ユーザーの罠がある**
-（[#73](https://github.com/mpppk/cloud-run-dsh/issues/73)）。`0001_init.sql` が作る6テーブルが
+（[#73](https://github.com/mpppk/cloud-run-dsh/issues/73)）。マイグレーション後に残る6テーブル
+（`0001_init.sql` の5テーブル + runner が作る `schema_migrations`）が
 `dsh_app` ロールを参照するため、user の削除が
 `role "dsh_app" cannot be dropped because some objects depend on it` で 400 になる。
 2026-09-05 の撤収では実際にこれで一度失敗した（database が先に消えていたため2回目は通ったが、
