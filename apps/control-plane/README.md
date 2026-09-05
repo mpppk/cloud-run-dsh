@@ -25,7 +25,7 @@ the two.
 | `LLM_BASE_URL` | no | agent-host default (`https://openrouter.ai/api/v1`) | Passed through to created Instances only when set. |
 | `LLM_MODEL` | no | agent-host default (`deepseek/deepseek-v4-flash`) | Passed through to created Instances only when set. |
 | `LLM_APPROVAL_POLICY` | no | agent-host default (`ask`) | Passed through to created Instances only when set (`ask` or `never`; anything else fails startup). |
-| `GCP_ACCESS_TOKEN` | no | metadata server | GCP OAuth2 token for the Instances API + GCS. On Cloud Run it is resolved from the metadata server automatically (the control-plane SA needs `roles/run.admin`); set explicitly only for local runs. Production-grade token handling (caching/refresh) is #27. |
+| `GCP_ACCESS_TOKEN` | no | metadata server | GCP OAuth2 token for the Instances API + GCS. On Cloud Run it is resolved from the metadata server automatically (the control-plane SA needs `roles/run.admin`); set explicitly only for local runs. Production-grade token handling (caching/refresh) landed on the agent-host side in #27 (PR #33); the control-plane provider is still minimal — see #76. |
 | `PORT` | no | `8080` | Listen port. Cloud Run injects this; the server always listens on `0.0.0.0:$PORT` (実装手順書 section 24). |
 
 Missing required keys fail startup with `MissingRequiredEnvError` listing
@@ -95,9 +95,9 @@ Known follow-ups (not placeholders — tracked issues):
 
 - Remote checkpoint trigger: the lifecycle checkpoint on `stop` is currently
   a no-op (durable checkpoints are the agent-host scheduler's job) and manual
-  checkpoints write request markers the agent-host does not honor yet. #22
-  adds the agent-host trigger endpoint.
-- Production-grade GCP token handling (caching/refresh/ADC) is #27.
+  checkpoints write request markers the agent-host does not honor yet. #75
+  tracks the agent-host trigger endpoint (#22 closed without it).
+- Production-grade GCP token handling (caching/refresh/ADC) is #76 (#27 closed with the agent-host side only).
 
 ## SQL adapters
 
