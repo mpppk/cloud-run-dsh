@@ -226,9 +226,11 @@ export const manualCheckpoint: RouteHandler = async (ctx) => {
   // forward, and `checkpointed: true` is now backed by a real durable
   // snapshot (a clean-tree host skip is still success — its snapshot
   // already covers the tree; a failure rejects and never reaches this
-  // line). The marker records the host's skip flag for audit.
-  await handle.runManualCheckpoint({ id: ctx.user.id, email: ctx.user.email });
-  return json({ workspaceId: workspace.id, checkpointed: true });
+  // line). The marker records the host's skip flag for audit, and the
+  // response carries it as `skipped` (issue #89) so callers can tell a
+  // real snapshot apart from a clean-tree skip.
+  const { skipped } = await handle.runManualCheckpoint({ id: ctx.user.id, email: ctx.user.email });
+  return json({ workspaceId: workspace.id, checkpointed: true, skipped });
 };
 
 // ---------------------------------------------------------------------------

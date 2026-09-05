@@ -474,7 +474,7 @@ export function buildManualCheckpointFn(
   workspaceId: string,
   clock: ControlPlaneClock,
   remote?: () => Promise<{ skipped: boolean }>,
-): () => Promise<void> {
+): () => Promise<{ skipped: boolean }> {
   return async () => {
     const skipped = remote ? (await remote()).skipped : undefined;
     const requestedAt = clock.now().toISOString();
@@ -490,6 +490,10 @@ export function buildManualCheckpointFn(
       }),
     );
     await storage.put(key, marker);
+    // The response flag mirrors the marker (issue #89). The no-remote
+    // fallback consulted no host, so there is no skip to report — and the
+    // marker write itself succeeded — hence `false`, never undefined.
+    return { skipped: skipped ?? false };
   };
 }
 

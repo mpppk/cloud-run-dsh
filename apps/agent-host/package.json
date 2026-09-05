@@ -15,6 +15,7 @@
     "@cloud-run-dsh/cloud-run-sandbox": "workspace:*",
     "@cloud-run-dsh/controller-lease": "workspace:*",
     "@cloud-run-dsh/dsh-subprocess-cloud-run": "workspace:*",
+    "@cloud-run-dsh/gcp-token-provider": "workspace:*",
     "@cloud-run-dsh/github-credential-broker": "workspace:*",
     "@cloud-run-dsh/observability": "workspace:*",
     "@cloud-run-dsh/session-persistence-postgres": "workspace:*",

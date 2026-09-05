@@ -948,7 +948,9 @@ describe("runManualCheckpoint — GCS marker", () => {
     // agent-persisted READY into this handle, like a real second open.
     await driveAgentRestore(h);
     expect(await handle.open()).toBe("READY");
-    await handle.runManualCheckpoint();
+    // Issue #89: the test-only no-remote fallback consulted no host, so
+    // there is no skip to report — the marker write itself succeeded.
+    await expect(handle.runManualCheckpoint()).resolves.toEqual({ skipped: false });
     const keys = [...h.gcs.objects.keys()];
     expect(keys).toHaveLength(1);
     expect(keys[0]!.startsWith("workspaces/ws-1/manual-checkpoints/")).toBe(true);
@@ -1166,7 +1168,9 @@ describe("runManualCheckpoint remote trigger (issue #75)", () => {
     const forwarder = new FakeCheckpointForwarder();
     const registry = makeRegistry(h, undefined, { forwarder });
     const handle = await openReady(h, registry);
-    await handle.runManualCheckpoint(CALLER);
+    // Issue #89: the host's skip flag flows back to the caller, matching
+    // what the marker records below.
+    await expect(handle.runManualCheckpoint(CALLER)).resolves.toEqual({ skipped: false });
     expect(forwarder.checkpointCalls).toHaveLength(1);
     expect(forwarder.checkpointCalls[0]!.identity).toEqual(CALLER);
     expect(forwarder.checkpointCalls[0]!.instanceUrl).toBe("https://dsh-ws-1.run.app");
@@ -1181,7 +1185,7 @@ describe("runManualCheckpoint remote trigger (issue #75)", () => {
     forwarder.checkpointSkipped = true;
     const registry = makeRegistry(h, undefined, { forwarder });
     const handle = await openReady(h, registry);
-    await handle.runManualCheckpoint(CALLER);
+    await expect(handle.runManualCheckpoint(CALLER)).resolves.toEqual({ skipped: true });
     expect(readMarker(h)["checkpointSkipped"]).toBe(true);
   });
 

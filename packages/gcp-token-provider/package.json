@@ -1,0 +1,17 @@
+{
+  "name": "@cloud-run-dsh/gcp-token-provider",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared GCP OAuth2 access-token provider (metadata server, ADC, env) with caching",
+  "main": "./src/index.ts",
+  "dependencies": {
+    "@cloud-run-dsh/observability": "workspace:*",
+    "@cloud-run-dsh/workspace-checkpoint": "workspace:*"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src",
+    "build": "tsc --build"
+  }
+}

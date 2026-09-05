@@ -36,7 +36,9 @@ async function main(): Promise<void> {
   const executor = await BunSqlQueryExecutor.connect(config.databaseUrl);
   const repo = new PostgresSessionPersistenceRepository(executor);
   const clock = new SystemClock();
-  const tokenProvider = createGcpAccessTokenProvider();
+  // Issue #76: the shared metadata → ADC → env chain with caching. The
+  // logger records WHICH source minted each token, never the token itself.
+  const tokenProvider = createGcpAccessTokenProvider(undefined, undefined, { logger });
   // Issue #68: ONE ID-token provider shared by the #22 forwarder AND the
   // agent-host health poll. Tokens are audience-bound per Instance URL, so
   // sharing one RefreshingIdTokenProvider shares its per-audience cache

@@ -75,8 +75,12 @@ export interface WorkspaceRuntimeHandle {
    * Runs a manual checkpoint as a meaningful, tracked operation. Same
    * identity rule as stop(): the real caller, forwarded to the agent-host
    * checkpoint route (issue #75).
+   *
+   * Returns whether the host skipped writing a new snapshot (clean tree —
+   * still success, issue #89): the handler surfaces it as `skipped` so API
+   * callers can tell a real snapshot apart from a clean-tree skip.
    */
-  runManualCheckpoint(identity?: ForwardIdentity): Promise<void>;
+  runManualCheckpoint(identity?: ForwardIdentity): Promise<{ skipped: boolean }>;
   /**
    * Returns the reachable URL of the workspace's Cloud Run Instance, or null
    * when the workspace has never been opened (or the Instance is unknown).
@@ -104,8 +108,12 @@ export interface WorkspaceRuntimeHandle {
 export class WorkspaceRuntimeHandleAdapter implements WorkspaceRuntimeHandle {
   constructor(
     private readonly runtime: WorkspaceRuntime,
-    /** Per-workspace checkpoint work composed from the T5 checkpoint bundle. */
-    private readonly checkpointFn: () => Promise<void>,
+    /**
+     * Per-workspace checkpoint work composed from the T5 checkpoint bundle.
+     * Returns the host's skip flag (issue #89) so runManualCheckpoint can
+     * report it; the T8 runtime passes the value through untouched.
+     */
+    private readonly checkpointFn: () => Promise<{ skipped: boolean }>,
     /**
      * Resolves the workspace's Instance URL for #22 forwarding. Optional so
      * existing call sites (route tests with stub handles) keep working; the
@@ -155,7 +163,7 @@ export class WorkspaceRuntimeHandleAdapter implements WorkspaceRuntimeHandle {
     this.runtime.assertAgentInputAllowed();
   }
 
-  runManualCheckpoint(identity?: ForwardIdentity): Promise<void> {
+  runManualCheckpoint(identity?: ForwardIdentity): Promise<{ skipped: boolean }> {
     this.identitySink?.(identity);
     return this.runtime.runCheckpoint(this.checkpointFn);
   }

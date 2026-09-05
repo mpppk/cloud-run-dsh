@@ -18,12 +18,12 @@
 //
 // Authentication: Instances carry invoker IAM, so the forward needs an ID
 // token whose audience is the Instance URL, minted at the metadata server
-// (`.../identity?audience=<url>`). The caching/expiry shape mirrors the #27
-// access-token provider (apps/agent-host/src/adapters.ts
-// RefreshingGcsTokenProvider): cache until a refresh margin before expiry
-// and share one in-flight refresh per audience. It is NOT shared code
-// because the endpoints, response shapes (JWT text vs JSON) and lifetimes
-// differ — sharing would couple two unrelated credential kinds.
+// (`.../identity?audience=<url>`). The caching/expiry shape mirrors the
+// access-token provider (@cloud-run-dsh/gcp-token-provider
+// RefreshingGcsTokenProvider, shared since #76): cache until a refresh
+// margin before expiry and share one in-flight refresh per audience. It is
+// NOT shared code because the endpoints, response shapes (JWT text vs JSON)
+// and lifetimes differ — sharing would couple two unrelated credential kinds.
 
 import type { Logger } from "@cloud-run-dsh/observability";
 
