@@ -29,7 +29,9 @@ import {
   createProductionRuntimeRegistry,
   defaultInstanceName,
   healthPollAudience,
+  isFrontendShutdownResponse,
   summarizeHealthFailure,
+  DEFAULT_AGENT_SHUTDOWN_GRACE,
   type HealthFetch,
 } from "./runtime-factory.js";
 import {
@@ -1568,6 +1570,10 @@ describe("issue #121 — the Cloud Run shutdown window vs the readiness budget",
     );
     expect(err).not.toBeNull();
     expect(err!.message).toMatch(/never became healthy/);
+    // Issue #121 log distinction: a host JSON 503 is reported as the host's
+    // own answer — never labeled as a frontend shutdown page.
+    expect(err!.message).toMatch(/Last failure: HTTP 503/);
+    expect(err!.message).not.toContain("frontend");
     // Bounded: exactly the health budget was spent — no more, no endless loop.
     expect(h.healthCalls).toHaveLength(3);
     expect(handle.getState()).toBe("RESTORE_FAILED");
@@ -1591,11 +1597,29 @@ describe("issue #121 — the Cloud Run shutdown window vs the readiness budget",
       (e: unknown) => e as Error,
     );
     expect(err).not.toBeNull();
-    expect(err!.message).toMatch(/never became healthy/);
-    // Finite: generous ceiling so the shutdown allowance fits, but an
-    // unbounded loop would blow past it (and hang the suite).
-    expect(h.healthCalls.length).toBeGreaterThan(0);
-    expect(h.healthCalls.length).toBeLessThanOrEqual(200);
+    // The failure names the shutdown window, not a broken host — and the
+    // health-budget phrasing ("never became healthy") is not reused for it.
+    expect(err!.message).toMatch(/frontend error page/);
+    expect(err!.message).not.toMatch(/never became healthy/);
+    // Exactly the shutdown budget was spent, then it stopped: finite proof.
+    expect(h.healthCalls).toHaveLength(DEFAULT_AGENT_SHUTDOWN_GRACE.maxAttempts + 1);
     expect(handle.getState()).toBe("RESTORE_FAILED");
+  });
+
+  test("isFrontendShutdownResponse: HTML 5xx is the frontend, JSON is the host", () => {
+    // The observed incident body.
+    expect(isFrontendShutdownResponse(500, FRONTEND_500_HTML)).toBe(true);
+    expect(isFrontendShutdownResponse(502, "<html><body>Bad Gateway</body></html>")).toBe(true);
+    expect(isFrontendShutdownResponse(503, "<html><body>Service Unavailable</body></html>")).toBe(
+      true,
+    );
+    // The agent-host's own answers are JSON — even a 500 from the app must
+    // count against the health budget, never the shutdown allowance.
+    expect(isFrontendShutdownResponse(503, HOST_RESTORING_JSON)).toBe(false);
+    expect(isFrontendShutdownResponse(500, JSON.stringify({ error: "boom" }))).toBe(false);
+    // Non-5xx is never the shutdown window (401 invoker-IAM, 404 no route…).
+    expect(isFrontendShutdownResponse(401, FRONTEND_500_HTML)).toBe(false);
+    expect(isFrontendShutdownResponse(200, FRONTEND_500_HTML)).toBe(false);
+    expect(isFrontendShutdownResponse(500, "")).toBe(false);
   });
 });
