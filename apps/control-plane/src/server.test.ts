@@ -343,10 +343,19 @@ describe("authentication", () => {
     expect(res.status).toBe(401);
   });
 
-  test("health endpoint needs no auth", async () => {
-    const res = await fetch(h.url("/healthz"));
+  test("liveness endpoint needs no auth (issue #68: /livez, never /healthz)", async () => {
+    const res = await fetch(h.url("/livez"));
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ status: "ok" });
+  });
+
+  test("issue #68: /healthz is not served (Cloud Run reserves it)", async () => {
+    // Cloud Run's frontend answers the exact path /healthz itself, so
+    // serving it here would advertise an endpoint that is unreachable over
+    // HTTP from outside. Liveness lives on /livez instead: an authenticated
+    // GET /healthz must 404 (no route), while /livez answers 200.
+    expect((await h.fetchAs("alice", "/healthz")).status).toBe(404);
+    expect((await h.fetchAs("alice", "/livez")).status).toBe(200);
   });
 });
 

@@ -187,9 +187,21 @@ export function createFetchHandler(deps: ControlPlaneDeps): (request: Request) =
       const url = new URL(request.url);
       pathname = url.pathname;
 
-      // Health endpoint (実装手順書 section 24: health responsibility).
+      // Liveness endpoint (実装手順書 section 24: health responsibility).
       // Not workspace-scoped and NOT meaningful activity (仕様書 section 11).
-      if (url.pathname === "/healthz" && request.method === "GET") {
+      //
+      // Served on "/livez", NOT "/healthz" (issue #68): Cloud Run's frontend
+      // reserves the exact path "/healthz" and answers it with Google's own
+      // 404 page without ever reaching the container (measured 2026-09-05:
+      // only the exact "/healthz" was hijacked; "/healthz/", "/Healthz",
+      // "/healthzz" and "/readyz" all reached the container). A "/healthz"
+      // here would look probeable while being unreachable over HTTP from
+      // outside — the old comment claiming "it must be probeable by the
+      // platform" was wrong for HTTP (only the TCP startup probe, which is
+      // a different path into the container, ever succeeded). The k8s
+      // "/livez" (liveness) / "/readyz" (readiness) split below keeps the
+      // standard vocabulary without the reserved path.
+      if (url.pathname === "/livez" && request.method === "GET") {
         return new Response(JSON.stringify({ status: "ok" }), {
           headers: { "content-type": "application/json; charset=utf-8" },
         });
@@ -197,7 +209,7 @@ export function createFetchHandler(deps: ControlPlaneDeps): (request: Request) =
 
       // Readiness endpoint: honestly reflects degraded capability (e.g. the
       // production runtime registry being a placeholder). Served before auth,
-      // like /healthz — it must be probeable by the platform.
+      // like /livez — it must be probeable by the platform.
       if (url.pathname === "/readyz" && request.method === "GET") {
         const report = deps.readiness?.();
         if (report && !report.ready) {

@@ -453,7 +453,7 @@ describe("issue #60 — shared-row open, end to end", () => {
   test("issue #63: agent git-clone failure surfaces the health error, not IllegalTransitionError", async () => {
     // The GCP incident, end to end on the shared rows: the agent-host fails
     // git clone and commits RESTORE_FAILED while the control-plane open is
-    // still polling /healthz in STARTING. open() must reject with the health
+    // still polling the readiness endpoint in STARTING. open() must reject with the health
     // observation error (downstream of the clone failure) — the old code
     // replaced it with
     // "illegal state transition: STARTING -> RESTORE_FAILED", hiding the

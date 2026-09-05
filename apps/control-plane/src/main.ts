@@ -36,6 +36,12 @@ async function main(): Promise<void> {
   const repo = new PostgresSessionPersistenceRepository(executor);
   const clock = new SystemClock();
   const tokenProvider = createGcpAccessTokenProvider();
+  // Issue #68: ONE ID-token provider shared by the #22 forwarder AND the
+  // agent-host health poll. Tokens are audience-bound per Instance URL, so
+  // sharing one RefreshingIdTokenProvider shares its per-audience cache
+  // instead of minting twice per open. The poll needs it because Instances
+  // carry invoker IAM — a bare fetch() 401s on every attempt.
+  const idTokenProvider = createIdTokenProvider();
   const runtimes = createProductionRuntimeRegistry({
     config,
     repo,
@@ -47,6 +53,7 @@ async function main(): Promise<void> {
     clock,
     instanceTransport: createAuthenticatedInstanceTransport(tokenProvider),
     gcsClient: new FetchGcsClient({ tokenProvider }),
+    idTokenProvider,
   });
   const deps = createControlPlaneDeps({
     repo,
@@ -63,7 +70,7 @@ async function main(): Promise<void> {
     // postMessage 409 when the Instance has no URL (open first) and 502
     // when the forward fails after the append (never a fake 201).
     messageForwarder: new HttpAgentHostForwarder({
-      idTokenProvider: createIdTokenProvider(),
+      idTokenProvider,
       logger,
     }),
   });

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { InMemoryLogger } from "@cloud-run-dsh/observability";
+import { AGENT_HOST_HEALTH_PATH } from "@cloud-run-dsh/workspace-runtime";
 import { composeTestHost, seedWorkspace } from "./fakes.js";
 import type { AgentTurnInput, TurnStarter } from "./gateway.js";
 
@@ -51,14 +52,32 @@ async function gatewayWithReadyHost() {
 }
 
 describe("AgentGateway", () => {
-  test("GET /healthz does not require IAP identity", async () => {
+  test("GET AGENT_HOST_HEALTH_PATH does not require IAP identity", async () => {
     const th = await composeTestHost();
-    const res = await th.host.gateway.handle(request("GET", "/healthz"));
+    const res = await th.host.gateway.handle(request("GET", AGENT_HOST_HEALTH_PATH));
     expect(res.status).toBe(503); // RESTORING — not ready yet
     await seedWorkspace(th);
     await th.host.recover();
-    const ready = await th.host.gateway.handle(request("GET", "/healthz"));
+    const ready = await th.host.gateway.handle(request("GET", AGENT_HOST_HEALTH_PATH));
     expect(ready.status).toBe(200);
+  });
+
+  test("issue #68: the health path is not /healthz (Cloud Run reserves it)", async () => {
+    // The shared constant is the contract the control-plane poll builds its
+    // URL from — if this ever reads "/healthz" again, the open flow is
+    // broken by construction (the Cloud Run frontend answers /healthz
+    // itself and never forwards it to the container).
+    expect(AGENT_HOST_HEALTH_PATH).toBe("/readyz");
+    expect(AGENT_HOST_HEALTH_PATH).not.toBe("/healthz");
+    const th = await gatewayWithReadyHost();
+    const served = await th.host.gateway.handle(request("GET", AGENT_HOST_HEALTH_PATH));
+    expect(served.status).toBe(200);
+    // ... and the reserved path is NOT served here (a 404 from the gateway
+    // proves the move; on GCP the platform answers /healthz before us).
+    // NOTE: with IAP identity — without it the gateway 401s before route
+    // matching, which would prove nothing about the path.
+    const reserved = await th.host.gateway.handle(request("GET", "/healthz", IAP));
+    expect(reserved.status).toBe(404);
   });
 
   test("non-health routes require an IAP identity", async () => {
@@ -141,7 +160,9 @@ describe("AgentGateway", () => {
   test("unknown paths 404, wrong methods 405", async () => {
     const th = await gatewayWithReadyHost();
     expect((await th.host.gateway.handle(request("GET", "/nope", IAP))).status).toBe(404);
-    expect((await th.host.gateway.handle(request("DELETE", "/healthz"))).status).toBe(405);
+    expect(
+      (await th.host.gateway.handle(request("DELETE", AGENT_HOST_HEALTH_PATH))).status,
+    ).toBe(405);
   });
 
   test("messages without a TurnStarter answer 503 with an explicit code (never a fake 202)", async () => {

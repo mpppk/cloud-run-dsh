@@ -6,13 +6,14 @@
 
 import type { WorkspaceRuntime } from "@cloud-run-dsh/workspace-runtime";
 import { AgentInputRefusedError } from "@cloud-run-dsh/workspace-runtime";
+import { AGENT_HOST_HEALTH_PATH } from "@cloud-run-dsh/workspace-runtime";
 import type { InvalidOperationError } from "@cloud-run-dsh/workspace-runtime";
 import type { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
 import type { Logger } from "@cloud-run-dsh/observability";
 import { describeError, newErrorId } from "@cloud-run-dsh/observability";
 import type { AgentHostConfig } from "./config.js";
 import type { HealthService } from "./health.js";
-import { healthzResponse } from "./health.js";
+import { healthResponse } from "./health.js";
 
 const IAP_IDENTITY_HEADER = "x-goog-authenticated-user-email";
 
@@ -152,10 +153,15 @@ export class AgentGateway {
   private async route(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === "/healthz") {
+    // External health (issue #68): served on AGENT_HOST_HEALTH_PATH, NOT
+    // "/healthz". Cloud Run's frontend reserves the exact path "/healthz"
+    // and answers it with Google's own 404 page without ever reaching this
+    // container, so polling "/healthz" can never succeed no matter how
+    // healthy the host is. See AGENT_HOST_HEALTH_PATH for the measurement.
+    if (url.pathname === AGENT_HOST_HEALTH_PATH) {
       if (request.method !== "GET") return this.methodNotAllowed();
       // Health checks are NOT meaningful activity (仕様書 section 11).
-      return healthzResponse(this.deps.health.snapshot());
+      return healthResponse(this.deps.health.snapshot());
     }
 
     // TRUST ASSUMPTION (仕様書 section 21 / 実装手順書 section 25, updated

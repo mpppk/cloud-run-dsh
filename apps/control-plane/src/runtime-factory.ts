@@ -18,12 +18,15 @@
 // What the lifecycle steps mean on the control plane (which has no workspace
 // files, no git, no sandbox — the image deliberately omits them):
 //   waitForInstanceHealth  REAL: polls Instances API GET until READY, then
-//                          polls the agent-host /healthz until it reports
-//                          ready, and persists workspaces.instance_url.
+//                          polls the agent-host readiness endpoint
+//                          (AGENT_HOST_HEALTH_PATH — "/readyz", NEVER
+//                          "/healthz": Cloud Run reserves "/healthz", issue
+//                          #68) until it reports ready, and persists
+//                          workspaces.instance_url.
 //   clone/checkout/        NO-OP: executed INSIDE the instance by the
 //   restore/sandbox/       agent-host restart recovery (実装手順書 section 30).
 //   restoreHarness         The control plane observes their completion via the
-//                          agent-host /healthz poll above; READY here means
+//                          agent-host readiness poll above; READY here means
 //                          "instance healthy AND agent-host recovery complete".
 //
 // Issue #60 案C: the control plane owns ONLY the instance lifecycle and the
@@ -60,7 +63,8 @@ import type {
 } from "@cloud-run-dsh/cloud-run-instance-client";
 import { GcsCheckpointStorage } from "@cloud-run-dsh/workspace-checkpoint";
 import type { GcsClient } from "@cloud-run-dsh/workspace-checkpoint";
-import { IdleManager, WorkspaceRuntime } from "@cloud-run-dsh/workspace-runtime";
+import { AGENT_HOST_HEALTH_PATH, IdleManager, WorkspaceRuntime } from "@cloud-run-dsh/workspace-runtime";
+import { redactValue } from "@cloud-run-dsh/observability";
 import type {
   TransactionalStateStore,
   WorkspaceLifecycleSteps,
@@ -72,9 +76,24 @@ import type {
 import { RuntimeRegistry, WorkspaceRuntimeHandleAdapter } from "./deps.js";
 import type { ControlPlaneClock } from "./deps.js";
 import type { ControlPlaneConfig } from "./config.js";
+import type { IdTokenProvider } from "./forwarding.js";
 
-/** Minimal surface used to poll the agent-host /healthz (global fetch in prod). */
-export type HealthFetch = (url: string) => Promise<{ ok: boolean; status: number }>;
+/**
+ * Minimal surface used to poll the agent-host readiness endpoint
+ * (AGENT_HOST_HEALTH_PATH) with global fetch in prod. The `init` carries
+ * the invoker-IAM Authorization header minted by the default
+ * implementation; test stubs may ignore it. `text()` is required (not
+ * optional) so a failing poll can always report WHAT the host answered —
+ * issue #68: a status-only `{ok, status}` shape plus a swallowing catch
+ * made 401-vs-unreachable indistinguishable in the logs.
+ */
+export interface HealthCheckResponse {
+  readonly ok: boolean;
+  readonly status: number;
+  text(): Promise<string>;
+}
+
+export type HealthFetch = (url: string, init?: RequestInit) => Promise<HealthCheckResponse>;
 
 export interface PollConfig {
   readonly maxAttempts: number;
@@ -97,6 +116,17 @@ export interface ProductionRuntimeOptions {
   /** GCS client behind the checkpoint storage (fake in tests). */
   readonly gcsClient: GcsClient;
   readonly healthFetch?: HealthFetch;
+  /**
+   * ID-token mint for the health poll (issue #68, reused from #22 forwarding:
+   * the SAME RefreshingIdTokenProvider main.ts gives the forwarder — tokens
+   * are audience-bound per Instance URL so the cache is shared, not minted
+   * twice). Used ONLY by the default healthFetch; tests that inject their
+   * own healthFetch never touch it. When absent the default poll goes out
+   * unauthenticated (local dev without invoker IAM).
+   */
+  readonly idTokenProvider?: IdTokenProvider;
+  /** Transport behind the default healthFetch (global fetch in prod; a recording fake in tests). */
+  readonly fetchImpl?: typeof fetch;
   readonly instancePoll?: PollConfig;
   readonly agentHealthPoll?: PollConfig;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -308,6 +338,37 @@ class EnsureCreatedInstanceRuntime implements InstanceRuntime {
   }
 }
 
+/**
+ * Summarizes one failed health attempt for the timeout error (issue #68,
+ * cause 3): status + a truncated, redactor-scrubbed body snippet. The body
+ * is NEVER embedded raw — an error page could echo request details — so it
+ * goes through the observability redactor (high-entropy tokens, secret
+ * assignments) and is cut to 200 chars.
+ */
+export function summarizeHealthFailure(status: number, bodyText: string): string {
+  const redacted = String(redactValue(bodyText.trim()));
+  const snippet = redacted.length <= 200 ? redacted : `${redacted.slice(0, 200)}…`;
+  return snippet === "" ? `HTTP ${status} (empty body)` : `HTTP ${status}: ${snippet}`;
+}
+
+/** Best-effort body read for the failure summary above; never throws. */
+async function safeHealthBody(res: HealthCheckResponse): Promise<string> {
+  try {
+    return await res.text();
+  } catch {
+    return "";
+  }
+}
+
+/** Audience for the poll's ID token: the Instance origin (issue #22 rule). */
+export function healthPollAudience(healthUrl: string): string {
+  try {
+    return new URL(healthUrl).origin;
+  } catch {
+    return healthUrl;
+  }
+}
+
 async function waitForInstanceHealth(args: {
   client: CloudRunInstanceClient;
   instanceName: string;
@@ -334,7 +395,16 @@ async function waitForInstanceHealth(args: {
         `(${args.instancePoll.maxAttempts} polls) — not retrying blindly`,
     );
   }
-  const healthUrl = `${instanceUrl.replace(/\/$/, "")}/healthz`;
+  // The path MUST stay AGENT_HOST_HEALTH_PATH (never "/healthz" — Cloud Run
+  // reserves it and never forwards it to the container, issue #68). The
+  // constant is shared with the agent-host gateway; the equality is pinned
+  // by tests on both sides.
+  const healthUrl = `${instanceUrl.replace(/\/$/, "")}${AGENT_HOST_HEALTH_PATH}`;
+  // Issue #68, cause 3: the old `catch {}` swallowed every attempt, so the
+  // timeout error could not say whether the host was unreachable, refused
+  // auth, or answered unhealthy. The last attempt's reason now travels with
+  // the timeout error (summarized + redacted, never raw).
+  let lastFailure = "no health attempts completed";
   for (let attempt = 1; attempt <= args.agentHealthPoll.maxAttempts; attempt++) {
     try {
       const res = await healthFetch(healthUrl);
@@ -342,14 +412,19 @@ async function waitForInstanceHealth(args: {
         await repo.updateWorkspace(workspaceId, { instanceUrl });
         return;
       }
-    } catch {
-      // Agent-host not reachable yet — keep polling within budget.
+      lastFailure = summarizeHealthFailure(res.status, await safeHealthBody(res));
+    } catch (e) {
+      // Unreachable host, aborted request, or a failing ID-token mint —
+      // keep polling within budget, but remember WHY for the final error.
+      const reason = e instanceof Error ? e.message : String(e);
+      lastFailure = `fetch failed: ${String(redactValue(reason))}`;
     }
     if (attempt < args.agentHealthPoll.maxAttempts) await sleep(args.agentHealthPoll.intervalMs);
   }
   throw new Error(
     `instance ${instanceName} is READY but its agent-host never became healthy ` +
-      `(${args.agentHealthPoll.maxAttempts} polls of ${healthUrl}) — not marking READY blindly`,
+      `(${args.agentHealthPoll.maxAttempts} polls of ${healthUrl}). ` +
+      `Last failure: ${lastFailure} — not marking READY blindly`,
   );
 }
 
@@ -398,7 +473,25 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
   const basePath = buildInstancesBasePathForConfig(config);
   const checkpointStorage = new GcsCheckpointStorage(opts.gcsClient, config.checkpointBucket);
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  const healthFetch: HealthFetch = opts.healthFetch ?? ((url: string) => fetch(url));
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const idTokenProvider = opts.idTokenProvider;
+  // Default health poll (issue #68, cause 2): Instances carry invoker IAM,
+  // so the poll mints an ID token for the Instance origin via the SAME
+  // provider the #22 forwarder uses (forwarding.ts RefreshingIdTokenProvider
+  // — metadata server `.../identity?audience=<instance-url>`, never a second
+  // copy of the mint logic). A bare fetch() here 401s on every attempt.
+  const healthFetch: HealthFetch =
+    opts.healthFetch ??
+    (async (url: string, init?: RequestInit): Promise<HealthCheckResponse> => {
+      const headers = new Headers(init?.headers);
+      if (idTokenProvider) {
+        // A failing mint throws HERE and is recorded as the attempt's
+        // failure reason by the poll loop — never silently unauthenticated.
+        const idToken = await idTokenProvider(healthPollAudience(url));
+        headers.set("authorization", `Bearer ${idToken}`);
+      }
+      return fetchImpl(url, { ...init, headers });
+    });
   const instancePoll = opts.instancePoll ?? DEFAULT_INSTANCE_POLL;
   const agentHealthPoll = opts.agentHealthPoll ?? DEFAULT_AGENT_HEALTH_POLL;
 
@@ -444,7 +537,7 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
           sleep,
         }),
       // Executed inside the Instance by agent-host restart recovery
-      // (実装手順書 section 30); observed via the /healthz poll above.
+      // (実装手順書 section 30); observed via the readiness poll above.
       cloneRepository: async () => {},
       checkoutBase: async () => {},
       restoreCheckpoint: async () => {},

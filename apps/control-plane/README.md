@@ -63,7 +63,7 @@ docker run --rm -p 8080:8080 \
   -e OPENROUTER_API_KEY="demo-key" \
   control-plane
 
-curl -s http://localhost:8080/healthz   # {"status":"ok"}
+curl -s http://localhost:8080/livez   # {"status":"ok"}
 ```
 
 ## Runtime registry: wired to Cloud Run Instances
@@ -72,7 +72,8 @@ This image composes the Postgres-backed session persistence (T4), controller
 leases (T6), owner-based membership, and the **production `RuntimeRegistry`**
 (`src/runtime-factory.ts`): workspace `open` creates-or-starts the Cloud Run
 Instance (with the full agent-host environment), waits for the Instance to
-report READY and the agent-host `/healthz` to turn healthy, then marks the
+report READY and the agent-host readiness endpoint (`/readyz` — never
+`/healthz`: Cloud Run reserves that path, issue #68) to turn healthy, then marks the
 workspace READY. `stop` runs the graceful path and calls the Instance `:stop`
 API. Manual checkpoints record a timestamped request marker in the checkpoint
 bucket (`workspaces/<id>/manual-checkpoints/`).

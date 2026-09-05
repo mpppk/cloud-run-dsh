@@ -105,7 +105,8 @@ export class WorkspaceRuntimeHandleAdapter implements WorkspaceRuntimeHandle {
   /**
    * Issue #60 案C: the control plane drives ONLY the instance lifecycle and
    * the health observation (openInstance: STOPPED -> STARTING, start, poll
-   * /healthz). The RESTORING -> READY transitions on the shared row belong
+   * the agent-host readiness endpoint; issue #68). The RESTORING -> READY
+   * state transitions on the shared row belong
    * to the agent-host's completeRestore(); running the full open() here is
    * the state-machine half of the #60 collision. The final reload observes
    * the state the agent-host persisted — READY once its recovery completes.
@@ -191,7 +192,7 @@ export class RuntimeRegistry {
 }
 
 /**
- * Readiness report served by GET /readyz. Unlike /healthz (liveness: the
+ * Readiness report served by GET /readyz. Unlike /livez (liveness: the
  * process is up), readiness must honestly reflect degraded capability —
  * e.g. the production runtime registry being a placeholder.
  */
