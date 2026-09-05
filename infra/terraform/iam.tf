@@ -175,6 +175,16 @@ resource "google_secret_manager_secret_iam_member" "control_plane_llm_key" {
   member    = "serviceAccount:${google_service_account.control_plane.email}"
 }
 
+# Control plane needs its own DATABASE_URL secret for the Cloud Run deploy
+# (issues #93 / #94). Kept next to the other three accessor grants so a new
+# secret can never again exist without its grant.
+resource "google_secret_manager_secret_iam_member" "control_plane_database_url" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.control_plane_database_url.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.control_plane.email}"
+}
+
 # --- Control plane only: Cloud Run admin ----------------------------------
 # Needed to create/start/stop/delete Cloud Run Instances (spec §2, §27-29).
 # Narrow to run.developer if the organisation forbids run.admin.

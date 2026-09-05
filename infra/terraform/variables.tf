@@ -152,6 +152,12 @@ variable "db_password_secret_id" {
   default     = "db-password"
 }
 
+variable "control_plane_database_url_secret_id" {
+  description = "Secret Manager secret ID for the control-plane Cloud Run service DATABASE_URL (socket form, added out-of-band in the runbook Step 6)."
+  type        = string
+  default     = "control-plane-database-url"
+}
+
 variable "iap_support_email" {
   description = "Support email for the IAP OAuth brand. Required when creating google_iap_brand. Supply out-of-band."
   type        = string

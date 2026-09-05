@@ -158,6 +158,10 @@ describe("content checks", () => {
     expect(c).toContain("roles/cloudsql.client");
     expect(c).toContain("roles/storage.objectAdmin");
     expect(c).toContain("roles/secretmanager.secretAccessor");
+    // Issue #93: the control-plane DATABASE_URL secret carries its own
+    // accessor grant next to the other three — a secret must never exist
+    // without its grant again.
+    expect(c).toContain('google_secret_manager_secret_iam_member" "control_plane_database_url"');
     expect(c).toContain("roles/logging.logWriter");
     expect(c).toContain("roles/monitoring.metricWriter");
     expect(c).toContain("roles/run.admin");
@@ -234,11 +238,15 @@ describe("content checks", () => {
     expect(saIamSaUserBlocks.length).toBe(3);
   });
 
-  test("secrets.tf creates 3 secrets without values", () => {
+  test("secrets.tf creates 4 secrets without values", () => {
     const c = tfContents["secrets.tf"];
     expect(c).toContain("github_app_private_key");
     expect(c).toContain("llm_api_key");
     expect(c).toContain("db_password");
+    // Issue #93: the control-plane DATABASE_URL secret lives here too, so its
+    // accessor grant (iam.tf) cannot drift out of sync with its existence.
+    expect(c).toContain("control_plane_database_url");
+    expect(tfContents["variables.tf"]).toContain("control_plane_database_url_secret_id");
     expect(c).not.toMatch(/secret_data/);
   });
 

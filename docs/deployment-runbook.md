@@ -23,7 +23,7 @@ Scope of the Terraform baseline (what you are about to create):
 - Cloud SQL PostgreSQL 16 with a private IP (own VPC + Service Networking peering) **plus a public IPv4** — Cloud Run Instances have no VPC connectivity, so the native `cloudSqlInstance` volume path dials the public address (see Step 5); `authorized_networks` stays empty (IAM + short-lived client certificate do the authorization), database `dsh`, user `dsh_app` — `cloudsql.tf`. The public IPv4 is **not** a provider default (`variables.tf` keeps `db_enable_public_ip = false` as a safety valve) — you enable it in Step 2.1 via `TF_VAR_db_enable_public_ip=true`, or by using the minimal profile (`profiles/minimal.tfvars`, Appendix), which sets `db_enable_public_ip = true`.
 - GCS checkpoint bucket (uniform access, versioning, ARCHIVED-object 30-day lifecycle) — `storage.tf`
 - Three service accounts (agent-host, control-plane, and the `ai-agent` operator identity) with least-privilege bindings — `iam.tf`. The `ai-agent` operator identity and its gcloud impersonation setup are documented separately in [`gcp-ai-agent-impersonation.md`](gcp-ai-agent-impersonation.md).
-- Secret Manager placeholders: `github-app-private-key`, `llm-api-key`, `db-password` (no values in code) — `secrets.tf`
+- Secret Manager placeholders: `github-app-private-key`, `llm-api-key`, `db-password`, `control-plane-database-url` (no values in code — versions are added out-of-band; the control-plane URL's version is added in Step 6) — `secrets.tf`
 - IAP brand + client + `iap.httpsResourceAccessor` members — `iap.tf`
 
 **NOT** in Terraform (deliberately — see [ADR-0001](adr/0001-instances-outside-terraform.md)):
@@ -160,7 +160,9 @@ After Phase 2 the password is sourced from Secret Manager again; leave `var.db_p
 
 ### 2.4 Fill the remaining secrets
 
-The other two secrets were created as empty placeholders by the apply:
+The other two secrets were created as empty placeholders by the apply
+(`control-plane-database-url` was too — its version is added in Step 6,
+where the connection name and encoded password are at hand):
 
 ```bash
 echo -n "$GITHUB_APP_PEM" | gcloud secrets versions add github-app-private-key --data-file=-
@@ -200,9 +202,14 @@ export IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-host/agent-host:v1"
 
 gcloud auth configure-docker "${REGION}-docker.pkg.dev"
 
-docker build -f apps/agent-host/Dockerfile -t "$IMAGE" .
+docker build --platform linux/amd64 -f apps/agent-host/Dockerfile -t "$IMAGE" .
 docker push "$IMAGE"
 ```
+
+(`--platform linux/amd64` is REQUIRED: Cloud Run executes linux/amd64 only,
+and a native build on Apple Silicon yields linux/arm64 — same rule as the
+control-plane build in Step 6. Verified 2026-09-05: both images inspected as
+`linux/amd64`.)
 
 The image never contains secrets — configuration is injected via environment at runtime (Step 5/6).
 
@@ -468,8 +475,8 @@ export CP_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-host/control-plane
 # argv or shell history — secrets travel via Secret Manager (--set-secrets)
 # and stdin redirection (herestrings use temp files, not argv). The
 # control-plane SA already holds accessor grants for db-password /
-# github-app-private-key / llm-api-key (iam.tf) and run.admin + act-as
-# agent-host (Steps 5/7 need them).
+# github-app-private-key / llm-api-key / control-plane-database-url (iam.tf)
+# and run.admin + act-as agent-host (Steps 5/7 need them).
 export SA_EMAIL="$(terraform -chdir=infra/terraform output -raw agent_host_service_account_email)"
 export BUCKET="$(terraform -chdir=infra/terraform output -raw checkpoint_bucket_name)"
 export SQL_CONNECTION="$(terraform -chdir=infra/terraform output -raw sql_connection_name)"
@@ -480,18 +487,20 @@ export DB_PASSWORD_URLENC="$(bun -e 'console.log(encodeURIComponent(process.argv
 # Your GitHub App ID (numeric, from the App settings page — not a secret).
 export GH_APP_ID="<github-app-id>"
 
-# The control plane needs its own full DATABASE_URL (TCP form — Cloud Run
-# services reach Cloud SQL over TCP, unlike Instances which use the socket).
-# Store it as a dedicated secret version so the password never lands in argv
-# or the service config (herestring, not argv):
+# The control plane needs its own full DATABASE_URL in the same /cloudsql
+# socket form the Instances use
+# (postgresql://dsh_app:<pw>@/dsh?host=/cloudsql/<sql_connection_name>).
+# A Cloud Run service reaches Cloud SQL through the SAME unix socket as an
+# Instance — a plain TCP connect to the instance's public IPv4 does NOT open,
+# because authorized_networks is deliberately empty (Step 4) and the service
+# egresses from the same shared pool (measured 2026-09-05: the TCP form
+# timed out with `Connection timeout after 30s` on the first DB request).
+# The secret container is Terraform-managed (secrets.tf, issue #93) — add
+# only the VERSION here, so the password never lands in argv or the service
+# config (herestring, not argv):
 umask 077
-gcloud secrets create control-plane-database-url --replication-policy=automatic 2>/dev/null || true
-gcloud sql instances describe "$(echo "$SQL_CONNECTION" | cut -d: -f3)" \
-  --format='get(ipAddresses[0].ipAddress)' | {
-  read -r SQL_IP
-  gcloud secrets versions add control-plane-database-url --data-file=- \
-    <<<"postgresql://dsh_app:${DB_PASSWORD_URLENC}@${SQL_IP}:5432/dsh"
-}
+gcloud secrets versions add control-plane-database-url --data-file=- \
+  <<<"postgresql://dsh_app:${DB_PASSWORD_URLENC}@/dsh?host=/cloudsql/${SQL_CONNECTION}"
 
 # Plain env vars travel via a 0600 YAML file (--env-vars-file), NOT inline
 # --set-env-vars: AGENT_HOST_DATABASE_URL embeds the DB password, and inline
@@ -515,9 +524,18 @@ gcloud run deploy control-plane \
   --service-account="$CP_SA_EMAIL" \
   --ingress=internal-and-cloud-load-balancing \
   --no-allow-unauthenticated \
+  --add-cloudsql-instances="$SQL_CONNECTION" \
   --env-vars-file="$CP_ENV" \
   --set-secrets="DATABASE_URL=control-plane-database-url:latest,GITHUB_APP_PRIVATE_KEY_PEM=github-app-private-key:latest,OPENROUTER_API_KEY=llm-api-key:latest"
 ```
+
+`--add-cloudsql-instances` mounts the `/cloudsql/<connection-name>` unix
+socket the `DATABASE_URL` above dials (same mechanism as the Instance
+`cloudSqlInstance` volume in Step 5.2 — without it the socket path does not
+exist and every DB request fails). No extra IAM is needed for it: the
+control-plane SA already holds `roles/cloudsql.client` (`iam.tf`,
+`control_plane_cloudsql_client`; measured 2026-09-05: `POST /v1/workspaces`
+returned 201 on the first DB request after this change).
 
 Created Instances receive their environment (including `DATABASE_URL` with the
 DB password AND `OPENROUTER_API_KEY` with the LLM key — issue #41, plus
@@ -599,6 +617,27 @@ gcloud storage ls "gs://$(terraform -chdir=infra/terraform output -raw checkpoin
 
 Pass criteria: `/livez` 200; workspace created (201, server-generated UUID `id`) + opened; an Instance exists for the workspace; the `workspaces` row shows the expected state; no 403 from IAP.
 
+### Recovery: `restore-failed` on a row stuck in `STOPPING`
+
+`prepareStop()` intentionally leaves the row in `STOPPING` (the Cloud Run
+instance stop and the `STOPPED` transition belong to the caller). The
+transition table (`packages/workspace-runtime/src/state.ts`) gives `STOPPING`
+only `STOPPED`, `CHECKPOINT_FAILED`, `ERROR` — no edge to `STARTING` /
+`RESTORING` — and `RESTORABLE_STATES` (`packages/workspace-runtime/src/runtime.ts`)
+does not contain `STOPPING`. So if the Instance restarts while the row is
+still `STOPPING`, restart recovery refuses (`open` raises, health reports
+`restore-failed`). That is deliberate, not corruption.
+
+The way out is re-sending the stop — `STOPPING` re-entry is allowed
+(`prepareStop` resumes the sequence instead of throwing):
+
+```bash
+curl -s -X POST "https://<control-plane-host>/v1/workspaces/${WORKSPACE_ID}/stop" \
+  -H "$IAP_ID" \
+  -H "$IAP_EMAIL"
+# → 200 {"state":"STOPPED"}, then open again as in step 3 above.
+```
+
 ---
 
 ## Step 8 — Teardown (stop paying)
@@ -651,7 +690,11 @@ Teardown gotchas (all verified against `infra/terraform`):
 - **Cloud SQL instance**: `google_sql_database_instance.main` has no ABANDON override, so destroy DOES delete it — the largest cost line disappears at step 4.
 - **DB user after migrations (open issue [#73](https://github.com/mpppk/cloud-run-dsh/issues/73), measured 2026-09-05; full path through `DROP ROLE` verified against local PostgreSQL 16.9):** once the migration runner has applied `0001_init.sql`, its 6 tables reference the `dsh_app` role, so deleting the `google_sql_user.app` user fails with `role "dsh_app" cannot be dropped because some objects depend on it` (400) and the destroy fails with it. Dropping the tables alone is NOT enough: `dsh_app` also holds granted privileges (`USAGE, CREATE ON SCHEMA public` — without them the migration runner cannot create tables on PostgreSQL 16 at all — plus `CONNECT ON DATABASE dsh`), and those keep blocking `DROP ROLE` after every table is gone (`privileges for schema public` / `privileges for database dsh`). Those grants were made by `postgres` during bring-up, and only the grantor can revoke them — while `postgres` cannot run `DROP OWNED BY dsh_app` for objects it does not own — so this takes two connections. If `terraform destroy` fails on the user, run both steps, then re-run destroy. **Destructive, teardown-only: step 1 permanently deletes every table `dsh_app` owns (all migrated data). Never run these against a database you intend to keep.** A failed destroy keeps billing — do not leave it.
   1. As `dsh_app` via the proxy, exactly as in Step 4 (`DATABASE_URL` connects as `dsh_app`, and a role can always drop the objects it owns):
-    `psql "$DATABASE_URL" -c 'DROP OWNED BY dsh_app;'`
+    `psql "$DATABASE_URL" -c 'DROP OWNED BY dsh_app CASCADE;'`
+    (measured 2026-09-05: with `CASCADE`, `terraform destroy` succeeded on the first try, 50 destroyed).
+    If you run this through Bun.SQL instead of `psql`, open a single connection — `new SQL({ url, max: 1 })` —
+    because the default pool exhausts the `db-f1-micro` connection slots and fails with
+    `remaining connection slots are reserved` (measured 2026-09-05). `psql` needs no such option (one connection).
   2. As `postgres` via the same proxy — revoke the leftover grants. Terraform manages only the `dsh_app` user (`google_sql_user.app`); the built-in `postgres` user exists on every Cloud SQL for PostgreSQL instance but has no password until you set one, and Cloud SQL has no true superuser (`postgres` is `cloudsqlsuperuser`: `CREATEROLE, CREATEDB, LOGIN` — enough for the `REVOKE`s below):
     ```bash
     cloud-sql-proxy "$SQL_CONNECTION_NAME" --port 5433 &

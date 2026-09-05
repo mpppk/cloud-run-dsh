@@ -112,8 +112,9 @@ credential in the project**. The confirmed escalation path is:
    the scoped `actAs` (`roles/iam.serviceAccountUser`) bindings on both runtime
    SAs, to push an arbitrary container image and deploy a Cloud Run service
    running **as `agent-host`** (`dev-dsh-agent-host`).
-3. That container can read all three Secret Manager secrets
-   (`github-app-private-key`, `llm-api-key`, `db-password`) and the checkpoint
+3. That container can read all four Secret Manager secrets
+   (`github-app-private-key`, `llm-api-key`, `db-password`,
+   `control-plane-database-url`) and the checkpoint
    bucket. The same holds when running as `control_plane`.
 
 This is acceptable for a single-owner MVP scratch project, but adding a member
@@ -125,7 +126,7 @@ Cloud Run service IAM policy management while still allowing create/update of
 services, mirroring the `control_plane_run_admin` note below). However, it
 does **not** close the secret path on its own: a developer can still deploy a
 service running as `agent-host` (given `actAs`), and that identity holds
-`secretAccessor` on all three secrets. Closing the secret path would require
+`secretAccessor` on all four secrets. Closing the secret path would require
 revisiting the runtime SAs' `secretAccessor` grants.
 
 ## Values that MUST be supplied out-of-band
@@ -138,6 +139,7 @@ These are never stored in code and must be injected via Secret Manager / env:
   - `github-app-private-key` — GitHub App private key PEM
   - `llm-api-key` — LLM provider API key
   - `db-password` — PostgreSQL `dsh_app` password (also drives `google_sql_user.app.password` via `data.google_secret_manager_secret_version`)
+  - `control-plane-database-url` — control-plane Cloud Run service `DATABASE_URL` in `/cloudsql` socket form (its version is added in the runbook's Step 6, which is where the connection name and encoded password are at hand)
 
 Example:
 
@@ -232,7 +234,7 @@ Destroy can fail in two ways, and either one means billing does NOT stop:
 ## IAM least-privilege summary
 
 - `agent-host`: `cloudsql.client`, `storage.objectAdmin` (bucket-scoped) + `legacyBucketReader` (bucket-scoped), `secretmanager.secretAccessor` (three secrets), `logging.logWriter`, `monitoring.metricWriter`, plus `artifactregistry.reader` repo-scoped on the agent-host repository (image pull at Instance startup, #58).
-- `control-plane`: same plus `run.admin`, `iam.serviceAccountUser` on the agent-host SA, and secret accessor for brokering. `legacyBucketReader` is granted symmetrically to both SAs so both can list checkpoints (agent_host restores, control_plane verifies). The control-plane SA also holds repo-scoped `artifactregistry.reader`: it never calls the AR API itself, but Cloud Run verifies image access with the caller's permission at Instance create time (#64) — verified live, do not remove as "unused".
+- `control-plane`: same plus `run.admin`, `iam.serviceAccountUser` on the agent-host SA, and secret accessor for brokering (three shared secrets plus its own `control-plane-database-url`, #93). `legacyBucketReader` is granted symmetrically to both SAs so both can list checkpoints (agent_host restores, control_plane verifies). The control-plane SA also holds repo-scoped `artifactregistry.reader`: it never calls the AR API itself, but Cloud Run verifies image access with the caller's permission at Instance create time (#64) — verified live, do not remove as "unused".
 - `ai-agent`: `run.admin` + `artifactregistry.writer` (project-level, via `ai_agent_project_roles`), `iam.serviceAccountTokenCreator` for members listed in `ai_agent_impersonators` (SA-scoped on the ai-agent SA), and scoped `iam.serviceAccountUser` (`actAs`) on both runtime SAs (`ai_agent_act_as_agent_host`, `ai_agent_act_as_control_plane`). See [AI-agent impersonation](#ai-agent-gcloud-impersonation): impersonating this account yields full runtime secrets.
 
 Bucket-level bindings use `google_storage_bucket_iam_member` (not project-wide `roles/storage.*`). Secret bindings use `google_secret_manager_secret_iam_member` per secret.
