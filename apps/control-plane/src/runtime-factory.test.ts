@@ -14,6 +14,7 @@ import { InMemoryFakeExecutor } from "@cloud-run-dsh/session-persistence-postgre
 import type { GcsClient } from "@cloud-run-dsh/workspace-checkpoint";
 import {
   IdleManager,
+  IllegalTransitionError,
   WorkspaceRuntime,
 } from "@cloud-run-dsh/workspace-runtime";
 import { SystemClock } from "./deps.js";
@@ -158,7 +159,7 @@ function makeRegistry(h: Harness, configOverride?: Partial<ControlPlaneConfig>) 
  * reports READY (the host is alive exactly when this code runs). Drives the
  * completeRestore() phase the control-plane handle deliberately skips.
  */
-function makeAgentRuntime(h: Harness, workspaceId = "ws-1"): WorkspaceRuntime {
+function makeAgentRuntime(h: Harness, workspaceId = "ws-1", cloneError?: Error): WorkspaceRuntime {
   const noop = async () => {};
   return new WorkspaceRuntime({
     workspaceId,
@@ -174,7 +175,11 @@ function makeAgentRuntime(h: Harness, workspaceId = "ws-1"): WorkspaceRuntime {
     instanceName: "dsh-ws-1",
     steps: {
       waitForInstanceHealth: noop,
-      cloneRepository: noop,
+      cloneRepository: cloneError
+        ? async () => {
+            throw cloneError;
+          }
+        : noop,
       checkoutBase: noop,
       restoreCheckpoint: noop,
       createSandbox: noop,
@@ -416,6 +421,89 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     const handle = await registry.get(workspace);
     await expect(handle.open()).rejects.toThrow(/never became healthy/);
     expect(handle.getState()).toBe("RESTORE_FAILED");
+  });
+
+  test("issue #63: agent-host restore failure surfaces the health error, not IllegalTransitionError", async () => {
+    // Production split (issue #60) on the shared SQL row: the agent-host
+    // fails git clone and commits RESTORE_FAILED while the control plane is
+    // still polling /healthz in STARTING. open() must reject with the health
+    // observation error — the old code replaced it with
+    // "illegal state transition: STARTING -> RESTORE_FAILED", hiding the
+    // real cause.
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
+    let releaseHealth!: () => void;
+    const healthGate = new Promise<void>((resolve) => {
+      releaseHealth = resolve;
+    });
+    const gatedUnhealthy: HealthFetch = async (url: string) => {
+      h.healthCalls.push(url);
+      await healthGate;
+      return { ok: false, status: 503 };
+    };
+    const registry = createProductionRuntimeRegistry({
+      config: testConfig(),
+      repo: h.repo,
+      stateStore: new SqlTransactionalStateStore(h.executor),
+      clock: new SystemClock(),
+      instanceTransport: h.transport,
+      gcsClient: h.gcs,
+      healthFetch: gatedUnhealthy,
+      instancePoll: { maxAttempts: 3, intervalMs: 0 },
+      agentHealthPoll: { maxAttempts: 2, intervalMs: 0 },
+      sleep: async () => {},
+    });
+    const handle = await registry.get(workspace);
+    const caughtP = handle.open().then(
+      (): Error | null => null,
+      (e: unknown) => e as Error,
+    );
+    // Wait until the control plane has taken the shared row to STARTING.
+    for (let i = 0; i < 1000; i++) {
+      const current = await h.repo.getWorkspace("ws-1");
+      if (current?.runtimeState === "STARTING") break;
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    expect((await h.repo.getWorkspace("ws-1"))?.runtimeState).toBe("STARTING");
+
+    // The agent-host fails git clone and records RESTORE_FAILED itself.
+    const agent = makeAgentRuntime(h, "ws-1", new Error("git clone failed: connection refused"));
+    await expect(agent.completeRestore()).rejects.toThrow("git clone failed");
+    expect((await h.repo.getWorkspace("ws-1"))?.runtimeState).toBe("RESTORE_FAILED");
+
+    // ... then the control plane's health observation fails too.
+    releaseHealth();
+    const err = await caughtP;
+    expect(err).not.toBeNull();
+    expect(err).not.toBeInstanceOf(IllegalTransitionError);
+    expect(err!.message).toMatch(/never became healthy/);
+    expect((await h.repo.getWorkspace("ws-1"))?.runtimeState).toBe("RESTORE_FAILED");
+  });
+});
+
+describe("SqlTransactionalStateStore CAS mismatch shape (issue #63)", () => {
+  test("reports (actual current, intended target) — same shape as the InMemory store", async () => {
+    const h = makeHarness();
+    await seedWorkspace(h.repo);
+    const store = new SqlTransactionalStateStore(h.executor);
+    await store.apply("ws-1", "STOPPED", "STARTING", "open");
+    await store.apply("ws-1", "STARTING", "RESTORING", "instance-healthy");
+    await store.apply("ws-1", "RESTORING", "RESTORE_FAILED", "restore-failed");
+
+    // A stale writer still expects STARTING. The old swapped construction
+    // threw "STARTING -> RESTORE_FAILED" here — byte-identical to the issue
+    // #63 GCP report — which reads as a forbidden table edge.
+    const err = await store
+      .apply("ws-1", "STARTING", "RESTORING", "stale-writer")
+      .then(
+        (): IllegalTransitionError | null => null,
+        (e: unknown) => e as IllegalTransitionError,
+      );
+    expect(err).toBeInstanceOf(IllegalTransitionError);
+    expect(err!.from).toBe("RESTORE_FAILED");
+    expect(err!.to).toBe("RESTORING");
+    expect(await store.load("ws-1")).toBe("RESTORE_FAILED");
   });
 });
 

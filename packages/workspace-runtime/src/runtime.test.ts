@@ -1,7 +1,10 @@
 import { describe, test, expect } from "bun:test";
 import type { WorkspaceLifecycleSteps } from "./runtime.js";
 import { WorkspaceRuntime, AgentInputRefusedError, InvalidOperationError } from "./runtime.js";
+import type { TransactionalStateStore } from "./store.js";
 import { InMemoryTransactionalStore } from "./store.js";
+import { IllegalTransitionError } from "./state.js";
+import type { WorkspaceRuntimeState } from "./state.js";
 import { IdleManager } from "./idle.js";
 import type { InstanceRuntime, InstanceInfo, Workspace as InstanceWorkspace } from "@cloud-run-dsh/cloud-run-instance-client";
 
@@ -208,6 +211,150 @@ describe("WorkspaceRuntime — restore orchestration (仕様書 section 8, 実�
       "RESTORING",
       "READY",
     ]);
+  });
+});
+
+describe("WorkspaceRuntime — issue #63: a STARTING failure keeps the original error", () => {
+  test("health observation failure while STARTING lands in RESTORE_FAILED with the original error", async () => {
+    // The GCP path: the instance started, but the agent-host health never
+    // reports ready (its git clone failed inside the instance). The control
+    // plane must surface the health error — not a state-transition error —
+    // and still record RESTORE_FAILED (仕様書 section 8).
+    const h = makeHarness();
+    h.steps.failures.set(
+      "waitForInstanceHealth",
+      () => new Error("agent-host never became healthy"),
+    );
+    await expect(h.runtime.openInstance()).rejects.toThrow("agent-host never became healthy");
+    expect(h.runtime.getState()).toBe("RESTORE_FAILED");
+    expect(h.runtime.getLastError()).toMatchObject({
+      message: "agent-host never became healthy",
+    });
+  });
+
+  test("shared-row race: agent-host records RESTORE_FAILED first, control plane still surfaces its own error", async () => {
+    // Two runtimes, one row (issue #60 split): the agent-host fails git clone
+    // and commits RESTORE_FAILED while the control plane is still polling
+    // health in STARTING. The control plane's belated bookkeeping must not
+    // replace its own failure with IllegalTransitionError (the exact GCP
+    // report: "illegal state transition: STARTING -> RESTORE_FAILED").
+    const h = makeHarness();
+    const gate = deferred<void>();
+    h.steps.gates.set("waitForInstanceHealth", gate as unknown as ReturnType<typeof deferred<void>>);
+    const agentSteps = new FakeSteps();
+    agentSteps.failures.set("cloneRepository", () => new Error("git clone failed: boom"));
+    const agent = new WorkspaceRuntime({
+      workspaceId: "ws-1",
+      store: h.store,
+      clock: h.clock,
+      instanceRuntime: h.instance,
+      instanceName: "dsh-ws-1",
+      steps: agentSteps,
+      idle: new IdleManager(h.clock),
+    });
+
+    const caughtP = h.runtime
+      .openInstance()
+      .then((): Error | null => null, (e: unknown) => e as Error);
+    for (let i = 0; i < 1000 && (await h.store.load("ws-1")) !== "STARTING"; i++) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    expect(await h.store.load("ws-1")).toBe("STARTING");
+
+    // The agent-host fails and records RESTORE_FAILED on the shared row.
+    await expect(agent.completeRestore()).rejects.toThrow("git clone failed: boom");
+
+    // ... then the control plane's own health observation fails too.
+    gate.reject(new Error("agent-host never became healthy"));
+    const err = await caughtP;
+    expect(err).not.toBeNull();
+    expect(err).not.toBeInstanceOf(IllegalTransitionError);
+    expect(err!.message).toBe("agent-host never became healthy");
+    // The failure state the agent-host recorded is left untouched.
+    expect(await h.store.load("ws-1")).toBe("RESTORE_FAILED");
+    expect(h.runtime.getState()).toBe("RESTORE_FAILED");
+    expect(h.runtime.getLastError()).toMatchObject({
+      message: "agent-host never became healthy",
+    });
+  });
+
+  /**
+   * Store whose compare-and-set loses a race exactly on the failure-state
+   * bookkeeping edge: reload() still sees STARTING, but apply() finds the
+   * row already moved on — the issue #60/#63 interleave.
+   */
+  class LostRaceStore implements TransactionalStateStore {
+    current: WorkspaceRuntimeState | null = "STOPPED";
+    constructor(private readonly onFailureEdge: (from: WorkspaceRuntimeState) => unknown) {}
+    async load(_workspaceId: string): Promise<WorkspaceRuntimeState | null> {
+      return this.current;
+    }
+    async apply(
+      _workspaceId: string,
+      from: WorkspaceRuntimeState,
+      to: WorkspaceRuntimeState,
+      _reason: string | undefined,
+    ): Promise<void> {
+      if (from === "STARTING" && to === "RESTORE_FAILED") {
+        this.current = "RESTORE_FAILED"; // the other process won
+        throw this.onFailureEdge(from);
+      }
+      if (this.current !== from) {
+        throw new IllegalTransitionError(this.current ?? "STOPPED", to);
+      }
+      this.current = to;
+    }
+  }
+
+  function makeRuntimeWithStore(store: TransactionalStateStore, steps: FakeSteps): WorkspaceRuntime {
+    const clock = new FakeClock();
+    return new WorkspaceRuntime({
+      workspaceId: "ws-1",
+      store,
+      clock,
+      instanceRuntime: new FakeInstanceRuntime(),
+      instanceName: "dsh-ws-1",
+      steps,
+      idle: new IdleManager(clock),
+    });
+  }
+
+  test("a lost bookkeeping race is chained as cause; the original error is still thrown", async () => {
+    const steps = new FakeSteps();
+    steps.failures.set("waitForInstanceHealth", () => new Error("health poll timed out"));
+    const runtime = makeRuntimeWithStore(
+      new LostRaceStore(
+        () => new IllegalTransitionError("RESTORE_FAILED", "RESTORE_FAILED"),
+      ),
+      steps,
+    );
+    const err = await runtime
+      .openInstance()
+      .then((): Error | null => null, (e: unknown) => e as Error);
+    expect(err).not.toBeNull();
+    expect(err).not.toBeInstanceOf(IllegalTransitionError);
+    expect(err!.message).toBe("health poll timed out");
+    // The secondary bookkeeping failure rides along as cause so the race
+    // stays visible without replacing the real failure.
+    expect(err!.cause).toBeInstanceOf(IllegalTransitionError);
+  });
+
+  test("a non-transition bookkeeping failure is dropped, never chained (secret hygiene)", async () => {
+    // Store-level failures can carry connection details; only state-names
+    // errors (IllegalTransitionError) may be chained onto errors that end up
+    // in structured logs.
+    const steps = new FakeSteps();
+    steps.failures.set("waitForInstanceHealth", () => new Error("health poll timed out"));
+    const runtime = makeRuntimeWithStore(
+      new LostRaceStore(() => new Error("postgres connect failed: host=/cloudsql/p:r:i")),
+      steps,
+    );
+    const err = await runtime
+      .openInstance()
+      .then((): Error | null => null, (e: unknown) => e as Error);
+    expect(err).not.toBeNull();
+    expect(err!.message).toBe("health poll timed out");
+    expect(err!.cause).toBeUndefined();
   });
 });
 

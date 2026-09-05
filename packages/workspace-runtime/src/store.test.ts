@@ -104,6 +104,22 @@ describe("InMemoryTransactionalStore", () => {
     expect(await store.load("ws-1")).toBe("READY");
   });
 
+  test("CAS mismatch reports (actual current, intended target) — issue #63 parity shape", async () => {
+    // A stale writer expects STARTING but the row already moved to
+    // RESTORE_FAILED (issue #60 shared row). The error must name the real
+    // row state and the attempted target — never a fabricated edge — so the
+    // next reader does not chase a transition-table bug that isn't there.
+    // The SQL stores must produce this exact shape (tested on both sides).
+    const store = new InMemoryTransactionalStore({ "ws-1": "RESTORE_FAILED" });
+    const err = await store
+      .apply("ws-1", "STARTING", "RESTORING", "stale-writer")
+      .then((): IllegalTransitionError | null => null, (e: unknown) => e as IllegalTransitionError);
+    expect(err).toBeInstanceOf(IllegalTransitionError);
+    expect(err!.from).toBe("RESTORE_FAILED");
+    expect(err!.to).toBe("RESTORING");
+    expect(await store.load("ws-1")).toBe("RESTORE_FAILED");
+  });
+
   test("concurrent applies to the same workspace are serialized", async () => {
     const store = new InMemoryTransactionalStore();
     const order: string[] = [];

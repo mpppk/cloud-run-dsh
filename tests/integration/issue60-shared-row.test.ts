@@ -25,6 +25,7 @@ import type {
   TransactionalStateStore,
   WorkspaceStateTransaction,
 } from "../../packages/workspace-runtime/src/index.js";
+import { IllegalTransitionError } from "../../packages/workspace-runtime/src/index.js";
 import { PostgresSessionPersistenceRepository } from "../../packages/session-persistence-postgres/src/index.js";
 import { InMemoryFakeExecutor } from "../../packages/session-persistence-postgres/src/testing.js";
 import { SqlTransactionalStateStore } from "../../apps/control-plane/src/prod-adapters.js";
@@ -434,8 +435,7 @@ describe("issue #60 — shared-row open, end to end", () => {
     expect((await world.repo.getWorkspace("ws-1"))!.runtimeState).toBe("READY");
   });
 
-  test("lease handover: fresh acquire for the opener; concurrent opens converge on one id", async () => {
-    const world = await buildSharedWorld("ws-2");
+  test("lease handover: fresh acquire for the opener; concurrent opens converge on one id", async () => {    const world = await buildSharedWorld("ws-2");
     // No lease exists: the first open acquires it fresh for the opener.
     const first = await ensureControllerLeaseForOpen(world.cpLeases, "ws-2", "alice");
     expect(typeof first).toBe("string");
@@ -448,5 +448,51 @@ describe("issue #60 — shared-row open, end to end", () => {
     ]);
     expect(a).toBe(first);
     expect(b).toBe(first);
+  });
+
+  test("issue #63: agent git-clone failure surfaces the health error, not IllegalTransitionError", async () => {
+    // The GCP incident, end to end on the shared rows: the agent-host fails
+    // git clone and commits RESTORE_FAILED while the control-plane open is
+    // still polling /healthz in STARTING. open() must reject with the health
+    // observation error (downstream of the clone failure) — the old code
+    // replaced it with
+    // "illegal state transition: STARTING -> RESTORE_FAILED", hiding the
+    // real cause behind a state-machine error.
+    const world = await buildSharedWorld("ws-1");
+    const established = await ensureControllerLeaseForOpen(world.cpLeases, "ws-1", "alice");
+    const agent = await composeAgent(world, "ws-1", established);
+    const originalRun = agent.git.run.bind(agent.git);
+    agent.git.run = async (args, opts) => {
+      if (args.includes("clone")) throw new Error("git clone failed: connection refused");
+      return originalRun(args, opts);
+    };
+
+    const openP = openWorkspace(openCtx(world, "ws-1", ALICE));
+    for (let i = 0; i < 1000; i++) {
+      const history = world.transitions.map((r) => `${r.from}->${r.to}`);
+      if (history.includes("STOPPED->STARTING")) break;
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    const recoverP = agent.host.recover();
+    const [openSettled, recoverSettled] = await Promise.allSettled([openP, recoverP]);
+
+    // The agent-host surfaces the clone failure and records RESTORE_FAILED.
+    expect(recoverSettled.status).toBe("rejected");
+    expect(String((recoverSettled as PromiseRejectedResult).reason)).toMatch(/clone failed/);
+    expect(agent.host.health.snapshot().status).toBe("RESTORE_FAILED");
+
+    // The control-plane open rejects with the health observation error —
+    // never the bookkeeping IllegalTransitionError — and the row the
+    // agent-host recorded is left untouched.
+    expect(openSettled.status).toBe("rejected");
+    const openErr = (openSettled as PromiseRejectedResult).reason as Error;
+    expect(openErr).not.toBeInstanceOf(IllegalTransitionError);
+    expect(openErr.message).toMatch(/never became healthy/);
+    expect((await world.repo.getWorkspace("ws-1"))!.runtimeState).toBe("RESTORE_FAILED");
+    expect(world.transitions.map((r) => `${r.from}->${r.to}`)).toEqual([
+      "STOPPED->STARTING",
+      "STARTING->RESTORING",
+      "RESTORING->RESTORE_FAILED",
+    ]);
   });
 });
