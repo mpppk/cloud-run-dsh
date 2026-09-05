@@ -193,16 +193,21 @@ resource "google_service_account_iam_member" "control_plane_act_as_agent_host" {
   member             = "serviceAccount:${google_service_account.control_plane.email}"
 }
 
-# --- Artifact Registry: repo-scoped reader for the Instance runtime SA -----
+# --- Artifact Registry: repo-scoped reader for Instance create + runtime ----
 # The agent-host repository image is pulled at Instance startup by the Cloud
 # Run infrastructure using the runtime execution SA (agent-host). Without this
 # binding, POST /v1/workspaces/:id/open fails with
 # artifactregistry.repositories.downloadArtifacts PERMISSION_DENIED (#58).
 # Scoped to the repository — not the project — via
 # google_artifact_registry_repository_iam_member.
-# The control-plane SA is intentionally NOT granted here: it only passes the
-# image URI string in the create request (containers[].image) and never calls
-# the Artifact Registry API itself.
+#
+# The control-plane SA does NOT call the Artifact Registry API itself — it only
+# passes the image URI string in the create request (containers[].image).
+# It still needs roles/artifactregistry.reader here because Cloud Run verifies
+# image access with the CALLER's permission at Instance create time (#64).
+# Verified on live infra: with agent-host only, `open` failed at `create` with
+# downloadArtifacts 403; granting the control-plane SA let the same `open`
+# proceed past create. Do NOT remove the control-plane binding as "unused".
 
 resource "google_artifact_registry_repository_iam_member" "agent_host_reader" {
   project    = var.project_id
@@ -210,4 +215,12 @@ resource "google_artifact_registry_repository_iam_member" "agent_host_reader" {
   repository = google_artifact_registry_repository.agent_host.repository_id
   role       = "roles/artifactregistry.reader"
   member     = "serviceAccount:${google_service_account.agent_host.email}"
+}
+
+resource "google_artifact_registry_repository_iam_member" "control_plane_reader" {
+  project    = var.project_id
+  location   = var.region
+  repository = google_artifact_registry_repository.agent_host.repository_id
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.control_plane.email}"
 }

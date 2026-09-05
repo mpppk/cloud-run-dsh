@@ -172,23 +172,33 @@ describe("content checks", () => {
     expect(c).toContain("control_plane_bucket_legacy_reader");
   });
 
-  test("iam.tf grants artifactregistry.reader repo-scoped to the Instance runtime SA (#58)", () => {
+  test("iam.tf grants artifactregistry.reader repo-scoped to both caller SAs (#58, #64)", () => {
     const c = tfContents["iam.tf"];
     // Repository-scoped binding — project-wide would over-grant.
     expect(c).toContain("google_artifact_registry_repository_iam_member");
     // Anchor on the assignment line itself: a bare toContain("roles/...reader")
     // also matches comments (the false-green seen before).
-    expect(c).toMatch(/^\s*role\s*=\s*"roles\/artifactregistry\.reader"\s*$/m);
+    const readerRoles = [...c.matchAll(/^\s*role\s*=\s*"roles\/artifactregistry\.reader"\s*$/gm)];
+    expect(readerRoles.length).toBe(2);
     // Wired to the agent-host repository resource, not a literal string.
-    expect(c).toMatch(/repository\s*=\s*google_artifact_registry_repository\.agent_host\./);
-    // Bound to the runtime execution SA that pulls the image at startup.
+    const repoWirings = [
+      ...c.matchAll(/repository\s*=\s*google_artifact_registry_repository\.agent_host\./g),
+    ];
+    expect(repoWirings.length).toBe(2);
+    // Bound to both SAs: agent-host pulls the image at startup (#58), and
+    // control-plane is checked by Cloud Run with the caller's permission at
+    // Instance create time even though it never calls the AR API (#64).
     expect(c).toMatch(/member\s*=\s*"serviceAccount:\$\{google_service_account\.agent_host\.email\}"/);
-    // Exactly one AR binding: control-plane only passes the image URI string
-    // in the create request and never calls the AR API, so it gets nothing.
+    expect(c).toMatch(
+      /member\s*=\s*"serviceAccount:\$\{google_service_account\.control_plane\.email\}"/,
+    );
+    expect(c).toContain('google_artifact_registry_repository_iam_member" "agent_host_reader"');
+    expect(c).toContain('google_artifact_registry_repository_iam_member" "control_plane_reader"');
+    // Exactly two AR bindings — one per SA.
     const arBlocks = [
       ...c.matchAll(/resource "google_artifact_registry_repository_iam_member" "[^"]+" \{[\s\S]*?\n\}/g),
     ];
-    expect(arBlocks.length).toBe(1);
+    expect(arBlocks.length).toBe(2);
     // No project-wide AR grants for either runtime SA.
     const projectAr = [
       ...c.matchAll(/resource "google_project_iam_member" "[^"]+" \{[\s\S]*?\n\}/g),
