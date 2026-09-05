@@ -174,6 +174,18 @@ export const DEFAULT_INSTANCE_CONFIG: InstanceConfig = {
   launchStage: DEFAULT_INSTANCE_LAUNCH_STAGE,
 } as const;
 
+/**
+ * Cloud SQL socket integration (issue #56). A Cloud Run Instance has no VPC
+ * connectivity of any kind, so the ONLY path to Cloud SQL is the built-in
+ * `cloudSqlInstance` volume mounted at /cloudsql (see
+ * infra/terraform/cloudsql.tf and docs/architecture.md). Both constants are
+ * exported so the control plane's consistency check (runtime-factory.ts:
+ * DATABASE_URL `host=` vs. volume instance) and tests share one source of
+ * truth — changing one side without the other re-creates this incident.
+ */
+export const CLOUD_SQL_VOLUME_NAME = "cloudsql";
+export const CLOUD_SQL_MOUNT_PATH = "/cloudsql";
+
 export type InstanceProfileName = "Small" | "Standard" | "Large";
 
 export const INSTANCE_PROFILES: Record<InstanceProfileName, InstanceConfig> = {
@@ -243,6 +255,30 @@ export class InstanceNotFoundError extends Error {
   readonly name = "InstanceNotFoundError";
   constructor(public readonly instanceName: string) {
     super(`instance not found: ${instanceName}`);
+  }
+}
+
+/**
+ * Thrown by `create()` when no Cloud SQL connection name is configured
+ * (issue #56). Without the `cloudSqlInstance` volume the Instance boots with
+ * no `/cloudsql` socket, so the agent-host dies with
+ * `ERR_POSTGRES_CONNECTION_REFUSED` and `restartPolicy: ON_FAILURE` restarts
+ * it in a loop — a billable crash loop that is only visible in container
+ * logs. Fail here, before any Instances API call, with the fix spelled out
+ * (same "fail before create" principle as issue #41's OPENROUTER_API_KEY
+ * guard). The connection name itself is not a secret, so echoing the
+ * *expected source* (never a credential) in the message is safe.
+ */
+export class MissingCloudSqlConnectionNameError extends Error {
+  readonly name = "MissingCloudSqlConnectionNameError";
+  constructor() {
+    super(
+      `create requires a Cloud SQL connection name (<project>:<region>:<instance>) — ` +
+        `supply \`cloudSqlConnectionName\` when constructing CloudRunInstanceClient ` +
+        `(the control plane reads it from CLOUD_SQL_CONNECTION_NAME, sourced from the ` +
+        `\`sql_connection_name\` Terraform output). Without it the Instance would boot ` +
+        `with no /cloudsql socket and crash-loop with ERR_POSTGRES_CONNECTION_REFUSED (issue #56).`,
+    );
   }
 }
 
@@ -318,6 +354,18 @@ export interface CloudRunInstanceClientOptions {
   /** v2 top-level `serviceAccount` — the SA the instance runs as. */
   serviceAccount?: string;
   /**
+   * Cloud SQL connection name (`<project>:<region>:<instance>`, the
+   * `sql_connection_name` Terraform output) for the `cloudSqlInstance` volume
+   * (issue #56). Required for `create()` — the Instance's only path to Cloud
+   * SQL is this volume mounted at /cloudsql (no VPC connectivity exists), so
+   * a missing name fails `create()` with MissingCloudSqlConnectionNameError
+   * before any API call instead of crash-looping inside the Instance.
+   * Optional here because some call sites only ever get/start/stop an
+   * existing instance (e.g. agent-host recovery); like `image`, `create()`
+   * throws a typed error when it is missing.
+   */
+  cloudSqlConnectionName?: string;
+  /**
    * Container environment variables (v2 `containers[].env`, a list of
    * `{name, value}` pairs). The control plane passes the agent-host's
    * required keys (WORKSPACE_ID, CHECKPOINT_BUCKET, DATABASE_URL, ...) here
@@ -343,6 +391,7 @@ export class CloudRunInstanceClient implements InstanceRuntime {
   private readonly config: InstanceConfig;
   private readonly image: string | undefined;
   private readonly serviceAccount?: string;
+  private readonly cloudSqlConnectionName?: string;
   private readonly env: Record<string, string>;
 
   constructor(options: CloudRunInstanceClientOptions) {
@@ -352,6 +401,7 @@ export class CloudRunInstanceClient implements InstanceRuntime {
     this.basePath = options.basePath.replace(/\/$/, "");
     this.image = options.image;
     this.serviceAccount = options.serviceAccount;
+    this.cloudSqlConnectionName = options.cloudSqlConnectionName?.trim() || undefined;
     this.env = { ...(options.env ?? {}) };
 
     // Resolve config: profile takes precedence, else explicit config, else default
@@ -392,6 +442,11 @@ export class CloudRunInstanceClient implements InstanceRuntime {
         "create requires an image (v2 containers[].image) — supply `image` when constructing CloudRunInstanceClient",
         400,
       );
+    }
+    // Issue #56: fail here — before any Instances API call — when the
+    // connection name is missing. A volumeless create bills a crash loop.
+    if (!this.cloudSqlConnectionName) {
+      throw new MissingCloudSqlConnectionNameError();
     }
     const instanceName = workspace.instanceName ?? `dsh-${workspace.id}`;
     // v2 create: the instance id is a query parameter, not a body field
@@ -465,6 +520,12 @@ export class CloudRunInstanceClient implements InstanceRuntime {
    *   - containers[].sandboxLauncher — lives on the CONTAINER, not the instance
    *   - containers[].ports[].containerPort
    *   - containers[].env    (optional; `{name, value}` pairs sorted by name)
+   *   - containers[].volumeMounts — the `cloudSqlInstance` volume mounted at
+   *     /cloudsql (issue #56; the Instance's ONLY path to Cloud SQL — without
+   *     it the agent-host crash-loops with ERR_POSTGRES_CONNECTION_REFUSED)
+   *   - volumes[]          (top-level; `cloudSqlInstance.instances` holds the
+   *     `<project>:<region>:<instance>` connection name; object form validated
+   *     against the live API with `validateOnly=true` on 2026-09-05)
    *   - restartPolicy      (top-level; API enum ON_FAILURE/NEVER/ALWAYS)
    *   - serviceAccount     (top-level)
    * There is no `template` wrapper on Instances (that is the Services/Revisions
@@ -483,6 +544,9 @@ export class CloudRunInstanceClient implements InstanceRuntime {
         },
       },
       ports: [{ containerPort: this.config.port }],
+      // Issue #56: mount the Cloud SQL socket volume. The name MUST match the
+      // top-level `volumes[]` entry below (asserted in tests).
+      volumeMounts: [{ name: CLOUD_SQL_VOLUME_NAME, mountPath: CLOUD_SQL_MOUNT_PATH }],
     };
     if (this.config.sandboxLauncher) container["sandboxLauncher"] = this.config.sandboxLauncher;
     const envNames = Object.keys(this.env).sort();
@@ -494,6 +558,14 @@ export class CloudRunInstanceClient implements InstanceRuntime {
       containers: [container],
       restartPolicy: toApiRestartPolicy(this.config.restartPolicy),
       launchStage: this.config.launchStage ?? DEFAULT_INSTANCE_LAUNCH_STAGE,
+      // Issue #56: the Cloud SQL socket volume. `create()` guarantees
+      // `cloudSqlConnectionName` is set before this ever runs.
+      volumes: [
+        {
+          name: CLOUD_SQL_VOLUME_NAME,
+          cloudSqlInstance: { instances: [this.cloudSqlConnectionName] },
+        },
+      ],
     };
     if (this.serviceAccount) body["serviceAccount"] = this.serviceAccount;
     return body;

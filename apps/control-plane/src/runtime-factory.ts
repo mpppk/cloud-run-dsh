@@ -37,6 +37,7 @@
 //                          from the control-plane side.
 
 import {
+  CLOUD_SQL_MOUNT_PATH,
   CloudRunInstanceClient,
   InstanceAlreadyExistsError,
   InstanceNotFoundError,
@@ -116,6 +117,69 @@ export function assertTwoMethodClock(clock: ControlPlaneClock): void {
 /** Instance name rule — identical to the client's default (`dsh-<workspace-id>`). */
 export function defaultInstanceName(workspace: Pick<Workspace, "id" | "instanceName">): string {
   return workspace.instanceName ?? `dsh-${workspace.id}`;
+}
+
+/**
+ * Fail-fast consistency check (issue #56, item 4): the `cloudSqlInstance`
+ * volume serves `<connection-name>` at /cloudsql, while the agent-host's
+ * `DATABASE_URL` dials `host=/cloudsql/<connection-name>`. Both values are
+ * operator-supplied (`CLOUD_SQL_CONNECTION_NAME` vs. `AGENT_HOST_DATABASE_URL`
+ * embedding the same `sql_connection_name` output), so changing one without
+ * the other re-creates this incident exactly: the socket path the app dials
+ * does not exist and the Instance crash-loops with
+ * `ERR_POSTGRES_CONNECTION_REFUSED` under `restartPolicy: ON_FAILURE`.
+ *
+ * Throw here — at handle creation, before any Instances API call — with both
+ * sides named and the fix spelled out. The connection name is not a secret;
+ * the DATABASE_URL *value* is never echoed (only its decoded `host=`, which
+ * carries no credentials).
+ */
+export function assertCloudSqlSocketConsistency(
+  agentHostDatabaseUrl: string,
+  cloudSqlConnectionName: string,
+): void {
+  const conn = cloudSqlConnectionName.trim();
+  if (conn === "") {
+    throw new Error(
+      "cannot build instance client: CLOUD_SQL_CONNECTION_NAME is not configured — " +
+        "set it to the `sql_connection_name` Terraform output (<project>:<region>:<instance>) " +
+        "so created Instances get their cloudSqlInstance volume (refusing to create a " +
+        "volumeless Instance that would crash-loop with ERR_POSTGRES_CONNECTION_REFUSED)",
+    );
+  }
+  const expectedHost = `${CLOUD_SQL_MOUNT_PATH}/${conn}`;
+  const actualHost = extractDatabaseUrlHostParam(agentHostDatabaseUrl);
+  if (actualHost !== expectedHost) {
+    const seen = actualHost === undefined ? "(no host= parameter)" : JSON.stringify(actualHost);
+    throw new Error(
+      `cannot build instance client: AGENT_HOST_DATABASE_URL host (${seen}) does not match ` +
+        `CLOUD_SQL_CONNECTION_NAME (${JSON.stringify(conn)}; want host=${JSON.stringify(expectedHost)}). ` +
+        "Derive both from the same `sql_connection_name` Terraform output " +
+        "(`...?host=/cloudsql/<connection-name>`) — refusing to create an Instance whose " +
+        "socket path would not exist",
+    );
+  }
+}
+
+/**
+ * Reads the `host` query parameter of a Postgres DSN without a full URL
+ * parse (passwords and placeholders in tests are not always URL-parseable;
+ * only the query string matters here). Returns undefined when absent.
+ */
+function extractDatabaseUrlHostParam(dsn: string): string | undefined {
+  const queryIndex = dsn.indexOf("?");
+  if (queryIndex < 0) return undefined;
+  for (const pair of dsn.slice(queryIndex + 1).split("&")) {
+    const eq = pair.indexOf("=");
+    if ((eq < 0 ? pair : pair.slice(0, eq)) !== "host") continue;
+    const raw = eq < 0 ? "" : pair.slice(eq + 1);
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -327,11 +391,16 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
     const instanceName = defaultInstanceName(workspace);
     const controllerId =
       opts.controllerIdForWorkspace?.(workspace) ?? crypto.randomUUID();
+    // Issue #56: the volume's connection name and the DATABASE_URL socket
+    // host must agree — fail here, before any Instances API call, not inside
+    // the Instance with ERR_POSTGRES_CONNECTION_REFUSED.
+    assertCloudSqlSocketConsistency(config.agentHostDatabaseUrl, config.cloudSqlConnectionName);
     const client = new CloudRunInstanceClient({
       transport: opts.instanceTransport,
       basePath,
       image: config.agentHostImage,
       serviceAccount: config.agentHostServiceAccount,
+      cloudSqlConnectionName: config.cloudSqlConnectionName,
       env: buildInstanceEnv(config, workspace, instanceName, controllerId),
     });
     const instanceRuntime = new EnsureCreatedInstanceRuntime(client, workspace, repo);
