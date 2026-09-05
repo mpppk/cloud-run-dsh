@@ -3,16 +3,22 @@
 ユーザーごとに隔離されたワークスペースを Cloud Run Instance 上で1つずつ動かすコーディングエージェント。
 ファイルシステムのサンドボックスは DeepSeek Harness が担う。
 
-> **現状は土台と閉じ込めまでで、エージェント本体（LLM 呼び出し）と 2 つのサービスを繋ぐ経路は未実装。**
-> 残作業の全体像は [#31](https://github.com/mpppk/cloud-run-dsh/issues/31) を参照。
+> **2026-09-05、下記「ワークスペースを開く流れ」の全経路が実プロジェクト上で動いた。**
+> ユーザーのメッセージから LLM がハーネスのツールを呼び、clone 済みリポジトリのファイルを読み、
+> イベントが SSE で返るまでを確認した。残る差分は
+> [#72](https://github.com/mpppk/cloud-run-dsh/issues/72)（`stop` が Instance を delete せず、
+> 停止時の tar.gz を保存しない）と
+> [#73](https://github.com/mpppk/cloud-run-dsh/issues/73)（撤収時の `terraform destroy`）。
 
-本書は 2026-09-03 に実プロジェクト `cloud-run-dsh` へ構築し、動作を確認したうえで撤収した内容に基づく。
-確認の経過・実測ログ・途中で判明した制約の詳細は [立ち上げ作業報告](./bringup-report.md) にまとめてある。
+本書は 2026-09-03 の構築と 2026-09-05 の端から端までの動作確認に基づく。
+経過・実測ログ・途中で判明した制約は
+[立ち上げ作業報告](./bringup-report.md) と
+[動作確認レポート](./e2e-verification-report.md) にまとめてある。
 
 | | |
 |---|---|
 | デプロイ単位 | 2 |
-| Terraform リソース | 52 |
+| Terraform リソース | 48（2026-09-05 の apply 実測。VPC コネクタ廃止で 52 から減） |
 | リージョン | asia-northeast1 |
 | DB | PostgreSQL 16 |
 
@@ -89,7 +95,7 @@ flowchart TB
 ## ワークスペースを開く流れ
 
 関係する主体が多く、往復の順序そのものが仕様になっている。
-**ただしこの図は設計であり、全段階が実装済みではない。**
+**2026-09-05 に全経路が実機で動いた。** 停止段の一部だけ実装が図に追いついていない（[#72](https://github.com/mpppk/cloud-run-dsh/issues/72)）。
 
 ```mermaid
 sequenceDiagram
@@ -134,8 +140,9 @@ sequenceDiagram
   alt アイドル検知 または POST /stop
     CP->>AH: 停止を要求
     AH->>GCS: ワークスペースを tar.gz で保存
+    Note over AH,GCS: 設計。実装では保存されない（#72）
     CP->>RUN: stop
-    Note over CP,RUN: 図は delete まで書いているが、<br/>実装は stop のみ（#72）
+    Note over CP,RUN: 設計では delete まで行う想定だが、<br/>実装は stop のみ（#72）
     Note over DB,GCS: Cloud SQL の行と GCS のチェックポイントは残る
   end
 ```
@@ -157,7 +164,7 @@ sequenceDiagram
 > **2026-09-05、この図の全経路が GCP 実機で動いた。** ユーザーのメッセージが
 > control-plane から agent-host に届き、LLM がハーネスのツールで clone 済みリポジトリの
 > ファイルを読み、イベントが Cloud SQL に積まれ、SSE で配信されるところまでを確認した。
-> 到達までに **本番でしか出ない 13 件のバグ**を修正した。詳細と証跡は
+> 到達までに **本番でしか出ない 14 件のバグ**を修正した。詳細と証跡は
 > [`e2e-verification-report.md`](e2e-verification-report.md) を参照。
 
 
@@ -181,8 +188,8 @@ sequenceDiagram
 | `POST /v1/workspaces` | ワークスペースを作成する。id はサーバが採番する。 |
 | `GET /v1/workspaces/:id` | 状態を取得する。 |
 | `POST /v1/workspaces/:id/open` | Instance を起動する（同時実行は合流）。 |
-| `POST /v1/workspaces/:id/stop` | チェックポイントを取って停止する。 |
-| `POST /v1/workspaces/:id/checkpoints` | 手動チェックポイント。 |
+| `POST /v1/workspaces/:id/stop` | 停止する（設計ではチェックポイントを取ってから停止するが、実装では tar.gz は保存されない。#72）。 |
+| `POST /v1/workspaces/:id/checkpoints` | 手動チェックポイント。**現状はマーカーの JSON を置くだけで、ワークスペースの中身は含まない**のに `checkpointed: true` を返す（#72）。 |
 | `POST /v1/workspaces/:id/controller/{acquire,heartbeat,release}` | コントローラリースの取得・延長・解放。 |
 | `GET` / `POST /v1/workspaces/:id/sessions` | セッションの一覧と作成。 |
 | `POST /v1/sessions/:id/messages` | エージェントへの入力。フィールド名は `content`。 |
