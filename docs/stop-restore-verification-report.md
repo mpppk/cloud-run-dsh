@@ -599,7 +599,7 @@ num_backends sample 8: 0 (from 1 series)   ← ここで break
 削除順（#103 の `depends_on`）も 4周目も正しかった:
 
 ```
-google_sql_database.dsh:           Destruction complete after 0s
+google_sql_database.dsh:           Destruction complete after 1s
 google_sql_user.app:               Destruction complete after 0s   ← database の後
 google_sql_database_instance.main: Destruction complete after 2m33s
 ```
@@ -710,10 +710,19 @@ assistant  The exact contents of `/workspace/CYCLE4_PROOF.txt` are:
 | 項目 | 結果 |
 |---|---|
 | デプロイ | **revision 00001**（3周連続で一発） |
-| `num_backends` ピーク | **10**（#109 の上限どおり。4周連続） |
+| `num_backends` ピーク | **10**（#109 の上限どおり。3周目に続き 2 周連続） |
 | ログ中のトークン | **0 件** |
-| Terraform | 52 適用 / 47 destroy（差は手順 3 でバケットを先に消したため） |
+| Terraform | 52 適用 / 47 destroy（差の 5 件は Step 8.3 でバケットを先に消したため。バケット本体＋IAM バインド 4 件が destroy の対象外になった） |
 | 手動チェックポイント | dirty なので `skipped: false`（期待どおり） |
+
+> 数字の出どころ: §8.1 の 8 サンプル・`47 destroyed`・`Invalid choice` は
+> `teardown-c4.log`、`stop` 1.4 秒・再 `open` の 500（63.6 秒）・409 は
+> `c4-verify.log`、マーカーの読み取りは `c4-sse-restore3.txt` に残っている。
+> §8.3〜§8.4 の時刻は `gcloud logging read` の値で、ファイルには残していない。
+> 再 `open` の 0.7 秒と手動チェックポイントの応答も実行時の端末出力による
+> （チェックポイント自体は Step 8.3 のバケット削除記録に
+> `manual-checkpoints/2026-09-05T21-51-56-939Z.json` として残っている）。
+> `num_backends` のピーク 10 は §7.1 と同じ手順で Monitoring の保持データから確認した。
 
 ### 8.7 4周目で見つかった 3 件
 
@@ -792,10 +801,12 @@ assistant  The exact contents of `/workspace/CYCLE4_PROOF.txt` are:
 - 4周目: #123（手順書に書いてあるコマンドが存在しない）、
   #118（ゲートのフィルタが実物のラベル形式と違う）
 
-**例外は 2 件だけで、どちらも「実装そのもの」のバグだった。**
+**例外は 3 件で、いずれも「実装そのもの」のバグだった。**
 
 - **#109** — 上限のないプール。コードを読めば分かるが、
   実機で負荷をかけるまで誰も困らない。
+- **#121** — shutdown 窓より短いポーリング予算と、500 の一律カウント。
+  コードの前提（500 = agent-host が不健康）が実物と違った。
 - **#122** — in-memory キャッシュを読む入力ゲート。
   **正常系では絶対に踏まない**。異常系に落ちた後の回復経路にしかない。
 
