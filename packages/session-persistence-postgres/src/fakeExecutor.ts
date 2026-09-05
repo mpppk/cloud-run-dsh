@@ -358,10 +358,11 @@ export class InMemoryFakeExecutor implements QueryExecutor {
       return [] as T[];
     }
 
-    // workspace_checkpoints — real storage (issue #95): every GCS
-    // checkpoint write appends one row; the (workspace_id, created_at)
-    // index is the generation history. Accepts both the repository
-    // recordCheckpoint shape (gen_random_uuid() id) and the
+    // workspace_checkpoints — write-audit storage (issues #95/#110):
+    // every GCS checkpoint write appends one row. Rows routinely share one
+    // gcs_object (each upload overwrites the same live key), so this is an
+    // audit trail, not a retrievable generation index. Accepts both the
+    // repository recordCheckpoint shape (gen_random_uuid() id) and the
     // transition-atomic persist shape from the SQL state stores.
     if (lower.startsWith("insert into workspace_checkpoints")) {
       const row: FakeCheckpointRow = {

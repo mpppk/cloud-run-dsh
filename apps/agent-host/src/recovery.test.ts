@@ -127,9 +127,10 @@ describe("RestartRecovery (実装手順書 section 30)", () => {
 
     // Lifecycle checkpoint uploaded a bundle.
     expect(th.storage.keys()).toContain("workspaces/ws-1/checkpoint.bin");
-    // Issue #95 案A: the same checkpoint appended one index row carrying
-    // the manifest base commit and the GCS object key — the row the
-    // production incident proved was never written before this fix.
+    // Issue #95 案A (clarified by #110): the same checkpoint appended one
+    // write-audit row carrying the manifest base commit and the GCS object
+    // key — the row the production incident proved was never written before
+    // this fix. The row is audit-only: restores read the live GCS key.
     const generations = await th.repository.listCheckpoints("ws-1");
     expect(generations.length).toBe(1);
     expect(generations[0]!.baseCommitSha).toBe("2c6fe42d68f1638b2d4059f0fa8c9901df9effb8");

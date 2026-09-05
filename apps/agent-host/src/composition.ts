@@ -158,9 +158,11 @@ export function composeAgentHost(deps: AgentHostDependencies): AgentHost {
     git: deps.git,
     fs: deps.fs,
     clock,
-    // Issue #95 案A: every durable GCS write appends one
-    // workspace_checkpoints row (base commit + object key) so the SQL
-    // index the spec requires actually reflects production. A failing
+    // Issue #95 案A (clarified by #110): every durable GCS write appends one
+    // workspace_checkpoints write-audit row (base commit + object key) so the SQL
+    // record the spec requires actually reflects production. Rows share the
+    // single live key — they are an audit trail, not a generation index, and
+    // restores never read them. A failing
     // record fails the checkpoint itself (loud, retried) rather than
     // silently diverging again.
     onCheckpointCreated: ({ baseCommitSha, gcsObject }) =>

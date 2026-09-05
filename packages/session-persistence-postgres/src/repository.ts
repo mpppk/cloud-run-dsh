@@ -98,13 +98,15 @@ export interface SessionPersistenceRepository {
   append(sessionId: string, events: NewSessionEvent[]): Promise<SessionEvent[]>;
   readEvents(sessionId: string, fromSeq?: number): Promise<SessionEvent[]>;
 
-  // Checkpoint index (workspace_checkpoints). Issue #95: every GCS
+  // Checkpoint write-audit (workspace_checkpoints). Issue #95: every GCS
   // checkpoint write must leave one row here — the table existed with an
   // INSERT implementation and tests, yet production never wrote a row
-  // because no checkpoint path reached it. The GCS object is the durable
-  // snapshot; this index answers "which workspace holds a checkpoint at
-  // which base commit" over SQL and is the basis for future generation
-  // management. Restore keeps using the GCS key convention directly.
+  // because no checkpoint path reached it. Issue #110: the rows all point
+  // at the same live key (`workspaces/<id>/checkpoint.bin`, overwritten
+  // per upload), so this table is the audit of "which base commit was
+  // durably written when" — NOT a generation index, and NOT read by
+  // restores (those fetch the live GCS key directly). Past generations live
+  // only as versioned noncurrent GCS objects (30-day expiry).
   recordCheckpoint(input: RecordCheckpointInput): Promise<WorkspaceCheckpoint>;
   listCheckpoints(workspaceId: string): Promise<WorkspaceCheckpoint[]>;
 
@@ -406,12 +408,12 @@ export class PostgresSessionPersistenceRepository implements SessionPersistenceR
   }
 
   /**
-   * Records one checkpoint generation in the index (issue #95 案A).
+   * Appends one write-audit row for a durable GCS upload (issue #95 案A,
+   * clarified by #110: every upload overwrites the same live key, so rows
+   * accumulate as an audit trail, not a retrievable generation index).
    * The id is database-generated (gen_random_uuid, same convention as the
    * transition-atomic persist path in the SQL state stores) so concurrent
-   * writers never collide; every successful GCS write appends exactly one
-   * row, which is what makes the (workspace_id, created_at) index a usable
-   * generation history.
+   * writers never collide.
    */
   async recordCheckpoint(input: RecordCheckpointInput): Promise<WorkspaceCheckpoint> {
     const rows = await this.executor.query<Record<string, unknown>>(
