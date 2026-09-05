@@ -124,6 +124,45 @@ export interface InstanceConfig {
   readonly restartPolicy: RestartPolicy;
   readonly sandboxLauncher: boolean;
   readonly port: number;
+  /**
+   * v2 top-level `launchStage` (issue #53). `containers[].sandboxLauncher`
+   * ("Instant sandboxes") requires at least BETA — without it the live API
+   * rejects every create with 400 FAILED_PRECONDITION ("The feature 'Instant
+   * sandboxes' is not supported in the declared launch stage ..."). Optional:
+   * when omitted the client defaults to BETA (validated against the live API
+   * with `validateOnly=true` on 2026-09-05).
+   */
+  readonly launchStage?: InstanceLaunchStage;
+}
+
+/**
+ * v2 `GoogleCloudRunV2Instance.launchStage` stages relevant to Instances.
+ * Maturity order is ALPHA < BETA < GA.
+ */
+export type InstanceLaunchStage = "ALPHA" | "BETA" | "GA";
+
+/**
+ * Default launch stage (issue #53). BETA is the proven value: the live API
+ * accepted `validateOnly=true` creates with `"launchStage": "BETA"` while the
+ * undeclared (GA-default) stage rejected `sandboxLauncher` with 400.
+ */
+export const DEFAULT_INSTANCE_LAUNCH_STAGE: InstanceLaunchStage = "BETA";
+
+const LAUNCH_STAGE_RANK: Record<InstanceLaunchStage, number> = {
+  ALPHA: 1,
+  BETA: 2,
+  GA: 3,
+};
+
+/**
+ * Issue #53 floor check: `sandboxLauncher` needs at least BETA.
+ * NOTE (live-API nuance): maturity order says GA is "newer" than BETA, but the
+ * sandbox feature itself is a BETA feature — the API rejected the undeclared
+ * stage and accepted an explicit "BETA". Keep the default at BETA; an explicit
+ * override is the caller's responsibility.
+ */
+export function meetsSandboxLaunchStageRequirement(stage: InstanceLaunchStage): boolean {
+  return (LAUNCH_STAGE_RANK[stage] ?? 0) >= LAUNCH_STAGE_RANK["BETA"];
 }
 
 export const DEFAULT_INSTANCE_CONFIG: InstanceConfig = {
@@ -132,6 +171,7 @@ export const DEFAULT_INSTANCE_CONFIG: InstanceConfig = {
   restartPolicy: "on-failure",
   sandboxLauncher: true,
   port: 8080,
+  launchStage: DEFAULT_INSTANCE_LAUNCH_STAGE,
 } as const;
 
 export type InstanceProfileName = "Small" | "Standard" | "Large";
@@ -143,6 +183,7 @@ export const INSTANCE_PROFILES: Record<InstanceProfileName, InstanceConfig> = {
     restartPolicy: "on-failure",
     sandboxLauncher: true,
     port: 8080,
+    launchStage: DEFAULT_INSTANCE_LAUNCH_STAGE,
   },
   Standard: {
     cpu: 4,
@@ -150,6 +191,7 @@ export const INSTANCE_PROFILES: Record<InstanceProfileName, InstanceConfig> = {
     restartPolicy: "on-failure",
     sandboxLauncher: true,
     port: 8080,
+    launchStage: DEFAULT_INSTANCE_LAUNCH_STAGE,
   },
   Large: {
     cpu: 8,
@@ -157,6 +199,7 @@ export const INSTANCE_PROFILES: Record<InstanceProfileName, InstanceConfig> = {
     restartPolicy: "on-failure",
     sandboxLauncher: true,
     port: 8080,
+    launchStage: DEFAULT_INSTANCE_LAUNCH_STAGE,
   },
 } as const;
 
@@ -327,7 +370,16 @@ export class CloudRunInstanceClient implements InstanceRuntime {
       throw new InvalidRestartPolicyError(resolved.restartPolicy);
     }
 
-    this.config = resolved;
+    // Issue #53: `sandboxLauncher` requires launchStage >= BETA on the live
+    // API (400 FAILED_PRECONDITION otherwise). Default an omitted stage to
+    // BETA and promote a weaker explicit stage (e.g. ALPHA) so the default
+    // path always works; an explicit BETA-or-newer choice is honored as-is.
+    let launchStage = resolved.launchStage ?? DEFAULT_INSTANCE_LAUNCH_STAGE;
+    if (resolved.sandboxLauncher && !meetsSandboxLaunchStageRequirement(launchStage)) {
+      launchStage = DEFAULT_INSTANCE_LAUNCH_STAGE;
+    }
+
+    this.config = { ...resolved, launchStage };
   }
 
   getConfig(): InstanceConfig {
@@ -404,6 +456,8 @@ export class CloudRunInstanceClient implements InstanceRuntime {
 
   /**
    * v2 GoogleCloudRunV2Instance create body (live discovery, 2026-09-03):
+   *   - launchStage        (top-level; issue #53 — BETA is required when
+   *     `containers[].sandboxLauncher` is set, the API default rejects it)
    *   - containers[]       (Required; exactly one container)
    *   - containers[].image (Required)
    *   - containers[].resources.limits.{cpu,memory}  — cpu/memory are limit
@@ -439,6 +493,7 @@ export class CloudRunInstanceClient implements InstanceRuntime {
     const body: Record<string, unknown> = {
       containers: [container],
       restartPolicy: toApiRestartPolicy(this.config.restartPolicy),
+      launchStage: this.config.launchStage ?? DEFAULT_INSTANCE_LAUNCH_STAGE,
     };
     if (this.serviceAccount) body["serviceAccount"] = this.serviceAccount;
     return body;
@@ -456,8 +511,10 @@ export class CloudRunInstanceClient implements InstanceRuntime {
       if (op["done"] === true) {
         if (op["error"] && typeof op["error"] === "object") {
           const err = op["error"] as Record<string, unknown>;
+          const raw = String(err["message"] ?? JSON.stringify(err));
+          const qualifier = formatErrorQualifier(err);
           throw new InstanceClientError(
-            `create failed: ${String(err["message"] ?? JSON.stringify(err))}`,
+            `create failed: ${raw}${qualifier ? ` (${qualifier})` : ""}`,
             500,
           );
         }
@@ -514,10 +571,7 @@ export class CloudRunInstanceClient implements InstanceRuntime {
   private handleErrorStatus(res: HttpResponse, instanceName: string): void {
     if (res.status >= 200 && res.status < 300) return;
 
-    const message =
-      res.body && typeof res.body === "object" && "message" in (res.body as Record<string, unknown>)
-        ? String((res.body as Record<string, unknown>)["message"])
-        : `request failed with status ${res.status}`;
+    const message = extractApiErrorMessage(res.body) ?? `request failed with status ${res.status}`;
 
     if (res.status === 404) {
       throw new InstanceNotFoundError(instanceName);
@@ -530,4 +584,42 @@ export class CloudRunInstanceClient implements InstanceRuntime {
     }
     throw new InstanceClientError(message, res.status);
   }
+}
+
+/**
+ * `status`/`code` qualifier for error messages (e.g.
+ * "status: FAILED_PRECONDITION, code: 400"). Carries the machine-readable
+ * triage signal alongside the human-readable message.
+ */
+function formatErrorQualifier(err: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if (typeof err["status"] === "string") parts.push(`status: ${err["status"]}`);
+  if (typeof err["code"] === "number") parts.push(`code: ${err["code"]}`);
+  return parts.join(", ");
+}
+
+/**
+ * Issue #53: Google APIs report failures as
+ * `{ "error": { "code": 400, "message": "...", "status": "FAILED_PRECONDITION" } }`.
+ * The old code read a top-level `body.message`, so the real message was
+ * discarded and every failure surfaced as "request failed with status 400".
+ * Prefer `error.message` (with the `error.status`/`code` qualifier appended
+ * for triage); keep the legacy top-level `message` and plain-string bodies as
+ * fallbacks for older fakes.
+ */
+function extractApiErrorMessage(body: unknown): string | undefined {
+  if (body && typeof body === "object") {
+    const obj = body as Record<string, unknown>;
+    const nested = obj["error"];
+    if (nested && typeof nested === "object") {
+      const err = nested as Record<string, unknown>;
+      if (typeof err["message"] === "string") {
+        const qualifier = formatErrorQualifier(err);
+        return qualifier ? `${err["message"]} (${qualifier})` : (err["message"] as string);
+      }
+    }
+    if (typeof obj["message"] === "string") return obj["message"];
+  }
+  if (typeof body === "string" && body.length > 0) return body;
+  return undefined;
 }
