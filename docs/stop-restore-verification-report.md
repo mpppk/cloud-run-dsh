@@ -328,6 +328,107 @@ Terraform 管理外の `control-plane-database-url` のみ残ったため手動�
 
 ---
 
+## 6. 2周目（同日）— 1周目の修正の実機検証
+
+1周目で直した13本のうち、**実機でしか判定できないもの**を同じ日にもう一度環境を作って
+確認した。あわせて新しい問題が3件見つかった。
+
+### 6.1 1周目の修正の検証結果
+
+| 対象 | 1周目 | 2周目 |
+|---|---|---|
+| デプロイ（#93 / #94） | revision **00003**（accessor 権限と TCP 形式で2回失敗） | ✅ **00001。一発成功** |
+| `open` の初回（#96） | **503**（`idleTimeout`） | ✅ **200 READY、20 秒** |
+| コンテナの Bun（#100） | qemu の制限で**確認不能** | ✅ 起動して `/livez` 200。**`idleTimeout` を受理** |
+| `workspace_checkpoints`（#101） | **0 行** | ✅ **3 行** |
+| `/readyz`（#102） | DB 不通でも ready | ✅ 実プローブ付きで ready |
+| `POST /checkpoints` の `skipped`（#89） | 応答に無い | ✅ clean で `true`、dirty で `false` |
+| ログ中のトークン（#76） | — | ✅ **0 件** |
+| stop → 復元（#72 / #87） | 成立（39 秒） | ✅ 成立（58 秒） |
+| 撤収（#73 / #103） | `DROP OWNED BY` が**必須** | ✅ **不要。52 destroyed が一発** |
+| Terraform リソース数 | 50 | **52**（#93 でシークレット + IAM が Terraform 管理に移ったため） |
+
+### 6.2 #85 の未確認事項が確定した — 停止中の Instance は quota を消費する
+
+1周目は「停止中の Instance が region あたり 100 の quota を消費するか」を
+**未確認のまま**残した（推測で断定しないという判断）。2周目で決着した。
+
+`serviceruntime.googleapis.com/quota/allocation/usage`
+（`quota_metric="run.googleapis.com/instances"`、asia-northeast1）:
+
+```
+11:40:50  0   ← Instance 作成前
+11:41:18  1   ← 作成後
+   （11:44 と 11:51 に stop。データ点なし = 割り当ては 1 のまま）
+11:52:54  0   ← delete した瞬間に 0 へ
+```
+
+**このメトリクスは値が変わったときに点を打つ。** stop では点が出ず、delete で初めて
+0 に落ちた。つまり **stop では quota が解放されず、delete でのみ解放される。**
+
+したがって **101 個目の workspace で `open` が失敗する。**
+[#104](https://github.com/mpppk/cloud-run-dsh/pull/104) で入れた GC
+（30 日で reaper + `DELETE /v1/workspaces/:id`）は**必要だった**ことになる。
+
+### 6.3 新しく見つかった 3 件
+
+| # | 内容 | どこで落ちたか |
+|---|---|---|
+| [#107](https://github.com/mpppk/cloud-run-dsh/issues/107) | `packages/gcp-token-provider` が Dockerfile の COPY 列挙に無く、**両イメージがビルドできない** | bring-up の開始直後 |
+| [#109](https://github.com/mpppk/cloud-run-dsh/issues/109) | control-plane 1 プロセスが Cloud SQL 接続を **23 本**保持し、`max_connections` 25 を枯渇させる | 検証の途中で DB に繋げなくなった |
+| [#110](https://github.com/mpppk/cloud-run-dsh/issues/110) | `workspace_checkpoints` は「世代索引」と書かれているが、**3 行すべてが同じ `checkpoint.bin` を指す** | 行数の確認時 |
+
+#### #107 — ローカルの緑が意味を持たない経路
+
+`bunx tsc --build` も `bun test`（848 pass）もレビューも通っていた。
+**Dockerfile の COPY 列挙はローカルのどのコマンドでも実行されない**ため、
+実機の直前でしか落ちない。列挙は手で維持されており、
+[PR #105](https://github.com/mpppk/cloud-run-dsh/pull/105) が新パッケージを足したときに
+2 つの Dockerfile の更新が漏れた。
+
+修正では COPY 行を足すだけでなく、**`packages/` 配下と両 Dockerfile の列挙が一致することを
+テストで固定した**（`tests/dockerfile-workspace-copy.test.ts`）。行を足すだけでは、
+次に誰かがパッケージを足したときに同じことが起きる。
+
+#### #109 — 1 周目の「回避策」が原因を隠していた
+
+1 周目の撤収で `DROP OWNED BY dsh_app` が
+`remaining connection slots are reserved` で失敗し、`max: 1` で回避した。
+そのときは「`db-f1-micro` は接続スロットが少ない」で片付けた。
+
+**本当の原因は control-plane が上限なしで接続を食い潰していたことだった。**
+2 周目で切り分けた:
+
+- agent-host の Instance は**停止済み**（API で確認）→ 23 本は control-plane のもの
+- Cloud Run のコンテナは **1 つだけ**（`listening` ログ 1 回、`instanceId` 1 種類）
+  → オートスケールによる複数プールではない
+- executor は起動時に **1 回だけ**生成され共有されている
+  → リクエストごとに `new SQL` しているわけでもない
+
+つまり **1 つの Bun.SQL プールが上限なしで育っている。**
+コードのどこにも `max` の指定が無い。
+
+**#73 のコメントに書いた「単一接続で繋ぐこと」は症状への対処であって、
+原因の修正ではなかった。**
+
+### 6.4 撤収
+
+```
+Cloud SQL: なし   Cloud Run: なし   バケット: なし   Secret: なし   Instances: 0
+```
+
+**52 destroyed、エラー 0 件、`DROP OWNED BY` 不要。** 削除順もログで確認した。
+
+```
+google_sql_database.dsh: Destruction complete after 0s
+google_sql_user.app:     Destruction complete after 1s   ← database の後
+```
+
+1 周目に手動削除が必要だった `control-plane-database-url` も、
+#93 で Terraform 管理に移ったため残らなかった。
+
+---
+
 ## 6. 前回レポートとの差分
 
 | | 前回（open まで） | 今回（stop → 復元） |

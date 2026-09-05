@@ -20,7 +20,7 @@
 | | |
 |---|---|
 | デプロイ単位 | 2 |
-| Terraform リソース | 50（2026-09-05 の apply 実測。48 から増えたのは Artifact Registry の reader 2 件） |
+| Terraform リソース | 52（2026-09-05 の 2 周目 apply 実測。数は増える。**この数字は目安であり、正は `terraform plan` の出力**） |
 | リージョン | asia-northeast1 |
 | DB | PostgreSQL 16 |
 
