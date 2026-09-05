@@ -301,8 +301,8 @@ Cloud Run 側からここを通る経路は無い。サブネットも VPC コ�
 
 | サービスアカウント | 付与 |
 |---|---|
-| `dev-dsh-agent-host` | `cloudsql.client`、logging、monitoring、3つのシークレットに対する `secretAccessor`、チェックポイントバケットの object admin。 |
-| `dev-dsh-control-plane` | 上記に加えて `run.admin` と agent-host への `actAs`。Instance を作るために必要。 |
+| `dev-dsh-agent-host` | `cloudsql.client`、logging、monitoring、3つのシークレット（`github-app-private-key` / `llm-api-key` / `db-password`）に対する `secretAccessor`、チェックポイントバケットの object admin。 |
+| `dev-dsh-control-plane` | 上記に加えて `control-plane-database-url` の `secretAccessor`（control-plane 専用の4つ目。#93）、`run.admin`、agent-host への `actAs`。Instance を作るために必要。 |
 | `ai-agent` | ローカルの AI 作業用オペレータ ID。`run.admin` + `artifactregistry.writer` とスコープ付き `actAs`。ユーザー管理鍵は持たない。 |
 
 > **これは least-privilege ではない。** `ai-agent` になりすませる者は、agent-host *として*動くコンテナを
