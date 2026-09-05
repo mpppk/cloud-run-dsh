@@ -154,7 +154,8 @@ resource "google_sql_database" "dsh" {
   # 2026-09-06 against the provider registry docs and upstream issue
   # hashicorp/terraform-provider-google#27492 (open `force_delete` request).
   # `google_sql_database` exposes only `deletion_policy`
-  # (DELETE/ABANDON/PREVENT); there is no pre-delete hook, no connection
+  # (DELETE/ABANDON — verified against provider v6.50.0 source, matching
+  # .terraform.lock.hcl); there is no pre-delete hook, no connection
   # drain, and no DROP DATABASE ... WITH (FORCE) path, and the Cloud SQL
   # Admin API DELETE databases issues a plain DROP DATABASE that fails with
   # 400 "database is being accessed by other users" while idle backends

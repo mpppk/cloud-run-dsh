@@ -667,7 +667,7 @@ gcloud run instances delete dsh-ws-demo --location="$REGION" 2>/dev/null || true
 # 2. Delete the control-plane service:
 gcloud run services delete control-plane --region="$REGION" --quiet
 
-# 3b. EMPTY the versioned checkpoint bucket — `terraform destroy` CANNOT delete
+# 3. EMPTY the versioned checkpoint bucket — `terraform destroy` CANNOT delete
 #    a non-empty versioned GCS bucket (lifecycle rules only age out ARCHIVED
 #    versions), so a destroy without this step FAILS and you keep paying.
 #    ⚠️ THIS PERMANENTLY DELETES ALL CHECKPOINTS (live objects + every version).
@@ -695,15 +695,18 @@ for i in $(seq 1 20); do
     --data-urlencode "interval.startTime=${START}" \
     --data-urlencode "interval.endTime=${END}" \
     --data-urlencode "view=FULL" \
-    | jq -r '[.timeSeries[].points[0].value.int64Value | tonumber] | max // empty')"
+    | jq -r '[(.timeSeries // [])[].points[0].value.int64Value | tonumber] | max // empty')"
   echo "num_backends sample $i: ${N:-unknown}"
   [ "$N" = "0" ] && break
   sleep 60
   END="$(bun -e 'console.log(new Date().toISOString())')"
   START="$(bun -e 'console.log(new Date(Date.now()-10*60*1000).toISOString())')"
 done
-# If the loop never saw 0, DO NOT destroy yet — see the Appendix failure
-# mode #3 (retry destroy later, or emergency pg_terminate_backend).
+# The loop MUST have seen 0 — otherwise STOP here and do NOT run step 4 yet.
+# (Without this guard a copy-pasted run would destroy despite the timeout.)
+# See the Appendix failure mode #3 (wait longer, or emergency
+# pg_terminate_backend), then re-run from this step 3b.
+[ "$N" = "0" ] || { echo "num_backends never drained to 0 — NOT destroying"; exit 1; }
 
 # 4. Destroy Terraform-managed resources (SQL, bucket, AR, IAM, secrets, IAP):
 terraform -chdir=infra/terraform destroy
