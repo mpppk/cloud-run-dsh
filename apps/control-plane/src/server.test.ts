@@ -266,7 +266,7 @@ class FakeHandle implements WorkspaceRuntimeHandle {
     this.activities.push(kind);
   }
 
-  assertAgentInputAllowed(): void {
+  async assertAgentInputAllowed(): Promise<void> {
     if (!this.inputAllowed) throw new AgentInputRefusedError("RESTORE_FAILED");
   }
 
@@ -1445,7 +1445,7 @@ describe("open/stop composition with the T8 runtime", () => {
         },
         getState: () => "STOPPING",
         recordActivity: () => {},
-        assertAgentInputAllowed: () => {},
+        assertAgentInputAllowed: async () => {},
         runManualCheckpoint: async () => ({ skipped: false }),
         getInstanceUrl: async () => null,
         deleteInstance: async () => {},
@@ -2138,7 +2138,7 @@ describe("unexpected error observability (issue #48)", () => {
         stop: async () => "STOPPED",
         getState: () => "STOPPED",
         recordActivity: () => {},
-        assertAgentInputAllowed: () => {},
+        assertAgentInputAllowed: async () => {},
         runManualCheckpoint: async () => ({ skipped: false }),
         getInstanceUrl: async () => null,
         deleteInstance: async () => {},

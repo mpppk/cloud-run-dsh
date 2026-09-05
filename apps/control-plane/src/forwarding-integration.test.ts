@@ -60,7 +60,7 @@ class TestInstanceHandle implements WorkspaceRuntimeHandle {
   recordActivity(kind: ActivityKind): void {
     this.activities.push(kind);
   }
-  assertAgentInputAllowed(): void {}
+  async assertAgentInputAllowed(): Promise<void> {}
   async runManualCheckpoint(): Promise<{ skipped: boolean }> {
     return { skipped: false };
   }

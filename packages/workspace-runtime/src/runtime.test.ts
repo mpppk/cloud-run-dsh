@@ -167,7 +167,7 @@ describe("WorkspaceRuntime — restore orchestration (仕様書 section 8, 実�
       "checkoutBase",
       "restoreCheckpoint",
     ]);
-    expect(() => h.runtime.assertAgentInputAllowed()).toThrow(AgentInputRefusedError);
+    await expect(h.runtime.assertAgentInputAllowed()).rejects.toThrow(AgentInputRefusedError);
     await expect(h.runtime.beginAgentTurn()).rejects.toThrow(AgentInputRefusedError);
   });
 
@@ -792,6 +792,10 @@ describe("WorkspaceRuntime — idle integration (仕様書 section 11)", () => {
       done = true;
       return "ok";
     });
+    // Issue #122: the operation gate is async now (it reloads the row
+    // first), so registration lands a tick after the call — wait for it.
+    // The assertions below (tracked + idle-stop blocked) are unchanged.
+    await new Promise((r) => setTimeout(r, 5));
     expect(h.runtime.pendingOperationCount()).toBe(1);
     expect(await h.runtime.maybeStopForIdle()).toBe(false);
     await sub;

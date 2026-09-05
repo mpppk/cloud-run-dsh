@@ -339,16 +339,29 @@ export class WorkspaceRuntime {
     }
   }
 
-  /** Agent input gate (仕様書 section 8: 復元失敗時はAgent入力を受け付けない). */
-  assertAgentInputAllowed(): void {
-    if (!isAgentInputAllowed(this.machine.getState())) {
-      throw new AgentInputRefusedError(this.machine.getState());
+  /**
+   * Agent input gate (仕様書 section 8: 復元失敗時はAgent入力を受け付けない).
+   *
+   * Issue #122: reloads the persisted row FIRST. This runtime's in-memory
+   * view can lag the row when another process changed it — e.g. the control
+   * plane recorded RESTORE_FAILED, then the agent-host recovered late and
+   * persisted READY. Without the reload the gate keeps throwing
+   * AgentInputRefusedError(RESTORE_FAILED) while GET (which reads the row)
+   * answers READY. The reload is adopt-only (machine.reload) and every
+   * transition below still goes through the store compare-and-set, so a
+   * fresher in-memory state is never clobbered into something older here —
+   * the row is the single source of truth both readers agree on.
+   */
+  async assertAgentInputAllowed(): Promise<void> {
+    const state = await this.machine.reload();
+    if (!isAgentInputAllowed(state)) {
+      throw new AgentInputRefusedError(state);
     }
   }
 
   /** READY -> BUSY. Refused while restoring/stopping (仕様書 section 8). */
   async beginAgentTurn(): Promise<void> {
-    this.assertAgentInputAllowed();
+    await this.assertAgentInputAllowed();
     if (this.machine.getState() !== "READY") {
       throw new InvalidOperationError("beginAgentTurn", this.machine.getState());
     }
@@ -384,14 +397,14 @@ export class WorkspaceRuntime {
 
   /** Runs an agent-driven tool invocation as a meaningful, tracked operation. */
   async runToolInvocation<T>(fn: () => Promise<T>): Promise<T> {
-    this.assertAgentInputAllowed();
+    await this.assertAgentInputAllowed();
     this.deps.idle.recordActivity("tool_invocation");
     return this.operations.run(fn);
   }
 
   /** Runs a subprocess as a meaningful, tracked operation. */
   async runSubprocess<T>(fn: () => Promise<T>): Promise<T> {
-    this.assertAgentInputAllowed();
+    await this.assertAgentInputAllowed();
     this.deps.idle.recordActivity("subprocess");
     this.deps.idle.setSubprocessRunning(true);
     try {
@@ -403,7 +416,7 @@ export class WorkspaceRuntime {
 
   /** Runs a checkpoint as a meaningful, tracked operation. */
   async runCheckpoint<T>(fn: () => Promise<T>): Promise<T> {
-    this.assertAgentInputAllowed();
+    await this.assertAgentInputAllowed();
     this.deps.idle.setCheckpointRunning(true);
     try {
       const result = await this.operations.run(fn);

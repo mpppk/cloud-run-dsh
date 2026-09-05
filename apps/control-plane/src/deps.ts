@@ -69,8 +69,14 @@ export interface WorkspaceRuntimeHandle {
   getState(): string;
   /** Meaningful-activity reporting; NEVER called for SSE heartbeats etc. (仕様書 section 11). */
   recordActivity(kind: ActivityKind): void;
-  /** Throws when the workspace state refuses agent input (e.g. RESTORE_FAILED). */
-  assertAgentInputAllowed(): void;
+  /**
+   * Throws when the workspace state refuses agent input (e.g. RESTORE_FAILED).
+   *
+   * Issue #122: async because the gate reloads the persisted row first, so
+   * it never disagrees with GET /v1/workspaces/:id (which reads the same
+   * row) over a stale in-memory cache. Callers must await it.
+   */
+  assertAgentInputAllowed(): Promise<void>;
   /**
    * Runs a manual checkpoint as a meaningful, tracked operation. Same
    * identity rule as stop(): the real caller, forwarded to the agent-host
@@ -174,8 +180,8 @@ export class WorkspaceRuntimeHandleAdapter implements WorkspaceRuntimeHandle {
     this.runtime.recordActivity(kind);
   }
 
-  assertAgentInputAllowed(): void {
-    this.runtime.assertAgentInputAllowed();
+  assertAgentInputAllowed(): Promise<void> {
+    return this.runtime.assertAgentInputAllowed();
   }
 
   runManualCheckpoint(identity?: ForwardIdentity): Promise<{ skipped: boolean }> {
