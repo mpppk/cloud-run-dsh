@@ -10,7 +10,18 @@ export interface SchedulerOptions {
   dirtyThresholdMs?: number;
 }
 
-export type LifecycleResult = { ok: true } | { ok: false; error: CheckpointFailedError };
+export type LifecycleResult =
+  | {
+      ok: true;
+      /**
+       * True when nothing was written because the tree is clean (git-dirty
+       * check negative — issue #72: this is the CORRECT behavior, not a bug).
+       * The durable snapshot still covers the current tree, so callers must
+       * treat skipped:true as success, not failure.
+       */
+      skipped: boolean;
+    }
+  | { ok: false; error: CheckpointFailedError };
 
 export class CheckpointScheduler {
   private dirty = false;
@@ -88,7 +99,7 @@ export class CheckpointScheduler {
       // Verify via git as well
       try {
         const dirtyViaGit = await isDirty(this.opts.git, this.opts.workspaceDir);
-        if (!dirtyViaGit) return { ok: true };
+        if (!dirtyViaGit) return { ok: true, skipped: true };
         // git says dirty but internal flag says clean -> mark dirty
         this.dirty = true;
         this.dirtySinceMs ??= this.opts.clock.nowMs();
@@ -101,7 +112,7 @@ export class CheckpointScheduler {
     }
     try {
       await this.runCheckpointBody();
-      return { ok: true };
+      return { ok: true, skipped: false };
     } catch (e) {
       return { ok: false, error: new CheckpointFailedError("lifecycle checkpoint failed", e) };
     } finally {

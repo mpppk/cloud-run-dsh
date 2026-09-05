@@ -17,7 +17,7 @@ import type { ActivityKind } from "@cloud-run-dsh/workspace-runtime";
 import type { Logger } from "@cloud-run-dsh/observability";
 import type { AuthDeps } from "./auth.js";
 import type { MembershipStore } from "./membership.js";
-import type { MessageForwarder } from "./forwarding.js";
+import type { ForwardIdentity, MessageForwarder } from "./forwarding.js";
 
 /**
  * The control-plane clock.
@@ -57,14 +57,26 @@ export class SystemClock implements ControlPlaneClock {
  */
 export interface WorkspaceRuntimeHandle {
   open(): Promise<string>;
-  stop(): Promise<string>;
+  /**
+   * Stops the workspace. The optional identity is the stop request's REAL
+   * caller (handlers.stopWorkspace passes ctx.user): the production handle
+   * forwards it to the agent-host prepare-stop route so the host can run
+   * its gateway check. It is never fabricated — when absent the remote
+   * preparation is skipped only where no forwarder is wired (tests); with
+   * a forwarder wired, a missing identity fails the stop closed (issue #72).
+   */
+  stop(identity?: ForwardIdentity): Promise<string>;
   getState(): string;
   /** Meaningful-activity reporting; NEVER called for SSE heartbeats etc. (仕様書 section 11). */
   recordActivity(kind: ActivityKind): void;
   /** Throws when the workspace state refuses agent input (e.g. RESTORE_FAILED). */
   assertAgentInputAllowed(): void;
-  /** Runs a manual checkpoint as a meaningful, tracked operation. */
-  runManualCheckpoint(): Promise<void>;
+  /**
+   * Runs a manual checkpoint as a meaningful, tracked operation. Same
+   * identity rule as stop(): the real caller, forwarded to the agent-host
+   * checkpoint route (issue #75).
+   */
+  runManualCheckpoint(identity?: ForwardIdentity): Promise<void>;
   /**
    * Returns the reachable URL of the workspace's Cloud Run Instance, or null
    * when the workspace has never been opened (or the Instance is unknown).
@@ -100,6 +112,16 @@ export class WorkspaceRuntimeHandleAdapter implements WorkspaceRuntimeHandle {
      * production factory always supplies it. Defaults to null.
      */
     private readonly instanceUrlProvider?: () => Promise<string | null>,
+    /**
+     * Receives the request caller's identity for remote lifecycle calls
+     * (issue #72). The steps are built at registry-construction time when
+     * no caller exists yet, so the identity arrives here per call and is
+     * handed to the factory-owned box. Last-writer-wins among legitimate
+     * callers; the host only checks the header's presence plus the
+     * workspace match (invoker IAM is the trust root), so a concurrent
+     * second caller joining the coalesced stop() changes nothing material.
+     */
+    private readonly identitySink?: (identity: ForwardIdentity | undefined) => void,
   ) {}
 
   /**
@@ -116,7 +138,8 @@ export class WorkspaceRuntimeHandleAdapter implements WorkspaceRuntimeHandle {
     return this.runtime.reloadState();
   }
 
-  stop(): Promise<string> {
+  stop(identity?: ForwardIdentity): Promise<string> {
+    this.identitySink?.(identity);
     return this.runtime.stop();
   }
 
@@ -132,7 +155,8 @@ export class WorkspaceRuntimeHandleAdapter implements WorkspaceRuntimeHandle {
     this.runtime.assertAgentInputAllowed();
   }
 
-  runManualCheckpoint(): Promise<void> {
+  runManualCheckpoint(identity?: ForwardIdentity): Promise<void> {
+    this.identitySink?.(identity);
     return this.runtime.runCheckpoint(this.checkpointFn);
   }
 

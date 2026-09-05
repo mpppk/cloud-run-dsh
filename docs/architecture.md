@@ -6,8 +6,11 @@
 > **2026-09-05、下記「ワークスペースを開く流れ」の全経路が実プロジェクト上で動いた。**
 > ユーザーのメッセージから LLM がハーネスのツールを呼び、clone 済みリポジトリのファイルを読み、
 > イベントが SSE で返るまでを確認した。残る差分は
-> [#72](https://github.com/mpppk/cloud-run-dsh/issues/72)（停止時の tar.gz を保存しない）と
+> [#72](https://github.com/mpppk/cloud-run-dsh/issues/72)（stop → restart → 復元の実機確認。
+> 停止時の tar.gz 保存自体は実装済み）と
 > [#73](https://github.com/mpppk/cloud-run-dsh/issues/73)（撤収時の `terraform destroy`）。
+> `stop` が Instance を delete しないのは意図した設計
+> （[#85](https://github.com/mpppk/cloud-run-dsh/issues/85)）。
 
 本書は 2026-09-03 の構築と 2026-09-05 の端から端までの動作確認に基づく。
 経過・実測ログ・途中で判明した制約は
@@ -94,7 +97,7 @@ flowchart TB
 ## ワークスペースを開く流れ
 
 関係する主体が多く、往復の順序そのものが仕様になっている。
-**2026-09-05 に全経路が実機で動いた。** 停止段の一部だけ実装が図に追いついていない（[#72](https://github.com/mpppk/cloud-run-dsh/issues/72)）。
+**2026-09-05 に全経路が実機で動いた。** 停止段はその後に実装が図に追いついた（[#72](https://github.com/mpppk/cloud-run-dsh/issues/72)）が、stop → restart → 復元の実機確認はまだない。
 
 ```mermaid
 sequenceDiagram
@@ -137,9 +140,11 @@ sequenceDiagram
   end
 
   alt アイドル検知 または POST /stop
-    CP->>AH: 停止を要求
+    CP->>AH: POST 停止準備（prepare-stop）
+    Note over CP,AH: ターンをドレインし、停止中の新規入力を拒否
     AH->>GCS: ワークスペースを tar.gz で保存
-    Note over AH,GCS: 設計。実装では保存されない（#72）
+    Note over AH,GCS: clean tree のときは何も書かず成功（仕様）
+    AH-->>CP: 200 prepared（失敗時は 502。CP は止めない）
     CP->>RUN: stop
     Note over CP,RUN: delete はしない。停止中は無課金と確認済み。<br/>溜まり続ける点は #85
     Note over DB,GCS: Cloud SQL の行と GCS のチェックポイントは残る
@@ -158,7 +163,7 @@ sequenceDiagram
 | 入力の転送（control-plane → agent-host） | あり | **実行** | [#22](https://github.com/mpppk/cloud-run-dsh/issues/22)。停止中は 409、転送失敗は 502。 |
 | **エージェントのターン（LLM 呼び出し）** | あり | **実行** | [#21](https://github.com/mpppk/cloud-run-dsh/issues/21)。OpenRouter 経由で LLM がツールを呼び、`/workspace` の実ファイルを読んで応答した。 |
 | SSE 配信 | あり | **実行** | `turn/start` から `turn/end` までのイベント列を実機で受信した。 |
-| チェックポイントして停止 | 一部 | **一部** | `stop` は成功して `STOPPED`。**停止時の tar.gz は保存されない**（[#72](https://github.com/mpppk/cloud-run-dsh/issues/72)）。delete しないのは意図した設計（[#85](https://github.com/mpppk/cloud-run-dsh/issues/85)）。 |
+| チェックポイントして停止 | あり | **一部** | `stop` は agent-host の停止準備（ドレイン→tar.gz 保存→sandbox 破棄）を経て `STOPPED`（[#72](https://github.com/mpppk/cloud-run-dsh/issues/72)）。チェックポイント失敗時は Cloud Run の stop を呼ばず `CHECKPOINT_FAILED`。delete しないのは意図した設計（[#85](https://github.com/mpppk/cloud-run-dsh/issues/85)）。stop → restart → 復元の実機確認は未実施。 |
 
 > **2026-09-05、この図の全経路が GCP 実機で動いた。** ユーザーのメッセージが
 > control-plane から agent-host に届き、LLM がハーネスのツールで clone 済みリポジトリの
@@ -187,8 +192,8 @@ sequenceDiagram
 | `POST /v1/workspaces` | ワークスペースを作成する。id はサーバが採番する。 |
 | `GET /v1/workspaces/:id` | 状態を取得する。 |
 | `POST /v1/workspaces/:id/open` | Instance を起動する（同時実行は合流）。 |
-| `POST /v1/workspaces/:id/stop` | 停止する（設計ではチェックポイントを取ってから停止するが、実装では tar.gz は保存されない。#72）。Instance は delete せず停止のまま残す（#85）。 |
-| `POST /v1/workspaces/:id/checkpoints` | 手動チェックポイント。**現状はマーカーの JSON を置くだけで、ワークスペースの中身は含まない**のに `checkpointed: true` を返す（#72）。 |
+| `POST /v1/workspaces/:id/stop` | 停止する。agent-host の停止準備（`POST 停止準備`→tar.gz 保存）が成功してから Instance を stop する。準備に失敗したら `CHECKPOINT_FAILED` で stop しない（#72）。Instance は delete せず残す（#85）。 |
+| `POST /v1/workspaces/:id/checkpoints` | 手動チェックポイント。agent-host で実スナップショットを取ってから `checkpointed: true` を返す（#75）。clean tree のスキップは成功扱い。Instance が止まっているときは 409。 |
 | `POST /v1/workspaces/:id/controller/{acquire,heartbeat,release}` | コントローラリースの取得・延長・解放。 |
 | `GET` / `POST /v1/workspaces/:id/sessions` | セッションの一覧と作成。 |
 | `POST /v1/sessions/:id/messages` | エージェントへの入力。フィールド名は `content`。 |
@@ -579,8 +584,8 @@ gcloud 呼び出しが失敗するので解除する。
 
 | 箇所 | 状態 | Issue |
 |---|---|---|
-| 停止済み Instance が溜まり続ける | delete しないのは意図した設計（停止中は無課金。SKU で確認済み）。ただし誰も消さないため workspace 数だけ増える。region あたり 100 の quota。 | [#85](https://github.com/mpppk/cloud-run-dsh/issues/85) |
-| 停止時の tar.gz チェックポイント | 保存されない。`POST /checkpoints` はマーカーの JSON を置くだけで、中身を含まないのに `checkpointed: true` を返す。 | [#72](https://github.com/mpppk/cloud-run-dsh/issues/72) |
+| 停止した Instance が溜まり続ける | `stop` のみで delete しないのは意図した設計（停止中は無課金と SKU で確認済み）。ただし誰も消さないため workspace 数だけ増える。region あたり 100 の quota。いつ誰が消すかは未定。 | [#85](https://github.com/mpppk/cloud-run-dsh/issues/85) |
+| stop → restart → 復元の実機確認 | ローカルでは全経路をテスト済み。GCP 実機での stop → restart → 復元は未実施（要 GCP 再構築＝課金）。 | [#72](https://github.com/mpppk/cloud-run-dsh/issues/72) |
 | マイグレーション後の `terraform destroy` | テーブルが `dsh_app` ロールを参照するため一度失敗する。撤収が失敗する＝課金が止まらない。 | [#73](https://github.com/mpppk/cloud-run-dsh/issues/73) |
 | cancel / approval の実機動作 | ローカルでは実キーで確認済み。GCP 上では未確認。 | [#39](https://github.com/mpppk/cloud-run-dsh/issues/39)（実装はマージ済み） |
 | IAP ブランド / ロードバランサ | 未作成。一度作ると削除できないため見送っている。`iap_support_email` を与えたときのみ作られる。現在 Instance を守っているのは invoker IAM のみ。 | — |

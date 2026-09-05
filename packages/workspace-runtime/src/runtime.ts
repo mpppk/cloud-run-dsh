@@ -113,6 +113,7 @@ export class WorkspaceRuntime {
   private openInstancePromise: Promise<WorkspaceRuntimeState> | null = null;
   private completeRestorePromise: Promise<WorkspaceRuntimeState> | null = null;
   private stopPromise: Promise<WorkspaceRuntimeState> | null = null;
+  private prepareStopPromise: Promise<WorkspaceRuntimeState> | null = null;
   private lastError: unknown = null;
   private idleTimer: ReturnType<typeof setInterval> | null = null;
   private agentTurnActive = false;
@@ -415,9 +416,9 @@ export class WorkspaceRuntime {
 
   /**
    * Graceful stop (実装手順書 section 29):
-   * STOPPING -> reject new agent turns -> wait running operations ->
-   * checkpoint -> flush session persistence -> delete sandbox ->
-   * Cloud Run instance stop -> STOPPED.
+   * prepareStop() (STOPPING -> reject new agent turns -> wait running
+   * operations -> checkpoint -> flush session persistence -> delete sandbox)
+   * followed by the Cloud Run instance stop -> STOPPED.
    *
    * If the lifecycle checkpoint fails the runtime goes to CHECKPOINT_FAILED
    * and does NOT call instance stop.
@@ -431,14 +432,77 @@ export class WorkspaceRuntime {
   }
 
   private async doStop(): Promise<WorkspaceRuntimeState> {
+    const prepared = await this.prepareStop();
+    // The checkpoint guard (issue #72): a failed lifecycle checkpoint leaves
+    // CHECKPOINT_FAILED and the Cloud Run instance stop below must NOT run —
+    // stopping now would discard in-memory files the checkpoint never saved.
+    if (prepared === "CHECKPOINT_FAILED") return prepared;
+    // Already stopped (or concurrently stopped): nothing left to do.
+    if (prepared === "STOPPED") return prepared;
+
+    try {
+      await this.deps.instanceRuntime.stop(this.deps.instanceName);
+    } catch (e) {
+      this.lastError = e;
+      await this.recordFailureStateBestEffort(e, "ERROR", "graceful-stop-failed");
+      throw e;
+    }
+
+    await this.machine.transition("STOPPED", "graceful-stop-complete");
+    return this.machine.getState();
+  }
+
+  /**
+   * Stop preparation (issue #72): everything in stop() EXCEPT the Cloud Run
+   * instance stop and the final STOPPED transition. The agent-host gateway
+   * exposes this as `POST /workspaces/:id/prepare-stop` so the control plane
+   * can drain turns, checkpoint the workspace and flush sessions INSIDE the
+   * instance before stopping it from the outside. There is exactly ONE stop
+   * sequence — stop() above delegates here, never a second copy.
+   *
+   * Entry states: the stoppable states (see canStopFrom) transition to
+   * STOPPING first. Two re-entrant entries skip the transition:
+   * - STOPPED: already stopped; returns immediately (idempotent).
+   * - STOPPING: a previous stop marked the row but never finished (process
+   *   crash between prepare and instance stop, or the control-plane-first
+   *   flow where the control plane's own stop() marked STOPPING on the
+   *   shared row before calling this remotely — issue #60 pattern). The
+   *   steps re-run from the drain: the lifecycle checkpoint is the critical
+   *   idempotent step, flush is a no-op, and the sandbox delete re-issues
+   *   the CLI delete. This resume is strictly better than the old hard
+   *   InvalidOperationError, which left STOPPING unrecoverable.
+   *
+   * Leaves the runtime in STOPPING on success. The caller owns the instance
+   * stop that follows; a checkpoint failure leaves CHECKPOINT_FAILED instead
+   * (and the caller must NOT stop the instance — see doStop).
+   *
+   * Restart-recovery note: a row left in STOPPING across an instance restart
+   * is NOT restorable — completeRestore() accepts only STARTING/RESTORING
+   * (+ failure states), so recovery refuses and health reports
+   * restore-failed. That is deliberate: STOPPING means a stop tore down (or
+   * is tearing down) the sandbox, so rebuilding workspace state underneath
+   * it would be wrong. The way out is retrying the stop (STOPPING re-entry
+   * above), which finishes the sequence to STOPPED.
+   */
+  async prepareStop(): Promise<WorkspaceRuntimeState> {
+    if (this.prepareStopPromise) return this.prepareStopPromise;
+    this.prepareStopPromise = this.doPrepareStop().finally(() => {
+      this.prepareStopPromise = null;
+    });
+    return this.prepareStopPromise;
+  }
+
+  private async doPrepareStop(): Promise<WorkspaceRuntimeState> {
     await this.machine.reload();
     const state = this.machine.getState();
     if (state === "STOPPED") return state;
-    if (!canStopFrom(state)) {
+    if (state !== "STOPPING" && !canStopFrom(state)) {
       throw new InvalidOperationError("stop", state);
     }
 
-    await this.machine.transition("STOPPING", "graceful-stop");
+    if (state !== "STOPPING") {
+      await this.machine.transition("STOPPING", "graceful-stop");
+    }
     // New agent turns and new agent-driven operations (tool invocation,
     // subprocess, checkpoint) are now refused: STOPPING is not an
     // agent-input-allowed state. In-flight work — including an active agent
@@ -468,14 +532,15 @@ export class WorkspaceRuntime {
     try {
       await this.deps.steps.flushSessionPersistence();
       await this.deps.steps.deleteSandbox();
-      await this.deps.instanceRuntime.stop(this.deps.instanceName);
     } catch (e) {
       this.lastError = e;
       await this.recordFailureStateBestEffort(e, "ERROR", "graceful-stop-failed");
       throw e;
     }
 
-    await this.machine.transition("STOPPED", "graceful-stop-complete");
+    // Intentionally STAYS in STOPPING: the Cloud Run instance stop (and the
+    // STOPPED transition) belong to the caller — stop() above, or the
+    // control plane after a remote prepare-stop (issue #72).
     return this.machine.getState();
   }
 

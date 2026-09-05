@@ -37,16 +37,28 @@
 // the no-op steps above) is exactly the state-machine half of the #60
 // collision: the agent-host would find STARTING and fail with
 // "open is not allowed in state STARTING".
-//   runLifecycleCheckpoint NO-OP success: durable checkpoints are written
-//                          continuously by the agent-host periodic scheduler.
-//                          A control-plane-driven remote checkpoint trigger is
-//                          follow-up work in #75 (no agent-host endpoint
-//                          exists yet to trigger one).
+//   runLifecycleCheckpoint REMOTE (issue #72): POSTs the agent-host
+//                          `prepare-stop` route via the #22 forwarder, so
+//                          in-flight turns drain and the tar.gz workspace
+//                          snapshot is written INSIDE the instance before this
+//                          side stops it from the outside. The old comment
+//                          here ("durable checkpoints are written continuously
+//                          by the periodic scheduler") was wrong as a stop
+//                          rationale: the scheduler skips clean trees, so a
+//                          stop without this call could persist nothing while
+//                          the instance stop discards everything. A remote
+//                          failure THROWS, so WorkspaceRuntime.stop() records
+//                          CHECKPOINT_FAILED and never calls the instance stop
+//                          — that refusal is the whole point of this wiring.
+//                          Skipped (NO-OP success) only when no instance URL
+//                          is known: there is nothing alive left to preserve,
+//                          and failing the stop then would strand STOPPING.
 //   flushSessionPersistence NO-OP: session events are append-only at write
 //                          time (same rationale as the agent-host steps).
 //   deleteSandbox          NO-OP: stopping the Instance discards all of its
 //                          local state; no separate sandbox resource exists
-//                          from the control-plane side.
+//                          from the control-plane side. (The agent-host runs
+//                          the REAL delete inside prepare-stop above.)
 
 import {
   CLOUD_SQL_MOUNT_PATH,
@@ -76,7 +88,12 @@ import type {
 import { RuntimeRegistry, WorkspaceRuntimeHandleAdapter } from "./deps.js";
 import type { ControlPlaneClock } from "./deps.js";
 import type { ControlPlaneConfig } from "./config.js";
-import type { IdTokenProvider } from "./forwarding.js";
+import { conflict } from "./errors.js";
+import type {
+  ForwardIdentity,
+  IdTokenProvider,
+  MessageForwarder,
+} from "./forwarding.js";
 
 /**
  * Minimal surface used to poll the agent-host readiness endpoint
@@ -138,6 +155,16 @@ export interface ProductionRuntimeOptions {
    * agent-host adopts, otherwise the host refuses to boot (§26-8 fencing).
    */
   readonly controllerIdForWorkspace?: (workspace: Workspace) => string;
+  /**
+   * Forwards lifecycle calls to the agent-host gateway (issue #72 stop
+   * preparation, issue #75 manual checkpoint). Production (main.ts) passes
+   * the SAME HttpAgentHostForwarder the message handlers use — one
+   * ID-token/timeout/409-vs-502 implementation, never a second copy.
+   * Absent in unit tests: the remote steps fall back to NO-OP success and
+   * the manual checkpoint writes only the GCS marker (both documented at
+   * the call sites as test-only behavior, never the production path).
+   */
+  readonly messageForwarder?: MessageForwarder;
 }
 
 /**
@@ -429,24 +456,38 @@ async function waitForInstanceHealth(args: {
 }
 
 /**
- * Manual-checkpoint work for runManualCheckpoint: records a durable,
- * timestamped request marker in the checkpoint bucket. The control plane has
- * no workspace files (and no git) so it cannot build a T5 bundle itself; the
- * agent-host owns bundle creation. #75 tracks teaching the agent-host to
- * honor these markers (or replacing them with a direct trigger call); until
- * then the marker is an auditable record of operator intent, never a silent
- * no-op.
+ * Manual-checkpoint work for runManualCheckpoint (issue #75): FIRST takes a
+ * real checkpoint on the agent-host via the `remote` trigger (which throws
+ * when the durable snapshot was NOT written — so `checkpointed: true` is
+ * never answered for an empty marker again), THEN records the durable,
+ * timestamped request marker in the checkpoint bucket as the auditable
+ * record of operator intent (now including whether the host had anything
+ * new to write). The control plane has no workspace files (and no git) so
+ * it cannot build a T5 bundle itself; the agent-host owns bundle creation.
+ *
+ * Without `remote` (unit tests only — production always wires it) only the
+ * marker is written; that fallback is test-only behavior, never the
+ * production path.
  */
 export function buildManualCheckpointFn(
   storage: GcsCheckpointStorage,
   workspaceId: string,
   clock: ControlPlaneClock,
+  remote?: () => Promise<{ skipped: boolean }>,
 ): () => Promise<void> {
   return async () => {
+    const skipped = remote ? (await remote()).skipped : undefined;
     const requestedAt = clock.now().toISOString();
     const key = `workspaces/${workspaceId}/manual-checkpoints/${requestedAt.replace(/[:.]/g, "-")}.json`;
     const marker = new TextEncoder().encode(
-      JSON.stringify({ kind: "manual-checkpoint-request", workspaceId, requestedAt }),
+      JSON.stringify({
+        kind: "manual-checkpoint-request",
+        workspaceId,
+        requestedAt,
+        // How the workspace content was actually preserved. Absent only on
+        // the test-only no-remote fallback above — never in production.
+        ...(skipped !== undefined ? { checkpointSkipped: skipped } : {}),
+      }),
     );
     await storage.put(key, marker);
   };
@@ -521,10 +562,75 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
     });
     const instanceRuntime = new EnsureCreatedInstanceRuntime(client, workspace, repo);
     const idle = new IdleManager(clock);
+    // Caller identity for the remote lifecycle calls below (issue #72
+    // design note): the steps are built HERE at registry-construction time
+    // when no caller exists yet, while the identity (handlers.stopWorkspace
+    // / manualCheckpoint's ctx.user) arrives per call at the handle. The
+    // adapter's identitySink fills this box just before delegating to the
+    // runtime, so the steps read the REAL caller — a fabricated
+    // service-account identity is never invented here.
+    let pendingIdentity: ForwardIdentity | null = null;
+    const identitySink = (identity: ForwardIdentity | undefined): void => {
+      if (identity) pendingIdentity = identity;
+    };
     // Last URL seen for this handle (seeded from the durable row). Updated
     // whenever the live API reports a (possibly recreated, changed) URL, and
     // persisted so #22 can also read workspaces.instance_url directly.
     let lastKnownUrl: string | null = workspace.instanceUrl;
+    const messageForwarder = opts.messageForwarder;
+    // Remote stop preparation (issue #72): the ONLY durable-checkpoint step
+    // on the control-plane side. MUST throw on failure so
+    // WorkspaceRuntime.stop() records CHECKPOINT_FAILED and never calls the
+    // instance stop (see the header comment above).
+    const runRemotePrepareStop = async (): Promise<void> => {
+      // Test-only fallback (no forwarder wired): legacy NO-OP success.
+      // Production always wires the forwarder (main.ts).
+      if (!messageForwarder) return;
+      const url = await instanceUrlProvider();
+      // Boundary case: the instance is gone (or never opened) — there is
+      // nothing alive left to preserve, so preparation trivially succeeds.
+      // Attempting a remote call here would fail the whole stop for an
+      // already-stopped workspace (the regression this guard prevents).
+      if (!url) return;
+      const identity = pendingIdentity;
+      // Fail closed: without the real caller there is nothing truthful to
+      // put in the forwarded identity headers, and inventing one would
+      // forge the audit trail (issue #72 design note).
+      if (!identity) {
+        throw new Error(
+          "control-plane stop requires the caller's identity to prepare the agent-host stop " +
+            "(issue #72) — refusing to stop a potentially-dirty workspace faceless",
+        );
+      }
+      await messageForwarder.forwardPrepareStop({
+        instanceUrl: url,
+        workspaceId: workspace.id,
+        identity,
+      });
+    };
+    // Remote manual checkpoint (issue #75): the durable snapshot itself.
+    // Unlike the stop path above, a missing instance is a caller-visible
+    // 409 (open first) — answering `checkpointed: true` with no snapshot
+    // anywhere would be exactly the lie this issue removes.
+    const runRemoteCheckpoint = async (): Promise<{ skipped: boolean }> => {
+      if (!messageForwarder) return { skipped: false };
+      const url = await instanceUrlProvider();
+      if (!url) {
+        throw conflict("workspace instance is not running — open the workspace first, then retry");
+      }
+      const identity = pendingIdentity;
+      if (!identity) {
+        throw new Error(
+          "manual checkpoint requires the caller's identity (issue #75) — refusing a faceless checkpoint",
+        );
+      }
+      const result = await messageForwarder.forwardCheckpoint({
+        instanceUrl: url,
+        workspaceId: workspace.id,
+        identity,
+      });
+      return { skipped: result.skipped };
+    };
     const steps: WorkspaceLifecycleSteps = {
       waitForInstanceHealth: () =>
         waitForInstanceHealth({
@@ -544,9 +650,7 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
       restoreCheckpoint: async () => {},
       createSandbox: async () => {},
       restoreHarness: async () => {},
-      // Durable checkpoints are the agent-host's job (periodic scheduler);
-      // a remote trigger is #22 follow-up work.
-      runLifecycleCheckpoint: async () => {},
+      runLifecycleCheckpoint: runRemotePrepareStop,
       // Session events persist append-only at write time (as on agent-host).
       flushSessionPersistence: async () => {},
       // Instance stop discards all local state; no separate sandbox exists here.
@@ -561,7 +665,15 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
       steps,
       idle,
     });
-    const checkpointFn = buildManualCheckpointFn(checkpointStorage, workspace.id, clock);
+    const checkpointFn = buildManualCheckpointFn(
+      checkpointStorage,
+      workspace.id,
+      clock,
+      // Issue #75: the real snapshot comes first via the agent-host; the
+      // marker below is only the auditable record. Without a forwarder
+      // (unit tests) the trigger is absent and only the marker is written.
+      messageForwarder ? runRemoteCheckpoint : undefined,
+    );
     const instanceUrlProvider = async (): Promise<string | null> => {
       try {
         const info = await client.get(instanceName);
@@ -597,6 +709,6 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
       lastKnownUrl = current?.instanceUrl ?? null;
       return lastKnownUrl;
     };
-    return new WorkspaceRuntimeHandleAdapter(runtime, checkpointFn, instanceUrlProvider);
+    return new WorkspaceRuntimeHandleAdapter(runtime, checkpointFn, instanceUrlProvider, identitySink);
   });
 }

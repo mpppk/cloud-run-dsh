@@ -8,7 +8,9 @@ import {
   AgentHostForwardError,
   type ForwardApprovalArgs,
   type ForwardCancelArgs,
+  type ForwardCheckpointArgs,
   type ForwardMessageArgs,
+  type ForwardPrepareStopArgs,
   type MessageForwarder,
 } from "./forwarding.js";
 import {
@@ -202,8 +204,11 @@ class FakeHandle implements WorkspaceRuntimeHandle {
     return this.state;
   }
 
-  async stop(): Promise<string> {
+  stopIdentities: { id: string; email: string }[] = [];
+
+  async stop(identity?: { id: string; email: string }): Promise<string> {
     this.stopCalls++;
+    if (identity) this.stopIdentities.push(identity);
     this.state = "STOPPED";
     return this.state;
   }
@@ -220,8 +225,11 @@ class FakeHandle implements WorkspaceRuntimeHandle {
     if (!this.inputAllowed) throw new AgentInputRefusedError("RESTORE_FAILED");
   }
 
-  async runManualCheckpoint(): Promise<void> {
+  checkpointIdentities: { id: string; email: string }[] = [];
+
+  async runManualCheckpoint(identity?: { id: string; email: string }): Promise<void> {
     this.checkpointCalls++;
+    if (identity) this.checkpointIdentities.push(identity);
     this.recordActivity("checkpoint");
   }
 
@@ -772,6 +780,23 @@ describe("controller enforcement", () => {
     expect(res.status).toBe(200);
     expect(h.handles.get(workspaceId)!.checkpointCalls).toBe(1);
     expect(h.handles.get(workspaceId)!.activities).toContain("checkpoint");
+    // Issue #75: the REAL caller reaches the handle for the host forward.
+    expect(h.handles.get(workspaceId)!.checkpointIdentities).toEqual([
+      { id: "alice", email: "alice@example.com" },
+    ]);
+  });
+
+  test("stop passes the real caller identity to the runtime handle (issue #72)", async () => {
+    const res = await h.fetchAs("alice", `/v1/workspaces/${workspaceId}/stop`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(200);
+    expect(h.handles.get(workspaceId)!.stopCalls).toBe(1);
+    expect(h.handles.get(workspaceId)!.stopIdentities).toEqual([
+      { id: "alice", email: "alice@example.com" },
+    ]);
   });
 
   test("observer may read the session stream, workspace status and sessions list", async () => {
@@ -1328,6 +1353,8 @@ class RecordingForwarder implements MessageForwarder {
   calls: ForwardMessageArgs[] = [];
   approvalCalls: ForwardApprovalArgs[] = [];
   cancelCalls: ForwardCancelArgs[] = [];
+  prepareCalls: ForwardPrepareStopArgs[] = [];
+  checkpointCalls: ForwardCheckpointArgs[] = [];
   behavior: "ok" | "conflict" | "forward-error" = "ok";
 
   async forward(args: ForwardMessageArgs): Promise<{ status: number; turnStarted: boolean }> {
@@ -1369,6 +1396,36 @@ class RecordingForwarder implements MessageForwarder {
       throw new AgentHostForwardError("workspace instance unreachable at https://ah.test (boom)");
     }
     return { status: 202, turnStarted: true };
+  }
+
+  async forwardPrepareStop(
+    args: ForwardPrepareStopArgs,
+  ): Promise<{ status: number; prepared: boolean; state: string }> {
+    this.prepareCalls.push(args);
+    if (this.behavior === "conflict") {
+      throw new AgentHostConflictError(
+        "agent-host refused the request (status 409): controller lease not held by this host",
+      );
+    }
+    if (this.behavior === "forward-error") {
+      throw new AgentHostForwardError("workspace instance unreachable at https://ah.test (boom)");
+    }
+    return { status: 200, prepared: true, state: "STOPPING" };
+  }
+
+  async forwardCheckpoint(
+    args: ForwardCheckpointArgs,
+  ): Promise<{ status: number; checkpointed: boolean; skipped: boolean; state: string }> {
+    this.checkpointCalls.push(args);
+    if (this.behavior === "conflict") {
+      throw new AgentHostConflictError(
+        "agent-host refused the request (status 409): controller lease not held by this host",
+      );
+    }
+    if (this.behavior === "forward-error") {
+      throw new AgentHostForwardError("workspace instance unreachable at https://ah.test (boom)");
+    }
+    return { status: 200, checkpointed: true, skipped: false, state: "READY" };
   }
 }
 

@@ -211,6 +211,10 @@ export function composeAgentHost(deps: AgentHostDependencies): AgentHost {
     lease,
     logger,
     turnStarter: deps.turnStarter,
+    // Issue #75: the `checkpoint` route runs the same lifecycle checkpoint
+    // the stop sequence uses — never the periodic tryCheckpoint (which
+    // swallows failures and would make `checkpointed: true` a lie).
+    manualCheckpoint: () => checkpointScheduler.runLifecycleCheckpoint(),
   };
   const gateway = new AgentGateway(gatewayDeps);
 

@@ -18,7 +18,9 @@ import {
   parseJwtExpSeconds,
   type ForwardApprovalArgs,
   type ForwardCancelArgs,
+  type ForwardCheckpointArgs,
   type ForwardMessageArgs,
+  type ForwardPrepareStopArgs,
 } from "./forwarding.js";
 
 // ---------------------------------------------------------------------------
@@ -523,6 +525,127 @@ describe("HttpAgentHostForwarder approval/cancel (issue #39)", () => {
     const err = await unreachable.forwardCancel(cancelArgs()).catch((e) => e);
     expect(err).toBeInstanceOf(AgentHostForwardError);
     expect(String(err.message)).toContain("https://dsh-ws-1.run.app");
+  });
+});
+
+describe("HttpAgentHostForwarder lifecycle forwards (issues #72/#75)", () => {
+  const prepareArgs = (overrides: Partial<ForwardPrepareStopArgs> = {}): ForwardPrepareStopArgs => ({
+    instanceUrl: "https://dsh-ws-1.run.app",
+    workspaceId: "ws-1",
+    identity: { id: "alice", email: "alice@example.com" },
+    ...overrides,
+  });
+
+  const checkpointArgs = (overrides: Partial<ForwardCheckpointArgs> = {}): ForwardCheckpointArgs => ({
+    instanceUrl: "https://dsh-ws-1.run.app",
+    workspaceId: "ws-1",
+    identity: { id: "alice", email: "alice@example.com" },
+    ...overrides,
+  });
+
+  function lifecycleSetup(body: unknown = {}, status = 200): {
+    calls: { url: string; init: RequestInit | undefined }[];
+    forwarder: HttpAgentHostForwarder;
+  } {
+    const calls: { url: string; init: RequestInit | undefined }[] = [];
+    const forwarder = new HttpAgentHostForwarder({
+      idTokenProvider: async () => "id-token-123",
+      fetchFn: (async (url: string, init?: RequestInit) => {
+        calls.push({ url, init });
+        return jsonResponse(body, status);
+      }) as (url: string, init?: RequestInit) => Promise<Response>,
+    });
+    return { calls, forwarder };
+  }
+
+  test("forwardPrepareStop POSTs to the prepare-stop path with the caller identity headers", async () => {
+    const { calls, forwarder } = lifecycleSetup({ prepared: true, state: "STOPPING" });
+    const result = await forwarder.forwardPrepareStop(prepareArgs());
+    expect(result).toEqual({ status: 200, prepared: true, state: "STOPPING" });
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.url).toBe("https://dsh-ws-1.run.app/workspaces/ws-1/prepare-stop");
+    const init = calls[0]!.init!;
+    expect(init.method).toBe("POST");
+    const headers = init.headers as Record<string, string>;
+    expect(headers["authorization"]).toBe("Bearer id-token-123");
+    expect(headers["x-goog-authenticated-user-email"]).toBe("alice@example.com");
+    expect(headers["x-goog-authenticated-user-id"]).toBe("accounts.google.com:alice");
+  });
+
+  test("forwardCheckpoint POSTs to the checkpoint path and reports the host skip flag", async () => {
+    const { calls, forwarder } = lifecycleSetup({
+      checkpointed: true,
+      skipped: true,
+      state: "READY",
+    });
+    const result = await forwarder.forwardCheckpoint(checkpointArgs());
+    expect(result).toEqual({
+      status: 200,
+      checkpointed: true,
+      skipped: true,
+      state: "READY",
+    });
+    expect(calls[0]!.url).toBe("https://dsh-ws-1.run.app/workspaces/ws-1/checkpoint");
+  });
+
+  test("a 200 claiming prepared:false / checkpointed:false still rejects (never fake success)", async () => {
+    const { forwarder: lyingPrepare } = lifecycleSetup({ prepared: false, state: "STOPPING" });
+    await expect(lyingPrepare.forwardPrepareStop(prepareArgs())).rejects.toBeInstanceOf(
+      AgentHostForwardError,
+    );
+    const { forwarder: lyingCheckpoint } = lifecycleSetup({ checkpointed: false });
+    await expect(lyingCheckpoint.forwardCheckpoint(checkpointArgs())).rejects.toBeInstanceOf(
+      AgentHostForwardError,
+    );
+  });
+
+  test("lifecycle forwards share the message contract: 409/403 -> conflict, 5xx/unreachable -> forward error", async () => {
+    for (const status of [409, 403]) {
+      const { forwarder } = lifecycleSetup({ error: "lease not held" }, status);
+      await expect(forwarder.forwardPrepareStop(prepareArgs())).rejects.toBeInstanceOf(
+        AgentHostConflictError,
+      );
+      const { forwarder: checkpointForwarder } = lifecycleSetup({ error: "nope" }, status);
+      await expect(
+        checkpointForwarder.forwardCheckpoint(checkpointArgs()),
+      ).rejects.toBeInstanceOf(AgentHostConflictError);
+    }
+    const { forwarder: fiveHundred } = lifecycleSetup({ error: "boom" }, 500);
+    await expect(fiveHundred.forwardPrepareStop(prepareArgs())).rejects.toBeInstanceOf(
+      AgentHostForwardError,
+    );
+    const unreachable = new HttpAgentHostForwarder({
+      idTokenProvider: async () => "tok",
+      fetchFn: (async () => {
+        throw new Error("connection refused");
+      }) as (url: string, init?: RequestInit) => Promise<Response>,
+    });
+    await expect(unreachable.forwardCheckpoint(checkpointArgs())).rejects.toBeInstanceOf(
+      AgentHostForwardError,
+    );
+  });
+});
+
+describe("HttpAgentHostForwarder delivery logging", () => {
+  // NOTE: approvalSetup/approvalArgs/cancelArgs live in the issue-#39
+  // describe above (closure-scoped), so this block re-declares the two
+  // tiny arg builders it needs instead of reaching across describes.
+  const approvalArgs = (overrides: Partial<ForwardApprovalArgs> = {}): ForwardApprovalArgs => ({
+    instanceUrl: "https://dsh-ws-1.run.app",
+    workspaceId: "ws-1",
+    sessionId: "sess-1",
+    approvalId: "ask-1",
+    decision: "rejected",
+    identity: { id: "alice", email: "alice@example.com" },
+    ...overrides,
+  });
+
+  const cancelArgs = (overrides: Partial<ForwardCancelArgs> = {}): ForwardCancelArgs => ({
+    instanceUrl: "https://dsh-ws-1.run.app",
+    workspaceId: "ws-1",
+    sessionId: "sess-1",
+    identity: { id: "alice", email: "alice@example.com" },
+    ...overrides,
   });
 
   test("approval/cancel delivery is logged with kind, without secrets", async () => {

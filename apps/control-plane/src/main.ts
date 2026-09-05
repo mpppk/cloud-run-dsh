@@ -42,6 +42,14 @@ async function main(): Promise<void> {
   // instead of minting twice per open. The poll needs it because Instances
   // carry invoker IAM — a bare fetch() 401s on every attempt.
   const idTokenProvider = createIdTokenProvider();
+  // Issue #72/#75: ONE forwarder shared by the message handlers AND the
+  // runtime registry's remote lifecycle steps (stop preparation, manual
+  // checkpoint) — a single ID-token/timeout/409-vs-502 implementation.
+  // Constructed BEFORE the registry so both sides share it.
+  const messageForwarder = new HttpAgentHostForwarder({
+    idTokenProvider,
+    logger,
+  });
   const runtimes = createProductionRuntimeRegistry({
     config,
     repo,
@@ -54,6 +62,7 @@ async function main(): Promise<void> {
     instanceTransport: createAuthenticatedInstanceTransport(tokenProvider),
     gcsClient: new FetchGcsClient({ tokenProvider }),
     idTokenProvider,
+    messageForwarder,
   });
   const deps = createControlPlaneDeps({
     repo,
@@ -69,10 +78,7 @@ async function main(): Promise<void> {
     // Instance (ID-token auth for invoker IAM). The forwarder makes
     // postMessage 409 when the Instance has no URL (open first) and 502
     // when the forward fails after the append (never a fake 201).
-    messageForwarder: new HttpAgentHostForwarder({
-      idTokenProvider,
-      logger,
-    }),
+    messageForwarder,
   });
 
   logger.info(
