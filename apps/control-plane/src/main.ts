@@ -34,7 +34,13 @@ async function main(): Promise<void> {
   // agent-host composition root.
   const logger = createLogger();
 
-  const executor = await BunSqlQueryExecutor.connect(config.databaseUrl);
+  // Issue #109: explicit pool budget (db-f1-micro has 25 slots; the
+  // uncapped default pool exhausted them from a single container).
+  const executor = await BunSqlQueryExecutor.connect(config.databaseUrl, undefined, {
+    max: config.dbPoolMax,
+    idleTimeout: config.dbPoolIdleTimeout,
+    connectionTimeout: config.dbPoolConnectionTimeout,
+  });
   const repo = new PostgresSessionPersistenceRepository(executor);
   const clock = new SystemClock();
   // Issue #76: the shared metadata → ADC → env chain with caching. The

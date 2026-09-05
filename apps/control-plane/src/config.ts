@@ -17,6 +17,8 @@
 
 export const DEFAULT_PORT = 8080;
 
+import { resolveBunSqlPoolOptions } from "@cloud-run-dsh/session-persistence-postgres";
+
 /**
  * Stopped-Instance GC defaults (issue #85 案A). The sweeper deletes the
  * Cloud Run Instance objects of STOPPED workspaces untouched for
@@ -76,7 +78,26 @@ export interface ControlPlaneConfig {
   readonly port: number;
   /** Cloud SQL (production) / docker compose Postgres (local) connection string. */
   readonly databaseUrl: string;
-  /** GCP project hosting the Cloud Run Instances (absolute basePath `https://run.googleapis.com/v2/projects/<id>/locations/<region>` — issue #47). */
+  /**
+   * Bun.SQL pool cap for this process (issue #109: `DB_POOL_MAX`, default
+   * 5). The pool is eager (first query opens `max` backends) against
+   * db-f1-micro's 25 slots — control-plane 5 + agent-host 5 = 10, leaving
+   * room for operator psql. Raise together with the DB tier (docs/cost.md).
+   */
+  readonly dbPoolMax: number;
+  /**
+   * Idle-backend reap in seconds (issue #109: `DB_POOL_IDLE_TIMEOUT`,
+   * default 30). Bun's default 0 never reaps, which held the leaked
+   * backends forever. 0 disables reaping explicitly.
+   */
+  readonly dbPoolIdleTimeout: number;
+  /**
+   * Connect-failure retry budget in seconds (issue #109:
+   * `DB_POOL_CONNECTION_TIMEOUT`, default 30 — the Bun default). This does
+   * NOT cap over-cap queue waits (Bun 1.4.0 has no such knob); keep `max`
+   * sized for peak concurrency instead.
+   */
+  readonly dbPoolConnectionTimeout: number;  /** GCP project hosting the Cloud Run Instances (absolute basePath `https://run.googleapis.com/v2/projects/<id>/locations/<region>` — issue #47). */
   readonly gcpProjectId: string;
   /** GCP region for every Instance the control plane creates. */
   readonly gcpRegion: string;
@@ -174,9 +195,16 @@ export function readControlPlaneConfig(
     throw new Error(`invalid PORT: ${portRaw}`);
   }
 
+  // Issue #109: pool budget shared with the agent-host (same env names;
+  // the control plane also injects them into created Instances).
+  const pool = resolveBunSqlPoolOptions(env);
+
   return {
     port,
     databaseUrl: env["DATABASE_URL"]!.trim(),
+    dbPoolMax: pool.max,
+    dbPoolIdleTimeout: pool.idleTimeout,
+    dbPoolConnectionTimeout: pool.connectionTimeout,
     gcpProjectId: env["GCP_PROJECT_ID"]!.trim(),
     gcpRegion: env["GCP_REGION"]!.trim(),
     instancesApiBaseUrl: readInstancesApiBaseUrl(env),

@@ -41,6 +41,35 @@ terraform -chdir=infra/terraform apply -var-file=profiles/minimal.tfvars
   control-plane のコネクションプールだけで枠が埋まり、`psql` が繋がらなく
   なった。検証中に素の `psql` で直接確認したい場合は、control-plane を止めた
   状態で行うか、一時的に上位 tier への上げを検討すること。
+  原因と対策は [#109](https://github.com/mpppk/cloud-run-dsh/issues/109)
+  で固定済み: Bun.SQL のプールは上限なしだと既定 `max: 10` で初回クエリ時に
+  10 本を一気に開き、アイドルでも解放しない (`idleTimeout` 既定 0)。
+  プール上限は `DB_POOL_MAX` / `DB_POOL_IDLE_TIMEOUT` /
+  `DB_POOL_CONNECTION_TIMEOUT` で調整する (既定 5 / 30秒 / 30秒)。
+  詳細は下の「DB 接続数: tier とプール予算」節。
+
+### DB 接続数: tier とプール予算 (issue #109)
+
+| 項目 | `db-f1-micro` (minimal) | 上位 tier |
+|---|---|---|
+| `max_connections` | **25** (2026-09-05 実測) | `SHOW max_connections;` で確認すること (推測で書かない) |
+| control-plane プール (`DB_POOL_MAX`) | 5 | tier に合わせて上げる |
+| agent-host プール (`DB_POOL_MAX`) | 5 (1プロセス1プール) | 同左 |
+| 合計 (定常の上限) | **10** | `max_connections` の半分以下を目安に |
+| 残り | 運用者 `psql` + Cloud SQL 内部 + 余裕 (~15) | 同左 |
+
+ルール:
+
+- プールは eager (初回クエリで `max` 本を一気に開く) なので、**定常の上限 =
+  各プールの `max` の合計**で考える。アイドル時は `DB_POOL_IDLE_TIMEOUT`
+  (既定 30秒) で刈られる。
+- `max` を超えたクエリは**際限なく待つ** (Bun 1.4.0 にキューの待ち時間上限は
+  ない。`DB_POOL_CONNECTION_TIMEOUT` は接続失敗リトライの予算であり、
+  行列の上限ではない)。小さくしすぎると同時実行リクエストが詰まるので、
+  ピーク同時クエリ数を見て決めること。
+- agent-host は1プロセス1プールにすること (2プールあった時期があり、
+  それだけで 20 枠を消費した)。control-plane は作成する Instance に同じ値を
+  注入する (`buildInstanceEnv` → `DB_POOL_MAX` 等)。
 
 ## 月額概算 (asia-northeast1)
 

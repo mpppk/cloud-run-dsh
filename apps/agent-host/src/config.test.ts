@@ -37,6 +37,10 @@ describe("readAgentHostConfig", () => {
     expect(config.llmApiKeyEnv).toBe("OPENROUTER_API_KEY");
     expect(config.llmModel).toBe("deepseek/deepseek-v4-flash");
     expect(config.llmApprovalPolicy).toBe("ask");
+    // Issue #109: pool budget defaults to the db-f1-micro share (5 of 25).
+    expect(config.dbPoolMax).toBe(5);
+    expect(config.dbPoolIdleTimeout).toBe(30);
+    expect(config.dbPoolConnectionTimeout).toBe(30);
   });
 
   test("missing env throws with the missing key names", () => {
@@ -81,6 +85,24 @@ describe("readAgentHostConfig", () => {
     expect(() =>
       readAgentHostConfig({ ...validEnv, LLM_APPROVAL_POLICY: "sometimes" }),
     ).toThrow(/invalid LLM_APPROVAL_POLICY/);
+  });
+
+  test("pool budget honours overrides and refuses bad values (issue #109)", () => {
+    const config = readAgentHostConfig({
+      ...validEnv,
+      DB_POOL_MAX: "20",
+      DB_POOL_IDLE_TIMEOUT: "60",
+      DB_POOL_CONNECTION_TIMEOUT: "10",
+    });
+    expect(config.dbPoolMax).toBe(20);
+    expect(config.dbPoolIdleTimeout).toBe(60);
+    expect(config.dbPoolConnectionTimeout).toBe(10);
+    expect(() => readAgentHostConfig({ ...validEnv, DB_POOL_MAX: "0" })).toThrow(
+      /DB_POOL_MAX/,
+    );
+    expect(() => readAgentHostConfig({ ...validEnv, DB_POOL_IDLE_TIMEOUT: "-1" })).toThrow(
+      /DB_POOL_IDLE_TIMEOUT/,
+    );
   });
 
   test("INSTANCES_API_BASE_URL defaults to production, honors overrides, rejects relative (issue #47)", () => {

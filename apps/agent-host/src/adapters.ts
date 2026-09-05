@@ -36,7 +36,10 @@ import {
   resolveBunSqlTarget,
   toBunSqlConnectionError,
 } from "@cloud-run-dsh/session-persistence-postgres";
-import type { BunSqlConnectionTarget } from "@cloud-run-dsh/session-persistence-postgres";
+import type {
+  BunSqlConnectionTarget,
+  BunSqlPoolOptions,
+} from "@cloud-run-dsh/session-persistence-postgres";
 
 // ---------------------------------------------------------------------------
 // Host process environment — explicit allowlist, never wholesale inheritance
@@ -284,7 +287,10 @@ interface UnsafeSqlClient {
   close(): Promise<void> | undefined;
 }
 
-type SqlClientCtor = new (target: BunSqlConnectionTarget) => UnsafeSqlClient;
+type SqlClientCtor = new (
+  target: BunSqlConnectionTarget,
+  options?: BunSqlPoolOptions,
+) => UnsafeSqlClient;
 
 export class BunSqlQueryExecutor implements SessionQueryExecutor {
   private constructor(private readonly client: UnsafeSqlClient) {}
@@ -301,19 +307,25 @@ export class BunSqlQueryExecutor implements SessionQueryExecutor {
    * (notably production's `DATABASE_URL`) cannot make the options object
    * throw `ERR_INVALID_URL` (issue #45).
    *
+   * `poolOptions` (issue #109) caps the pool — pass the config's
+   * `dbPoolMax`/`dbPoolIdleTimeout`. The host must share ONE executor: a
+   * second `connect()` opens a second eager pool against the same 25-slot
+   * db-f1-micro (that double pool is half of the #109 exhaustion).
+   *
    * The optional `sqlCtor` is a test seam for asserting the resolved target
    * without opening a real connection.
    */
   static async connect(
     databaseUrl: string,
     sqlCtor?: SqlClientCtor,
+    poolOptions?: BunSqlPoolOptions,
   ): Promise<BunSqlQueryExecutor> {
     const target = resolveBunSqlTarget(databaseUrl);
     const Ctor =
       sqlCtor ??
       (await import("bun") as unknown as { SQL: SqlClientCtor }).SQL;
     try {
-      return new BunSqlQueryExecutor(createBunSqlClient(target, Ctor));
+      return new BunSqlQueryExecutor(createBunSqlClient(target, Ctor, poolOptions));
     } catch (e) {
       throw toBunSqlConnectionError(e, target);
     }
@@ -345,9 +357,10 @@ export class BunSqlQueryExecutor implements SessionQueryExecutor {
 
 export async function createSessionRepository(
   databaseUrl: string,
+  poolOptions?: BunSqlPoolOptions,
 ): Promise<PostgresSessionPersistenceRepository> {
   return new PostgresSessionPersistenceRepository(
-    await BunSqlQueryExecutor.connect(databaseUrl),
+    await BunSqlQueryExecutor.connect(databaseUrl, undefined, poolOptions),
   );
 }
 

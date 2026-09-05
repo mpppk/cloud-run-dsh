@@ -5,14 +5,17 @@ export {
   BUN_SQL_ENV_URL_KEYS,
   BunSqlConnectionError,
   DatabaseUrlParseError,
+  DEFAULT_DB_POOL_IDLE_TIMEOUT,
+  DEFAULT_DB_POOL_MAX,
   createBunSqlClient,
   describeConnectionTarget,
   isSocketTarget,
+  resolveBunSqlPoolOptions,
   resolveBunSqlTarget,
   toBunSqlConnectionError,
   withIsolatedBunSqlEnv,
 } from "./connection.js";
-export type { BunSqlConnectionTarget, BunSqlSocketOptions } from "./connection.js";
+export type { BunSqlConnectionTarget, BunSqlPoolOptions, BunSqlSocketOptions } from "./connection.js";
 export { PostgresSessionPersistenceRepository, type SessionPersistenceRepository } from "./repository.js";
 export { PostgresSessionPersistence, type SessionPersistence } from "./sessionPersistence.js";
 

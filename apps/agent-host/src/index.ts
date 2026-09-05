@@ -5,6 +5,7 @@
 import { CloudRunInstanceClient, buildInstancesBasePath } from "@cloud-run-dsh/cloud-run-instance-client";
 import { createLogger } from "@cloud-run-dsh/observability";
 import { createGcsTokenProvider } from "@cloud-run-dsh/gcp-token-provider";
+import { PostgresSessionPersistenceRepository } from "@cloud-run-dsh/session-persistence-postgres";
 import { composeAgentHost } from "./composition.js";
 import type { AgentHostDependencies } from "./composition.js";
 import { readAgentHostConfig } from "./config.js";
@@ -20,7 +21,6 @@ import {
   SqlTransactionalStateStore,
   createCheckpointStorage,
   createEnvSecretProvider,
-  createSessionRepository,
   fetchHttpTransport,
   instanceHttpTransport,
 } from "./adapters.js";
@@ -37,8 +37,17 @@ export async function createProductionDependencies(
   const gcsClient = new FetchGcsClient({
     tokenProvider: createGcsTokenProvider(env, { logger }),
   });
-  const executor = await BunSqlQueryExecutor.connect(config.databaseUrl);
-  const repository = await createSessionRepository(config.databaseUrl);
+  // Issue #109: ONE pool for the whole host. This composition root used
+  // to connect twice (executor + createSessionRepository), opening two
+  // eager pools against db-f1-micro's 25 slots. The repository now shares
+  // the executor; the pool budget comes from the config (injected by the
+  // control plane into every Instance).
+  const executor = await BunSqlQueryExecutor.connect(config.databaseUrl, undefined, {
+    max: config.dbPoolMax,
+    idleTimeout: config.dbPoolIdleTimeout,
+    connectionTimeout: config.dbPoolConnectionTimeout,
+  });
+  const repository = new PostgresSessionPersistenceRepository(executor);
 
   // Real DeepSeek Harness filesystem/search composition (see harness above).
   const harness = await createHarnessComposition(config.workspaceRoot);

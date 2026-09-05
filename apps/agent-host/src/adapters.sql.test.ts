@@ -12,6 +12,7 @@ import { describe, expect, test } from "bun:test";
 import { BunSqlLeaseStore, BunSqlQueryExecutor, SqlTransactionalStateStore } from "./adapters.js";
 import { IllegalTransitionError } from "@cloud-run-dsh/workspace-runtime";
 import type { BunSqlConnectionTarget } from "@cloud-run-dsh/session-persistence-postgres";
+import type { BunSqlPoolOptions } from "@cloud-run-dsh/session-persistence-postgres";
 import { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
 import type { LeaseTransaction } from "@cloud-run-dsh/controller-lease";
 import type { QueryExecutor } from "@cloud-run-dsh/session-persistence-postgres";
@@ -254,10 +255,12 @@ const CONNECT_SECRET = "ah-s3cr3t-Pw/xX9qZ";
 
 describe("BunSqlQueryExecutor.connect", () => {
   const seen: BunSqlConnectionTarget[] = [];
+  const seenOptions: (BunSqlPoolOptions | undefined)[] = [];
 
   class StubSql {
-    constructor(target: BunSqlConnectionTarget) {
+    constructor(target: BunSqlConnectionTarget, options?: BunSqlPoolOptions) {
       seen.push(target);
+      seenOptions.push(options);
     }
     async unsafe(): Promise<unknown[]> {
       return [];
@@ -288,6 +291,35 @@ describe("BunSqlQueryExecutor.connect", () => {
     const url = `postgres://dsh:${CONNECT_SECRET}@localhost:5432/dsh`;
     await BunSqlQueryExecutor.connect(url, StubSql);
     expect(seen).toEqual([url]);
+  });
+
+  test("pool options merge into the socket options object (issue #109)", async () => {
+    seen.length = 0;
+    seenOptions.length = 0;
+    await BunSqlQueryExecutor.connect(
+      `postgresql://dsh_app:${CONNECT_SECRET}@/dsh?host=/cloudsql/p:r:i`,
+      StubSql,
+      { max: 5, idleTimeout: 30, connectionTimeout: 30 },
+    );
+    expect(seen[0]).toEqual({
+      path: "/cloudsql/p:r:i",
+      username: "dsh_app",
+      password: CONNECT_SECRET,
+      database: "dsh",
+      max: 5,
+      idleTimeout: 30,
+      connectionTimeout: 30,
+    });
+    expect(seenOptions[0]).toBeUndefined();
+  });
+
+  test("pool options ride the second constructor arg for TCP strings (issue #109)", async () => {
+    seen.length = 0;
+    seenOptions.length = 0;
+    const url = `postgres://dsh:${CONNECT_SECRET}@localhost:5432/dsh`;
+    await BunSqlQueryExecutor.connect(url, StubSql, { max: 5, idleTimeout: 30 });
+    expect(seen).toEqual([url]);
+    expect(seenOptions[0]).toEqual({ max: 5, idleTimeout: 30 });
   });
 
   test("constructor failure never carries the password", async () => {

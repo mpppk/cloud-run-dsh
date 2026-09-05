@@ -15,10 +15,13 @@ import { SQL } from "bun";
 import {
   BUN_SQL_ENV_URL_KEYS,
   BunSqlConnectionError,
+  DEFAULT_DB_POOL_IDLE_TIMEOUT,
+  DEFAULT_DB_POOL_MAX,
   createBunSqlClient,
   DatabaseUrlParseError,
   describeConnectionTarget,
   isSocketTarget,
+  resolveBunSqlPoolOptions,
   resolveBunSqlTarget,
   toBunSqlConnectionError,
   withIsolatedBunSqlEnv,
@@ -452,5 +455,120 @@ describe("Bun.SQL environment isolation (issue #45)", () => {
     } finally {
       restoreEnv(snap);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pool budget (issue #109): explicit caps instead of Bun defaults
+// (max 10 eager + idleTimeout 0 = never reap), which exhausted db-f1-micro.
+// ---------------------------------------------------------------------------
+
+describe("resolveBunSqlPoolOptions", () => {
+  test("defaults encode the db-f1-micro budget (5 + 5 of 25)", () => {
+    expect(DEFAULT_DB_POOL_MAX).toBe(5);
+    expect(DEFAULT_DB_POOL_IDLE_TIMEOUT).toBe(30);
+    expect(resolveBunSqlPoolOptions({})).toEqual({
+      max: 5,
+      idleTimeout: 30,
+      connectionTimeout: 30,
+    });
+  });
+
+  test("blank values fall back to defaults", () => {
+    expect(
+      resolveBunSqlPoolOptions({
+        DB_POOL_MAX: "   ",
+        DB_POOL_IDLE_TIMEOUT: "",
+        DB_POOL_CONNECTION_TIMEOUT: undefined,
+      }),
+    ).toEqual({ max: 5, idleTimeout: 30, connectionTimeout: 30 });
+  });
+
+  test("explicit values are honoured (tier upsizing path)", () => {
+    expect(
+      resolveBunSqlPoolOptions({
+        DB_POOL_MAX: "20",
+        DB_POOL_IDLE_TIMEOUT: "60",
+        DB_POOL_CONNECTION_TIMEOUT: "10",
+      }),
+    ).toEqual({ max: 20, idleTimeout: 60, connectionTimeout: 10 });
+  });
+
+  test("idleTimeout 0 explicitly disables reaping", () => {
+    expect(resolveBunSqlPoolOptions({ DB_POOL_IDLE_TIMEOUT: "0" }).idleTimeout).toBe(0);
+  });
+
+  test("invalid values fail fast naming the variable", () => {
+    expect(() => resolveBunSqlPoolOptions({ DB_POOL_MAX: "0" })).toThrow(/DB_POOL_MAX/);
+    expect(() => resolveBunSqlPoolOptions({ DB_POOL_MAX: "nope" })).toThrow(/DB_POOL_MAX/);
+    expect(() => resolveBunSqlPoolOptions({ DB_POOL_IDLE_TIMEOUT: "-1" })).toThrow(
+      /DB_POOL_IDLE_TIMEOUT/,
+    );
+    expect(() => resolveBunSqlPoolOptions({ DB_POOL_CONNECTION_TIMEOUT: "nope" })).toThrow(
+      /DB_POOL_CONNECTION_TIMEOUT/,
+    );
+  });
+});
+
+describe("createBunSqlClient — pool options plumbing", () => {
+  test("socket target merges pool knobs into the options object", () => {
+    const seen: unknown[] = [];
+    class RecordingSql {
+      constructor(target: unknown) {
+        seen.push(target);
+      }
+    }
+    createBunSqlClient(
+      { path: "/x", username: "u", password: "p", database: "d" },
+      RecordingSql,
+      { max: 5, idleTimeout: 30, connectionTimeout: 30 },
+    );
+    expect(seen).toEqual([
+      { path: "/x", username: "u", password: "p", database: "d", max: 5, idleTimeout: 30, connectionTimeout: 30 },
+    ]);
+  });
+
+  test("TCP string target passes pool knobs as the second constructor arg", () => {
+    const seen: unknown[][] = [];
+    class RecordingSql {
+      constructor(...args: unknown[]) {
+        seen.push(args);
+      }
+    }
+    createBunSqlClient("postgres://u:p@localhost:5432/d", RecordingSql, {
+      max: 5,
+      idleTimeout: 30,
+    });
+    expect(seen.length).toBe(1);
+    expect(seen[0]![0]).toBe("postgres://u:p@localhost:5432/d");
+    expect(seen[0]![1]).toEqual({ max: 5, idleTimeout: 30 });
+  });
+
+  test("absent pool options keep the historical single-arg call", () => {
+    const seen: unknown[][] = [];
+    class RecordingSql {
+      constructor(...args: unknown[]) {
+        seen.push(args);
+      }
+    }
+    createBunSqlClient({ path: "/x", username: "u", password: "p", database: "d" }, RecordingSql);
+    expect(seen[0]!.length).toBe(1);
+    createBunSqlClient("postgres://u:p@localhost:5432/d", RecordingSql, {});
+    expect(seen[1]!.length).toBe(1);
+  });
+
+  test("partial pool options pass only the set keys", () => {
+    const seen: unknown[] = [];
+    class RecordingSql {
+      constructor(target: unknown) {
+        seen.push(target);
+      }
+    }
+    createBunSqlClient(
+      { path: "/x", username: "u", password: "p", database: "d" },
+      RecordingSql,
+      { max: 3 },
+    );
+    expect(seen).toEqual([{ path: "/x", username: "u", password: "p", database: "d", max: 3 }]);
   });
 });

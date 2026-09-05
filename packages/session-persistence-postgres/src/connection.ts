@@ -51,6 +51,111 @@ export function isSocketTarget(target: BunSqlConnectionTarget): target is BunSql
   return typeof target !== "string";
 }
 
+// ---------------------------------------------------------------------------
+// Bun.SQL pool budget (issue #109).
+//
+// MEASURED 2026-09-05: one control-plane container grew to 23 Cloud SQL
+// backends and held them idle, exhausting db-f1-micro (`max_connections` is
+// 25 — `psql` then fails with "remaining connection slots are reserved").
+// No call site passed a pool cap, so every pool ran at Bun's default.
+//
+// Bun 1.4.0 pool facts (verified against oven-sh/bun tag `bun-v1.4.0`,
+// `src/js/internal/sql/shared.ts` + `postgres.ts`, plus a live
+// `new SQL(url, { max: 0 })` throw check with the vendored bun 1.4.0):
+// - `max` defaults to 10, and the pool is EAGER: the first query opens all
+//   `max` backends at once. Three pools existed (control-plane 1 +
+//   agent-host 2 — its composition root connected twice), so the worst case
+//   was 3 × 10 = 30 backends against a 25-slot database.
+// - `idleTimeout` defaults to 0, meaning "never reap": idle backends are
+//   held forever. That is the "does not shrink when idle" half of #109.
+// - Over-cap queries WAIT in an unbounded in-memory queue — there is NO
+//   queue-wait timeout in Bun 1.4.0. `connectionTimeout` (default 30s) only
+//   budgets connect-failure RETRIES, and `idleTimeout` only reaps idle
+//   connections. So a too-small `max` does not fail fast: requests pile up
+//   behind the pool until the caller's own timeout (Cloud Run request
+//   timeout) kills them. Size `max` for peak concurrent in-flight queries,
+//   not for the average.
+//
+// BUDGET for db-f1-micro (25 slots, measured): control-plane 5 + agent-host
+// 5 (one shared pool — the host's double connect is removed) = 10 steady
+// state, leaving ~15 for operator `psql` (teardown's DROP OWNED needs a
+// slot; #73/#109 each blocked teardown for lack of one), Cloud SQL
+// internals, and headroom. A bigger tier raises `max_connections` — raise
+// these caps through the environment at the same time (see docs/cost.md).
+// ---------------------------------------------------------------------------
+
+/** Bun.SQL pool knobs, in Bun-native names and units (timeouts are seconds). */
+export interface BunSqlPoolOptions {
+  /** Maximum backends in the pool (Bun default when absent: 10). */
+  readonly max?: number;
+  /** Seconds an idle backend is kept before it is closed (Bun default: 0 = never). */
+  readonly idleTimeout?: number;
+  /**
+   * Seconds of connect-failure retry budget per slot (Bun default: 30).
+   * NOT a queue-wait cap: over-cap queries still wait unboundedly (see above).
+   */
+  readonly connectionTimeout?: number;
+}
+
+/** Default pool cap per process (issue #109 budget: 5 + 5 = 10 of 25). */
+export const DEFAULT_DB_POOL_MAX = 5;
+/** Default idle reap in seconds (issue #109: the leak never released idle backends). */
+export const DEFAULT_DB_POOL_IDLE_TIMEOUT = 30;
+
+function readPoolInt(
+  raw: string | undefined,
+  name: string,
+  fallback: number,
+  min: number,
+): number {
+  const trimmed = raw?.trim();
+  if (trimmed === undefined || trimmed === "") return fallback;
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isInteger(parsed) || parsed < min) {
+    throw new Error(`invalid ${name}: ${JSON.stringify(raw)} (want an integer >= ${min})`);
+  }
+  return parsed;
+}
+
+/**
+ * Reads the pool budget from the environment (issue #109). Both apps share
+ * these names so one tier change retunes every pool; the control plane also
+ * injects the same values into the Instances it creates.
+ * - `DB_POOL_MAX` (default 5): per-process backend cap.
+ * - `DB_POOL_IDLE_TIMEOUT` (default 30): idle reap in seconds; 0 disables.
+ * - `DB_POOL_CONNECTION_TIMEOUT` (default 30): connect-retry budget in
+ *   seconds. This does NOT cap queue waits — see the module note above.
+ */
+export function resolveBunSqlPoolOptions(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): Required<BunSqlPoolOptions> {
+  return {
+    max: readPoolInt(env["DB_POOL_MAX"], "DB_POOL_MAX", DEFAULT_DB_POOL_MAX, 1),
+    idleTimeout: readPoolInt(
+      env["DB_POOL_IDLE_TIMEOUT"],
+      "DB_POOL_IDLE_TIMEOUT",
+      DEFAULT_DB_POOL_IDLE_TIMEOUT,
+      0,
+    ),
+    connectionTimeout: readPoolInt(
+      env["DB_POOL_CONNECTION_TIMEOUT"],
+      "DB_POOL_CONNECTION_TIMEOUT",
+      30,
+      0,
+    ),
+  };
+}
+
+/** Drops unset keys; undefined means "no pool knobs — historical single-arg call". */
+function poolArgs(poolOptions?: BunSqlPoolOptions): BunSqlPoolOptions | undefined {
+  if (poolOptions === undefined) return undefined;
+  const out: { max?: number; idleTimeout?: number; connectionTimeout?: number } = {};
+  if (poolOptions.max !== undefined) out.max = poolOptions.max;
+  if (poolOptions.idleTimeout !== undefined) out.idleTimeout = poolOptions.idleTimeout;
+  if (poolOptions.connectionTimeout !== undefined) out.connectionTimeout = poolOptions.connectionTimeout;
+  return Object.keys(out).length === 0 ? undefined : out;
+}
+
 /**
  * Thrown when the configured value is not a usable connection string.
  * Messages NEVER contain the password (see the module header). Values that
@@ -410,10 +515,23 @@ export function withIsolatedBunSqlEnv<T>(fn: () => T): T {
  * This is the ONLY approved way to call `new SQL(target)`: it guarantees
  * the explicit `target` (socket options object or TCP string) cannot be
  * overridden, polluted, or rejected because of ambient `*_URL` variables.
+ *
+ * `poolOptions` (issue #109) caps the pool: a TCP string target is passed
+ * as `new SQL(url, pool)` (two-arg form, verified on bun 1.4.0), while a
+ * socket options object is spread into one (`{ path, ..., ...pool }`) —
+ * both shapes flow through the same Bun defaults parsing. Omitted (or
+ * all-unset) means the historical single-arg call with Bun defaults
+ * (`max: 10`, `idleTimeout: 0` = never reap).
  */
 export function createBunSqlClient<TClient>(
   target: BunSqlConnectionTarget,
-  ctor: new (target: BunSqlConnectionTarget) => TClient,
+  ctor: new (target: BunSqlConnectionTarget, options?: BunSqlPoolOptions) => TClient,
+  poolOptions?: BunSqlPoolOptions,
 ): TClient {
-  return withIsolatedBunSqlEnv(() => new ctor(target));
+  return withIsolatedBunSqlEnv(() => {
+    const pool = poolArgs(poolOptions);
+    if (pool === undefined) return new ctor(target);
+    if (typeof target === "string") return new ctor(target, pool);
+    return new ctor({ ...target, ...pool });
+  });
 }

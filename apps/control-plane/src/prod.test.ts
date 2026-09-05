@@ -15,6 +15,7 @@ import {
   FetchGcsClient,
 } from "./prod-adapters.js";
 import type { BunSqlConnectionTarget } from "@cloud-run-dsh/session-persistence-postgres";
+import type { BunSqlPoolOptions } from "@cloud-run-dsh/session-persistence-postgres";
 import type { QueryExecutor } from "@cloud-run-dsh/session-persistence-postgres";
 import type { ControllerLeaseRecord } from "@cloud-run-dsh/controller-lease";
 import { InMemoryLogger } from "@cloud-run-dsh/observability";
@@ -107,6 +108,31 @@ describe("readControlPlaneConfig", () => {
     expect(config.instanceGcIntervalMs).toBe(60 * 60 * 1000);
     expect(config.instanceGcStaleAfterMs).toBe(30 * 24 * 60 * 60 * 1000);
     expect(config.instanceGcMaxDeletesPerSweep).toBe(10);
+    // Issue #109: pool budget defaults to the db-f1-micro share (5 of 25).
+    expect(config.dbPoolMax).toBe(5);
+    expect(config.dbPoolIdleTimeout).toBe(30);
+    expect(config.dbPoolConnectionTimeout).toBe(30);
+  });
+
+  test("pool budget is tunable via the environment (tier upsizing path)", () => {
+    const config = readControlPlaneConfig({
+      ...fullEnv(),
+      DB_POOL_MAX: "20",
+      DB_POOL_IDLE_TIMEOUT: "60",
+      DB_POOL_CONNECTION_TIMEOUT: "10",
+    });
+    expect(config.dbPoolMax).toBe(20);
+    expect(config.dbPoolIdleTimeout).toBe(60);
+    expect(config.dbPoolConnectionTimeout).toBe(10);
+  });
+
+  test("invalid pool values fail boot naming the variable", () => {
+    expect(() => readControlPlaneConfig({ ...fullEnv(), DB_POOL_MAX: "0" })).toThrow(
+      /DB_POOL_MAX/,
+    );
+    expect(() => readControlPlaneConfig({ ...fullEnv(), DB_POOL_IDLE_TIMEOUT: "-1" })).toThrow(
+      /DB_POOL_IDLE_TIMEOUT/,
+    );
   });
 
   test("missing OPENROUTER_API_KEY fails boot with the key NAME only (no value to leak)", () => {
@@ -254,10 +280,12 @@ const CONNECT_SECRET = "cp-s3cr3t-Pw/xX9qZ";
 
 describe("BunSqlQueryExecutor.connect", () => {
   const seen: BunSqlConnectionTarget[] = [];
+  const seenOptions: (BunSqlPoolOptions | undefined)[] = [];
 
   class StubSql {
-    constructor(target: BunSqlConnectionTarget) {
+    constructor(target: BunSqlConnectionTarget, options?: BunSqlPoolOptions) {
       seen.push(target);
+      seenOptions.push(options);
     }
     async unsafe(): Promise<unknown[]> {
       return [];
@@ -288,6 +316,36 @@ describe("BunSqlQueryExecutor.connect", () => {
     const url = `postgres://dsh:${CONNECT_SECRET}@localhost:5432/dsh`;
     await BunSqlQueryExecutor.connect(url, StubSql);
     expect(seen).toEqual([url]);
+  });
+
+  test("pool options merge into the socket options object (issue #109)", async () => {
+    seen.length = 0;
+    seenOptions.length = 0;
+    await BunSqlQueryExecutor.connect(
+      `postgresql://dsh_app:${CONNECT_SECRET}@/dsh?host=/cloudsql/p:r:i`,
+      StubSql,
+      { max: 5, idleTimeout: 30, connectionTimeout: 30 },
+    );
+    expect(seen[0]).toEqual({
+      path: "/cloudsql/p:r:i",
+      username: "dsh_app",
+      password: CONNECT_SECRET,
+      database: "dsh",
+      max: 5,
+      idleTimeout: 30,
+      connectionTimeout: 30,
+    });
+    // Merged form: no second constructor arg for object targets.
+    expect(seenOptions[0]).toBeUndefined();
+  });
+
+  test("pool options ride the second constructor arg for TCP strings (issue #109)", async () => {
+    seen.length = 0;
+    seenOptions.length = 0;
+    const url = `postgres://dsh:${CONNECT_SECRET}@localhost:5432/dsh`;
+    await BunSqlQueryExecutor.connect(url, StubSql, { max: 5, idleTimeout: 30 });
+    expect(seen).toEqual([url]);
+    expect(seenOptions[0]).toEqual({ max: 5, idleTimeout: 30 });
   });
 
   test("constructor failure never carries the password", async () => {
