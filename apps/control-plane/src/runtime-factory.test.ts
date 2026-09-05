@@ -166,6 +166,8 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     const createReq = h.transport.requests[1]!;
     const body = createReq.body as Record<string, unknown>;
     expect(body["restartPolicy"]).toBe("ON_FAILURE");
+    // Issue #53: sandboxLauncher requires launchStage >= BETA on the live API.
+    expect(body["launchStage"]).toBe("BETA");
     expect(body["serviceAccount"]).toBe("agent-host@test-proj.iam.gserviceaccount.com");
     const containers = body["containers"] as Array<Record<string, unknown>>;
     expect(containers[0]!["image"]).toBe(
