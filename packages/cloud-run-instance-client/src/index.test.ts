@@ -1,9 +1,14 @@
 import { describe, test, expect } from "bun:test";
 import {
   DEFAULT_INSTANCE_CONFIG,
+  DEFAULT_INSTANCE_LAUNCH_STAGE,
   INSTANCE_PROFILES,
   AVAILABLE_PROFILES,
+  DEFAULT_INSTANCES_API_BASE_URL,
+  InvalidBasePathError,
+  buildInstancesBasePath,
   configForProfile,
+  meetsSandboxLaunchStageRequirement,
   toApiRestartPolicy,
   ProfileNotAvailableError,
   InvalidRestartPolicyError,
@@ -22,6 +27,9 @@ describe("cloud-run-instance-client config defaults", () => {
     expect(DEFAULT_INSTANCE_CONFIG.restartPolicy).toBe("on-failure");
     expect(DEFAULT_INSTANCE_CONFIG.sandboxLauncher).toBe(true);
     expect(DEFAULT_INSTANCE_CONFIG.port).toBe(8080);
+    // Issue #53: sandboxLauncher requires launchStage >= BETA on the live API.
+    expect(DEFAULT_INSTANCE_CONFIG.launchStage).toBe("BETA");
+    expect(DEFAULT_INSTANCE_LAUNCH_STAGE).toBe("BETA");
   });
 
   test("profile mapping matches spec section 22", () => {
@@ -31,6 +39,7 @@ describe("cloud-run-instance-client config defaults", () => {
       restartPolicy: "on-failure",
       sandboxLauncher: true,
       port: 8080,
+      launchStage: "BETA",
     });
     expect(INSTANCE_PROFILES.Standard).toEqual(DEFAULT_INSTANCE_CONFIG);
     expect(INSTANCE_PROFILES.Large).toEqual({
@@ -39,6 +48,7 @@ describe("cloud-run-instance-client config defaults", () => {
       restartPolicy: "on-failure",
       sandboxLauncher: true,
       port: 8080,
+      launchStage: "BETA",
     });
   });
 
@@ -57,7 +67,7 @@ describe("cloud-run-instance-client config defaults", () => {
 
   test("client uses default config when none provided", () => {
     const t = new FakeTransport();
-    const c = new CloudRunInstanceClient({ transport: t, basePath: "projects/p/locations/us-central1" });
+    const c = new CloudRunInstanceClient({ transport: t, basePath: "https://run.googleapis.com/v2/projects/p/locations/us-central1" });
     expect(c.getConfig()).toEqual(DEFAULT_INSTANCE_CONFIG);
   });
 
@@ -65,7 +75,7 @@ describe("cloud-run-instance-client config defaults", () => {
     const t = new FakeTransport();
     const c = new CloudRunInstanceClient({
       transport: t,
-      basePath: "projects/p/locations/us-central1",
+      basePath: "https://run.googleapis.com/v2/projects/p/locations/us-central1",
       profile: "Standard",
     });
     expect(c.getConfig()).toEqual(DEFAULT_INSTANCE_CONFIG);
@@ -79,7 +89,7 @@ describe("cloud-run-instance-client restartPolicy always rejection", () => {
       () =>
         new CloudRunInstanceClient({
           transport: t,
-          basePath: "projects/p/locations/us-central1",
+          basePath: "https://run.googleapis.com/v2/projects/p/locations/us-central1",
           config: { cpu: 4, memory: "8Gi", restartPolicy: "always", sandboxLauncher: true, port: 8080 },
         }),
     ).toThrow(InvalidRestartPolicyError);
@@ -90,7 +100,7 @@ describe("cloud-run-instance-client restartPolicy always rejection", () => {
     try {
       new CloudRunInstanceClient({
         transport: t,
-        basePath: "projects/p/locations/us-central1",
+        basePath: "https://run.googleapis.com/v2/projects/p/locations/us-central1",
         config: { cpu: 4, memory: "8Gi", restartPolicy: "always", sandboxLauncher: true, port: 8080 },
       });
       expect.unreachable();
@@ -102,7 +112,7 @@ describe("cloud-run-instance-client restartPolicy always rejection", () => {
 });
 
 describe("cloud-run-instance-client request shapes", () => {
-  const basePath = "projects/test-proj/locations/us-central1";
+  const basePath = "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1";
   const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
 
   test("toApiRestartPolicy maps to the v2 API enum", () => {
@@ -134,6 +144,9 @@ describe("cloud-run-instance-client request shapes", () => {
     expect(req.url).toBe(`${basePath}/instances?instanceId=dsh-ws-123`);
     const body = req.body as Record<string, unknown>;
     expect(body["restartPolicy"]).toBe("ON_FAILURE");
+    // Issue #53: the live API rejects creates without launchStage >= BETA
+    // (400 FAILED_PRECONDITION) when sandboxLauncher is set.
+    expect(body["launchStage"]).toBe("BETA");
     expect(body["serviceAccount"]).toBe("agent-host@test-proj.iam.gserviceaccount.com");
     const containers = body["containers"] as Array<Record<string, unknown>>;
     expect(containers).toHaveLength(1);
@@ -201,7 +214,7 @@ describe("cloud-run-instance-client request shapes", () => {
   test("create parses a pending v2 longrunning operation", async () => {
     const transport = new FakeTransport(async () => ({
       status: 200,
-      body: { name: "projects/test-proj/locations/us-central1/operations/op-1", done: false },
+      body: { name: "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1/operations/op-1", done: false },
     }));
     const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     const info = await client.create({ id: "ws-1" });
@@ -212,7 +225,7 @@ describe("cloud-run-instance-client request shapes", () => {
   test("create throws when the completed operation carries an error", async () => {
     const transport = new FakeTransport(async () => ({
       status: 200,
-      body: { name: "projects/test-proj/locations/us-central1/operations/op-1", done: true, error: { code: 13, message: "internal boom" } },
+      body: { name: "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1/operations/op-1", done: true, error: { code: 13, message: "internal boom" } },
     }));
     const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     await expect(client.create({ id: "ws-1" })).rejects.toThrow("internal boom");
@@ -285,7 +298,7 @@ describe("cloud-run-instance-client request shapes", () => {
 });
 
 describe("cloud-run-instance-client v2 response parsing", () => {
-  const basePath = "projects/test-proj/locations/us-central1";
+  const basePath = "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1";
   const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
 
   test("get derives READY from terminalCondition.state (v2 has no top-level state)", async () => {
@@ -326,11 +339,15 @@ describe("cloud-run-instance-client v2 response parsing", () => {
 });
 
 describe("cloud-run-instance-client error mapping", () => {
-  const basePath = "projects/test-proj/locations/us-central1";
+  const basePath = "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1";
   const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
 
   test("404 maps to InstanceNotFoundError", async () => {
-    const transport = new FakeTransport(async () => ({ status: 404, body: { message: "not found" } }));
+    // Real Google API shape: { error: { code, message, status } }.
+    const transport = new FakeTransport(async () => ({
+      status: 404,
+      body: { error: { code: 404, message: "Requested entity was not found.", status: "NOT_FOUND" } },
+    }));
     const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     await expect(client.get("missing")).rejects.toBeInstanceOf(InstanceNotFoundError);
     await expect(client.start("missing")).rejects.toBeInstanceOf(InstanceNotFoundError);
@@ -339,13 +356,19 @@ describe("cloud-run-instance-client error mapping", () => {
   });
 
   test("409 maps to InstanceAlreadyExistsError", async () => {
-    const transport = new FakeTransport(async () => ({ status: 409, body: { message: "already exists" } }));
+    const transport = new FakeTransport(async () => ({
+      status: 409,
+      body: { error: { code: 409, message: "Requested entity already exists", status: "ALREADY_EXISTS" } },
+    }));
     const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     await expect(client.create({ id: "ws-1" })).rejects.toBeInstanceOf(InstanceAlreadyExistsError);
   });
 
   test("create 409 error message reports the instance name, not the workspace id", async () => {
-    const transport = new FakeTransport(async () => ({ status: 409, body: { message: "already exists" } }));
+    const transport = new FakeTransport(async () => ({
+      status: 409,
+      body: { error: { code: 409, message: "Requested entity already exists", status: "ALREADY_EXISTS" } },
+    }));
     const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     const err = await client.create({ id: "ws-1" }).catch((e) => e);
     expect(err).toBeInstanceOf(InstanceAlreadyExistsError);
@@ -354,7 +377,10 @@ describe("cloud-run-instance-client error mapping", () => {
   });
 
   test("create 409 error message reports an explicit instanceName when provided", async () => {
-    const transport = new FakeTransport(async () => ({ status: 409, body: { message: "already exists" } }));
+    const transport = new FakeTransport(async () => ({
+      status: 409,
+      body: { error: { code: 409, message: "Requested entity already exists", status: "ALREADY_EXISTS" } },
+    }));
     const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     const err = await client.create({ id: "ws-1", instanceName: "my-instance" }).catch((e) => e);
     expect(err).toBeInstanceOf(InstanceAlreadyExistsError);
@@ -371,13 +397,25 @@ describe("cloud-run-instance-client error mapping", () => {
   });
 
   test("403 maps to PermissionDeniedError", async () => {
-    const transport = new FakeTransport(async () => ({ status: 403, body: { message: "permission denied" } }));
+    const transport = new FakeTransport(async () => ({
+      status: 403,
+      body: {
+        error: {
+          code: 403,
+          message: "Permission 'run.instances.get' denied on resource 'x'.",
+          status: "PERMISSION_DENIED",
+        },
+      },
+    }));
     const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     await expect(client.get("x")).rejects.toBeInstanceOf(PermissionDeniedError);
   });
 
   test("5xx maps to InstanceClientError", async () => {
-    const transport = new FakeTransport(async () => ({ status: 500, body: { message: "internal" } }));
+    const transport = new FakeTransport(async () => ({
+      status: 500,
+      body: { error: { code: 13, message: "internal", status: "INTERNAL" } },
+    }));
     const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
     await expect(client.get("x")).rejects.toBeInstanceOf(InstanceClientError);
   });
@@ -389,8 +427,224 @@ describe("cloud-run-instance-client error mapping", () => {
   });
 });
 
+describe("cloud-run-instance-client Google API error body (issue #53)", () => {
+  const basePath = "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1";
+  const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
+
+  // Verbatim shape observed against the live API on 2026-09-05: the message
+  // lives at body.error.message, NOT body.message. A fake returning
+  // { message: "..." } hides the bug the old handleErrorStatus had.
+  const LIVE_LAUNCH_STAGE_ERROR = {
+    error: {
+      code: 400,
+      message:
+        "The feature 'Instant sandboxes' is not supported in the declared launch stage " +
+        "on resource dsh-probe-ws. The launch stage annotation should be specified " +
+        "at least as BETA.",
+      status: "FAILED_PRECONDITION",
+    },
+  };
+
+  test("400 FAILED_PRECONDITION surfaces the API message, not 'request failed with status 400'", async () => {
+    const transport = new FakeTransport(async () => ({ status: 400, body: LIVE_LAUNCH_STAGE_ERROR }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const err = await client.create({ id: "ws-1" }).catch((e) => e);
+    expect(err).toBeInstanceOf(InstanceClientError);
+    expect((err as Error).message).toContain("Instant sandboxes");
+    expect((err as Error).message).toContain("FAILED_PRECONDITION");
+    expect((err as Error).message).not.toBe("request failed with status 400");
+  });
+
+  test("403 PERMISSION_DENIED surfaces the API message", async () => {
+    const transport = new FakeTransport(async () => ({
+      status: 403,
+      body: {
+        error: {
+          code: 403,
+          message: "Permission 'run.instances.get' denied on resource 'x'.",
+          status: "PERMISSION_DENIED",
+        },
+      },
+    }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const err = await client.get("x").catch((e) => e);
+    expect(err).toBeInstanceOf(PermissionDeniedError);
+    expect((err as Error).message).toContain("Permission 'run.instances.get' denied");
+    expect((err as Error).message).toContain("PERMISSION_DENIED");
+  });
+
+  test("5xx INTERNAL surfaces the API message", async () => {
+    const transport = new FakeTransport(async () => ({
+      status: 500,
+      body: { error: { code: 13, message: "internal boom", status: "INTERNAL" } },
+    }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const err = await client.get("x").catch((e) => e);
+    expect(err).toBeInstanceOf(InstanceClientError);
+    expect((err as InstanceClientError).status).toBe(500);
+    expect((err as Error).message).toContain("internal boom");
+    expect((err as Error).message).toContain("INTERNAL");
+  });
+
+  test("legacy top-level { message } bodies are still honored (older fakes)", async () => {
+    const transport = new FakeTransport(async () => ({ status: 500, body: { message: "legacy boom" } }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const err = await client.get("x").catch((e) => e);
+    expect(err).toBeInstanceOf(InstanceClientError);
+    expect((err as Error).message).toContain("legacy boom");
+  });
+
+  test("empty body falls back to the status-only message", async () => {
+    const transport = new FakeTransport(async () => ({ status: 503, body: undefined }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const err = await client.get("x").catch((e) => e);
+    expect(err).toBeInstanceOf(InstanceClientError);
+    expect((err as Error).message).toBe("request failed with status 503");
+  });
+
+  test("completed operation error carries its code", async () => {
+    const transport = new FakeTransport(async () => ({
+      status: 200,
+      body: {
+        name: `${basePath}/operations/op-1`,
+        done: true,
+        error: { code: 13, message: "internal boom" },
+      },
+    }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const err = await client.create({ id: "ws-1" }).catch((e) => e);
+    expect(err).toBeInstanceOf(InstanceClientError);
+    expect((err as Error).message).toContain("internal boom");
+    expect((err as Error).message).toContain("code: 13");
+  });
+});
+
+describe("cloud-run-instance-client launchStage (issue #53)", () => {
+  const basePath = "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1";
+  const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
+
+  interface TestConfig {
+    cpu: number;
+    memory: string;
+    restartPolicy: "on-failure" | "never" | "always";
+    sandboxLauncher: boolean;
+    port: number;
+    launchStage?: "ALPHA" | "BETA" | "GA";
+  }
+
+  async function createBodyWith(config?: TestConfig): Promise<Record<string, unknown>> {
+    const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, ...(config ? { config } : {}) });
+    await client.create({ id: "ws-1" });
+    return transport.lastRequest()!.body as Record<string, unknown>;
+  }
+
+  test("meetsSandboxLaunchStageRequirement ranks ALPHA < BETA <= GA", () => {
+    expect(meetsSandboxLaunchStageRequirement("ALPHA")).toBe(false);
+    expect(meetsSandboxLaunchStageRequirement("BETA")).toBe(true);
+    expect(meetsSandboxLaunchStageRequirement("GA")).toBe(true);
+  });
+
+  test("default config sends BETA", async () => {
+    const body = await createBodyWith();
+    expect(body["launchStage"]).toBe("BETA");
+  });
+
+  test("explicit launchStage override is honored", async () => {
+    const body = await createBodyWith({
+      cpu: 4,
+      memory: "8Gi",
+      restartPolicy: "on-failure",
+      sandboxLauncher: true,
+      port: 8080,
+      launchStage: "GA",
+    });
+    expect(body["launchStage"]).toBe("GA");
+  });
+
+  test("sandboxLauncher with a weaker stage is promoted to BETA", async () => {
+    const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
+    const client = new CloudRunInstanceClient({
+      transport,
+      basePath,
+      image: IMAGE,
+      config: {
+        cpu: 4,
+        memory: "8Gi",
+        restartPolicy: "on-failure",
+        sandboxLauncher: true,
+        port: 8080,
+        launchStage: "ALPHA",
+      },
+    });
+    // The constructor normalizes the config so the default path always works.
+    expect(client.getConfig().launchStage).toBe("BETA");
+    await client.create({ id: "ws-1" });
+    expect((transport.lastRequest()!.body as Record<string, unknown>)["launchStage"]).toBe("BETA");
+  });
+
+  test("no sandboxLauncher: explicit stage passes through untouched", async () => {
+    const body = await createBodyWith({
+      cpu: 4,
+      memory: "8Gi",
+      restartPolicy: "on-failure",
+      sandboxLauncher: false,
+      port: 8080,
+      launchStage: "GA",
+    });
+    expect(body["launchStage"]).toBe("GA");
+  });
+
+  test("live-API-like fake validates the body: missing launchStage is rejected", async () => {
+    // The #53 hole was a fake that never looked at the body, so a missing
+    // required field stayed green. This fake mimics the live API: it rejects
+    // creates whose launchStage is absent (or below BETA with sandbox set)
+    // with the real 400 FAILED_PRECONDITION shape.
+    const liveLike = new FakeTransport(async (req) => {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const containers = body["containers"] as Array<Record<string, unknown>> | undefined;
+      const sandbox = containers?.[0]?.["sandboxLauncher"] === true;
+      const stage = body["launchStage"];
+      const ok = stage === "BETA" || stage === "GA" || (!sandbox && typeof stage === "string");
+      if (!ok) {
+        return {
+          status: 400,
+          body: {
+            error: {
+              code: 400,
+              message:
+                "The feature 'Instant sandboxes' is not supported in the declared launch stage. " +
+                "The launch stage annotation should be specified at least as BETA.",
+              status: "FAILED_PRECONDITION",
+            },
+          },
+        };
+      }
+      return { status: 200, body: { done: false } };
+    });
+    const client = new CloudRunInstanceClient({ transport: liveLike, basePath, image: IMAGE });
+    // With the fix the create passes body validation (no 400).
+    await expect(client.create({ id: "ws-1" })).resolves.toMatchObject({ state: "PENDING" });
+    expect((liveLike.lastRequest()!.body as Record<string, unknown>)["launchStage"]).toBe("BETA");
+
+    // ...and the surfaced error preserves the API message when it does fail.
+    liveLike.setHandler(async () => ({
+      status: 400,
+      body: {
+        error: {
+          code: 400,
+          message: "The feature 'Instant sandboxes' is not supported in the declared launch stage.",
+          status: "FAILED_PRECONDITION",
+        },
+      },
+    }));
+    const err = await client.create({ id: "ws-2" }).catch((e) => e);
+    expect((err as Error).message).toContain("Instant sandboxes");
+  });
+});
+
 describe("cloud-run-instance-client container env", () => {
-  const basePath = "projects/test-proj/locations/us-central1";
+  const basePath = "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1";
   const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
 
   function createBodyOf(req: { body?: unknown }): Record<string, unknown> {
@@ -428,5 +682,94 @@ describe("cloud-run-instance-client container env", () => {
       { name: "DATABASE_URL", value: "postgresql://x" },
       { name: "WORKSPACE_ID", value: "ws-1" },
     ]);
+  });
+});
+
+describe("cloud-run-instance-client basePath contract (issue #47)", () => {
+  const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
+
+  test("DEFAULT_INSTANCES_API_BASE_URL is the production v2 origin", () => {
+    expect(DEFAULT_INSTANCES_API_BASE_URL).toBe("https://run.googleapis.com/v2");
+  });
+
+  test("buildInstancesBasePath assembles an absolute basePath", () => {
+    expect(
+      buildInstancesBasePath({
+        apiBaseUrl: "https://run.googleapis.com/v2",
+        projectId: "my-proj",
+        region: "asia-northeast1",
+      }),
+    ).toBe("https://run.googleapis.com/v2/projects/my-proj/locations/asia-northeast1");
+  });
+
+  test("buildInstancesBasePath tolerates a trailing slash on the origin", () => {
+    expect(
+      buildInstancesBasePath({
+        apiBaseUrl: "http://localhost:8080/v2/",
+        projectId: "p",
+        region: "r",
+      }),
+    ).toBe("http://localhost:8080/v2/projects/p/locations/r");
+  });
+
+  test("relative basePath is rejected in the constructor, before any request", () => {
+    const t = new FakeTransport();
+    expect(
+      () =>
+        new CloudRunInstanceClient({
+          transport: t,
+          basePath: "projects/p/locations/us-central1",
+        }),
+    ).toThrow(InvalidBasePathError);
+    expect(t.requests).toHaveLength(0);
+  });
+
+  test("rejection message names the absolute-URL contract", () => {
+    const t = new FakeTransport();
+    try {
+      new CloudRunInstanceClient({ transport: t, basePath: "projects/p/locations/r" });
+      expect.unreachable();
+    } catch (e) {
+      expect(e).toBeInstanceOf(InvalidBasePathError);
+      expect((e as Error).message).toContain("https://run.googleapis.com/v2");
+    }
+  });
+
+  test("empty and non-http(s) basePaths are rejected", () => {
+    for (const bad of ["", "   ", "ftp://example.com/v2/projects/p/locations/r"]) {
+      const t = new FakeTransport();
+      expect(() => new CloudRunInstanceClient({ transport: t, basePath: bad })).toThrow(
+        InvalidBasePathError,
+      );
+      expect(t.requests).toHaveLength(0);
+    }
+  });
+
+  test("http:// emulator origins are accepted", async () => {
+    const basePath = "http://localhost:8080/v2/projects/p/locations/r";
+    const transport = new FakeTransport(async () => ({
+      status: 200,
+      body: { name: "x", state: "READY" },
+    }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    await client.get("x");
+    expect(transport.lastRequest()!.url).toBe(`${basePath}/instances/x`);
+  });
+
+  test("absolute request URLs are fetchable (regression: relative URLs threw 'URL is invalid')", async () => {
+    const basePath =
+      "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1";
+    const transport = new FakeTransport(async () => ({
+      status: 200,
+      body: { name: "x", state: "READY" },
+    }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    await client.get("x");
+    const url = transport.lastRequest()!.url;
+    // Must survive the WHATWG URL parser that fetch() applies — the exact
+    // failure mode of the relative basePath in #47.
+    expect(() => new URL(url)).not.toThrow();
+    expect(new URL(url).protocol).toBe("https:");
+    expect(url).toBe(`${basePath}/instances/x`);
   });
 });

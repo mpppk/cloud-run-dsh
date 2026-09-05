@@ -85,6 +85,8 @@ describe("readControlPlaneConfig", () => {
     expect(config.databaseUrl).toBe("postgres://x");
     expect(config.gcpProjectId).toBe("test-proj");
     expect(config.gcpRegion).toBe("test-region");
+    // Issue #47: production default is the absolute v2 origin.
+    expect(config.instancesApiBaseUrl).toBe("https://run.googleapis.com/v2");
     expect(config.agentHostImage).toBe("img");
     expect(config.agentHostServiceAccount).toBe("sa@test-proj.iam.gserviceaccount.com");
     expect(config.checkpointBucket).toBe("bucket");
@@ -155,6 +157,29 @@ describe("readControlPlaneConfig", () => {
     expect(() => readControlPlaneConfig({ ...fullEnv(), PORT: "70000" })).toThrow(
       /invalid PORT/,
     );
+  });
+
+  test("INSTANCES_API_BASE_URL defaults to production, honors overrides, rejects relative (issue #47)", () => {
+    expect(readControlPlaneConfig(fullEnv()).instancesApiBaseUrl).toBe(
+      "https://run.googleapis.com/v2",
+    );
+    expect(
+      readControlPlaneConfig({ ...fullEnv(), INSTANCES_API_BASE_URL: "http://localhost:8080/v2" })
+        .instancesApiBaseUrl,
+    ).toBe("http://localhost:8080/v2");
+    // Blank means "unset" — same rule as the LLM overrides.
+    expect(
+      readControlPlaneConfig({ ...fullEnv(), INSTANCES_API_BASE_URL: "   " }).instancesApiBaseUrl,
+    ).toBe("https://run.googleapis.com/v2");
+    expect(() =>
+      readControlPlaneConfig({
+        ...fullEnv(),
+        INSTANCES_API_BASE_URL: "projects/test-proj/locations/test-region",
+      }),
+    ).toThrow(/invalid INSTANCES_API_BASE_URL/);
+    expect(() =>
+      readControlPlaneConfig({ ...fullEnv(), INSTANCES_API_BASE_URL: "ftp://example.com/v2" }),
+    ).toThrow(/invalid INSTANCES_API_BASE_URL/);
   });
 });
 
@@ -471,11 +496,11 @@ describe("createAuthenticatedInstanceTransport", () => {
     );
     const res = await transport.request({
       method: "POST",
-      url: "projects/p/locations/r/instances/i:start",
+      url: "https://run.googleapis.com/v2/projects/p/locations/r/instances/i:start",
       headers: { "content-type": "application/json" },
       body: {},
     });
-    expect(seenUrl).toBe("projects/p/locations/r/instances/i:start");
+    expect(seenUrl).toBe("https://run.googleapis.com/v2/projects/p/locations/r/instances/i:start");
     const headers = seenInit.headers as Record<string, string>;
     expect(headers["Authorization"]).toBe("Bearer tok-123");
     expect(seenInit.body).toBe("{}");

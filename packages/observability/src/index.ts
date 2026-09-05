@@ -83,7 +83,10 @@ const SECRET_ASSIGNMENT_RE =
  * identifiers, so candidates matching an identifier shape mechanically
  * distinguishable from secrets are excluded:
  * - strict PascalCase (`RuntimeNotWiredError` survives),
- * - lowercase snake_case (event names survive).
+ * - lowercase snake_case (event names survive),
+ * - RFC 4122 UUIDs (`d7383605-d479-47f9-bfef-8d62f82b729c` survives — spec
+ *   section 25 correlation keys are `crypto.randomUUID()` v4 values, and
+ *   `instance_name` is `dsh-<uuid>`; see UUID_RE / UUID_FIND_RE).
  * Hex-only 40 / 64 char candidates (commit SHAs vs. `secrets.token_hex`
  * output — informationally indistinguishable by shape) are NOT excluded
  * unconditionally; they go through context-limited SHA rescue instead (see
@@ -113,6 +116,22 @@ const STRICT_PASCAL_CASE_RE = /^[A-Z][a-z]+([A-Z][a-z0-9]+)+$/;
 const COMMIT_SHA_RE = /^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$/;
 // Lowercase snake_case event names: my_event_name_with_long_description.
 const SNAKE_CASE_RE = /^[a-z][a-z0-9]*(_[a-z0-9]+)+$/;
+// RFC 4122 UUIDs (spec section 25 correlation keys: workspace_id, session_id,
+// sandbox_id, tool_call_id, controller_id, process_id, and `dsh-<uuid>`
+// instance names — all `crypto.randomUUID()` v4 in this codebase).
+// Strict on purpose (#51): exact 8-4-4-4-12 hex groups AND the version nibble
+// (1-8) AND the variant nibble (8/9/a/b). A loose `[0-9a-f-]{36}` would let a
+// hyphenated hex secret through; the version+variant check cuts that accident
+// space ~8x while matching every real v4 ID this project emits.
+// UUID_FIND_RE is the non-anchored twin for UUIDs embedded in longer tokens
+// (e.g. `dsh-<uuid>` is ONE 40-char token to HIGH_ENTROPY_TOKEN_RE because
+// `-` is in its character class). Hex-run boundaries keep `<uuid>deadbeef`
+// (UUID glued to more hex — not a valid identifier) on the redaction path:
+// the UUID must not be part of a longer hex run.
+const UUID_SHAPE =
+  "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}";
+const UUID_RE = new RegExp(`^${UUID_SHAPE}$`);
+const UUID_FIND_RE = new RegExp(`(?<![0-9a-fA-F])${UUID_SHAPE}(?![0-9a-fA-F])`, "g");
 // Context-limited SHA rescue: a hex-40/64 candidate survives only when one of
 // these words appears within ±SHA_CONTEXT_RADIUS chars. Leak-averse default:
 // `{sha: "<hex>"}` (key name only, no nearby keyword in the string value) is
@@ -162,7 +181,18 @@ function redactString(input: string): string {
   // they survive only with a commit-ish word within ±SHA_CONTEXT_RADIUS
   // chars, otherwise they fall through to the entropy check (random hex has
   // 2 classes + entropy > 3.0, so it is redacted).
+  // #51: RFC 4122 UUIDs survive unconditionally (spec section 25 correlation
+  // keys are UUIDs — identifiers, not secrets). Composites like `dsh-<uuid>`
+  // survive when the non-UUID remainder is not itself secret-shaped; a
+  // high-entropy remainder (secret glued to a UUID) still redacts the token.
   out = out.replace(HIGH_ENTROPY_TOKEN_RE, (m, offset: number, full: string) => {
+    if (UUID_RE.test(m)) return m;
+    if (m.length > 36) {
+      // Single replace call (no stateful .test on the /g regex): a changed
+      // string means an embedded UUID was found.
+      const remainder = m.replace(UUID_FIND_RE, "");
+      if (remainder !== m && !isHighEntropyToken(remainder)) return m;
+    }
     if (COMMIT_SHA_RE.test(m)) {
       const start = Math.max(0, offset - SHA_CONTEXT_RADIUS);
       const end = Math.min(full.length, offset + m.length + SHA_CONTEXT_RADIUS);

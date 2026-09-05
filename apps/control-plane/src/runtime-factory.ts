@@ -40,6 +40,7 @@ import {
   CloudRunInstanceClient,
   InstanceAlreadyExistsError,
   InstanceNotFoundError,
+  buildInstancesBasePath,
 } from "@cloud-run-dsh/cloud-run-instance-client";
 import type {
   HttpTransport,
@@ -297,10 +298,25 @@ export function buildManualCheckpointFn(
 }
 
 /** Builds the production RuntimeRegistry. Validates the clock first (pitfall guard). */
+export function buildInstancesBasePathForConfig(
+  config: Pick<ControlPlaneConfig, "gcpProjectId" | "gcpRegion" | "instancesApiBaseUrl">,
+): string {
+  // Issue #47: the Instances API basePath MUST be absolute
+  // (https://run.googleapis.com/v2/projects/.../locations/...). A relative
+  // "projects/.../locations/..." makes fetch() throw "URL is invalid", so
+  // every open() failed. The origin+version stays configurable for
+  // tests/emulators; production default is https://run.googleapis.com/v2.
+  return buildInstancesBasePath({
+    apiBaseUrl: config.instancesApiBaseUrl,
+    projectId: config.gcpProjectId,
+    region: config.gcpRegion,
+  });
+}
+
 export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions): RuntimeRegistry {
   assertTwoMethodClock(opts.clock);
   const { config, repo, stateStore, clock } = opts;
-  const basePath = `projects/${config.gcpProjectId}/locations/${config.gcpRegion}`;
+  const basePath = buildInstancesBasePathForConfig(config);
   const checkpointStorage = new GcsCheckpointStorage(opts.gcsClient, config.checkpointBucket);
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const healthFetch: HealthFetch = opts.healthFetch ?? ((url: string) => fetch(url));
