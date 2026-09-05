@@ -36,3 +36,12 @@ infra/terraform/.terraform.tfstate.lock.info
 # logs
 *.log
 npm-debug.log*
+
+# secrets that must never be committed
+# A GitHub App private key was placed at the repository root twice (2026-09-04
+# and 2026-09-05), both times mode 644 and NOT ignored — one `git add -A` away
+# from being published. Keep keys outside the repo; this pattern is the net
+# that catches the mistake when they are not.
+*.pem
+*.p12
+*.key
