@@ -133,7 +133,7 @@ terraform -chdir=infra/terraform destroy
 | リソース | destroy 挙動 | 課金が止まる条件 |
 |---|---|---|
 | Cloud SQL (最大コスト) | 削除される (`deletion_protection = false`) | destroy 成功時 |
-| Cloud SQL ユーザー `dsh_app` | マイグレーション後は**削除失敗する** (テーブルがロールを参照。オープンな issue [#73](https://github.com/mpppk/cloud-run-dsh/issues/73)。2026-09-05 の撤収で実測) | 先に `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` してから destroy 再実行 (詳細は [deployment-runbook.md Step 8](deployment-runbook.md#step-8--teardown-stop-paying)) |
+| Cloud SQL ユーザー `dsh_app` | マイグレーション後は**削除失敗する** (テーブルがロールを参照。オープンな issue [#73](https://github.com/mpppk/cloud-run-dsh/issues/73)。2026-09-05 の撤収で実測) | 先に `DROP OWNED BY dsh_app;` してから destroy 再実行 (破壊的操作・撤収時のみ。詳細は [deployment-runbook.md Step 8](deployment-runbook.md#step-8--teardown-stop-paying)) |
 | GCS チェックポイントバケット | **空でないと削除失敗** | 上記スクリプト実行後 |
 | Service Networking peering | `deletion_policy = "ABANDON"` で**残る** | runbook Step 8.5 の手動削除 |
 | Cloud Run Instance (Pre-GA) | Terraform 管理外 | 手動 stop/delete (Step 8.1) |

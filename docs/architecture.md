@@ -532,8 +532,9 @@ curl -sS -H "Authorization: Bearer $TOK" "$BASE/instances"
 gcloud run services delete control-plane --region "$REGION" --quiet   # デプロイしていれば
 bun run teardown:empty-bucket -- --yes
 
-# マイグレーション済みなら、DB のオブジェクトを先に落とす（#73）
-#   psql "$DATABASE_URL" -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
+# マイグレーション済みなら、dsh_app が所有するオブジェクトを先に落とす（#73）。
+# 破壊的操作につき撤収時のみ実行すること（dsh_app 所有の全テーブル＝全マイグレーション済みデータが消える）。
+#   psql "$DATABASE_URL" -c 'DROP OWNED BY dsh_app;'
 
 terraform destroy -input=false -var-file=~/.dsh.tfvars
 # → Destroy complete!（2026-09-05 の実測は 2回目で 18 destroyed。
