@@ -16,6 +16,11 @@ export interface GcsClient {
  * Thin GCS-backed CheckpointStorage adapter: delegates to an injected
  * GcsClient for a fixed bucket (仕様書 section 7: Cloud Storage に
  * uncommitted workspace checkpoint を保存).
+ *
+ * Verified against a real GCS bucket in issue #26 (2026-09-05: put / head /
+ * get byte-equality and a bundle round-trip with no fakes). Stop-time tar.gz
+ * saving is out of scope here — it does not happen on the current stop path
+ * (issue #72).
  */
 export class GcsCheckpointStorage implements CheckpointStorage {
   constructor(

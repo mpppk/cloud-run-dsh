@@ -44,7 +44,13 @@ export class WorkspaceStateMachine {
 
   /**
    * Reloads the current state from the store (e.g. after another process
-   * changed it). Throws when the store state has diverged.
+   * changed it). Adopt-only: a diverged store state is taken over, never
+   * rejected — the issue #60 split-open handoff depends on this (a fresh
+   * agent-host starts at STOPPED and must adopt STARTING/RESTORING from the
+   * shared row). Divergence against a stale in-memory view is detected later
+   * by the compare-and-set in transition()/store.apply(), which throws
+   * IllegalTransitionError. Unknown workspaces (load() === null) keep the
+   * in-memory state.
    */
   async reload(): Promise<WorkspaceRuntimeState> {
     const persisted = await this.store.load(this.workspaceId);

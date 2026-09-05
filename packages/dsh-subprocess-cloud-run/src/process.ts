@@ -47,7 +47,7 @@ export function truncateOutput(
 ): string {
   const buf = Buffer.from(text, "utf-8");
   if (buf.length <= maxBytes) return text;
-  // Keep head + indicator + tail? For MVP keep head and append indicator.
+  // Keep the head and append an indicator (no tail: the head holds the actionable output).
   const truncated = buf.subarray(0, maxBytes).toString("utf-8");
   return truncated + `\n[truncated ${buf.length - maxBytes} bytes]`;
 }
