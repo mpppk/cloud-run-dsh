@@ -1,11 +1,14 @@
 import { describe, test, expect } from "bun:test";
 import {
+  CLOUD_SQL_MOUNT_PATH,
+  CLOUD_SQL_VOLUME_NAME,
   DEFAULT_INSTANCE_CONFIG,
   DEFAULT_INSTANCE_LAUNCH_STAGE,
   INSTANCE_PROFILES,
   AVAILABLE_PROFILES,
   DEFAULT_INSTANCES_API_BASE_URL,
   InvalidBasePathError,
+  MissingCloudSqlConnectionNameError,
   buildInstancesBasePath,
   configForProfile,
   meetsSandboxLaunchStageRequirement,
@@ -19,6 +22,14 @@ import {
   CloudRunInstanceClient,
 } from "./index.js";
 import { FakeTransport } from "./testing.js";
+
+/**
+ * Shared connection name for create-path tests (issue #56: `create()` fails
+ * fast without one, so every test that reaches the transport passes it —
+ * exactly like production, where the control plane always supplies
+ * CLOUD_SQL_CONNECTION_NAME).
+ */
+const TEST_CONNECTION_NAME = "test-proj:us-central1:test-pg";
 
 describe("cloud-run-instance-client config defaults", () => {
   test("DEFAULT_INSTANCE_CONFIG matches spec section 6", () => {
@@ -130,6 +141,7 @@ describe("cloud-run-instance-client request shapes", () => {
       transport,
       basePath,
       image: IMAGE,
+      cloudSqlConnectionName: TEST_CONNECTION_NAME,
       serviceAccount: "agent-host@test-proj.iam.gserviceaccount.com",
     });
 
@@ -168,7 +180,7 @@ describe("cloud-run-instance-client request shapes", () => {
 
   test("create does not send readOnly fields", async () => {
     const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await client.create({ id: "ws-1" });
     const body = transport.lastRequest()!.body as Record<string, unknown>;
     const readOnly = [
@@ -181,7 +193,7 @@ describe("cloud-run-instance-client request shapes", () => {
 
   test("create appends validateOnly=true when requested", async () => {
     const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await client.create({ id: "ws-1" }, { validateOnly: true });
     expect(transport.lastRequest()!.url).toBe(
       `${basePath}/instances?instanceId=dsh-ws-1&validateOnly=true`,
@@ -190,7 +202,7 @@ describe("cloud-run-instance-client request shapes", () => {
 
   test("create without validateOnly never sets the query parameter", async () => {
     const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await client.create({ id: "ws-1" });
     expect(transport.lastRequest()!.url).toBe(`${basePath}/instances?instanceId=dsh-ws-1`);
   });
@@ -204,7 +216,7 @@ describe("cloud-run-instance-client request shapes", () => {
 
   test("create uses explicit instanceName in the instanceId query param", async () => {
     const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await client.create({ id: "ws-123", instanceName: "my-instance" });
     const req = transport.lastRequest()!;
     expect(req.url).toBe(`${basePath}/instances?instanceId=my-instance`);
@@ -216,7 +228,7 @@ describe("cloud-run-instance-client request shapes", () => {
       status: 200,
       body: { name: "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1/operations/op-1", done: false },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     const info = await client.create({ id: "ws-1" });
     expect(info.name).toBe(`${basePath}/instances/dsh-ws-1`);
     expect(info.state).toBe("PENDING");
@@ -227,7 +239,7 @@ describe("cloud-run-instance-client request shapes", () => {
       status: 200,
       body: { name: "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1/operations/op-1", done: true, error: { code: 13, message: "internal boom" } },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await expect(client.create({ id: "ws-1" })).rejects.toThrow("internal boom");
   });
 
@@ -236,14 +248,14 @@ describe("cloud-run-instance-client request shapes", () => {
       status: 200,
       body: { name: "my-instance", state: "READY" },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     const info = await client.create({ id: "ws-1" });
     expect(info.name).toBe("my-instance");
   });
 
   test("start request shape", async () => {
     const transport = new FakeTransport(async () => ({ status: 200, body: {} }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await client.start("my-instance");
     const req = transport.lastRequest()!;
     expect(req.method).toBe("POST");
@@ -252,7 +264,7 @@ describe("cloud-run-instance-client request shapes", () => {
 
   test("stop request shape", async () => {
     const transport = new FakeTransport(async () => ({ status: 200, body: {} }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await client.stop("my-instance");
     const req = transport.lastRequest()!;
     expect(req.method).toBe("POST");
@@ -264,7 +276,7 @@ describe("cloud-run-instance-client request shapes", () => {
       status: 200,
       body: { name: "my-instance", state: "READY", url: "https://example.run.app" },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     const info = await client.get("my-instance");
     expect(info.name).toBe("my-instance");
     expect(info.state).toBe("READY");
@@ -275,7 +287,7 @@ describe("cloud-run-instance-client request shapes", () => {
 
   test("delete request shape", async () => {
     const transport = new FakeTransport(async () => ({ status: 200, body: {} }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await client.delete("my-instance");
     const req = transport.lastRequest()!;
     expect(req.method).toBe("DELETE");
@@ -287,7 +299,7 @@ describe("cloud-run-instance-client request shapes", () => {
       status: 200,
       body: { name: "x", state: "READY" },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await client.create({ id: "ws-1" });
     await client.get("x");
     await client.start("x");
@@ -310,7 +322,7 @@ describe("cloud-run-instance-client v2 response parsing", () => {
         urls: ["https://a.run.app", "https://b.run.app"],
       },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     const info = await client.get("my-instance");
     expect(info.state).toBe("READY");
     expect(info.url).toBe("https://a.run.app");
@@ -321,7 +333,7 @@ describe("cloud-run-instance-client v2 response parsing", () => {
       status: 200,
       body: { name: "x", terminalCondition: { state: "CONDITION_FAILED" } },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     expect((await client.get("x")).state).toBe("FAILED");
 
     transport.setHandler(async () => ({
@@ -333,7 +345,7 @@ describe("cloud-run-instance-client v2 response parsing", () => {
 
   test("get returns UNKNOWN when no state signal is present", async () => {
     const transport = new FakeTransport(async () => ({ status: 200, body: { name: "x" } }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     expect((await client.get("x")).state).toBe("UNKNOWN");
   });
 });
@@ -348,7 +360,7 @@ describe("cloud-run-instance-client error mapping", () => {
       status: 404,
       body: { error: { code: 404, message: "Requested entity was not found.", status: "NOT_FOUND" } },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await expect(client.get("missing")).rejects.toBeInstanceOf(InstanceNotFoundError);
     await expect(client.start("missing")).rejects.toBeInstanceOf(InstanceNotFoundError);
     await expect(client.stop("missing")).rejects.toBeInstanceOf(InstanceNotFoundError);
@@ -360,7 +372,7 @@ describe("cloud-run-instance-client error mapping", () => {
       status: 409,
       body: { error: { code: 409, message: "Requested entity already exists", status: "ALREADY_EXISTS" } },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await expect(client.create({ id: "ws-1" })).rejects.toBeInstanceOf(InstanceAlreadyExistsError);
   });
 
@@ -369,7 +381,7 @@ describe("cloud-run-instance-client error mapping", () => {
       status: 409,
       body: { error: { code: 409, message: "Requested entity already exists", status: "ALREADY_EXISTS" } },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     const err = await client.create({ id: "ws-1" }).catch((e) => e);
     expect(err).toBeInstanceOf(InstanceAlreadyExistsError);
     expect((err as Error).message).toContain("dsh-ws-1");
@@ -381,7 +393,7 @@ describe("cloud-run-instance-client error mapping", () => {
       status: 409,
       body: { error: { code: 409, message: "Requested entity already exists", status: "ALREADY_EXISTS" } },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     const err = await client.create({ id: "ws-1", instanceName: "my-instance" }).catch((e) => e);
     expect(err).toBeInstanceOf(InstanceAlreadyExistsError);
     expect((err as Error).message).toContain("my-instance");
@@ -390,7 +402,7 @@ describe("cloud-run-instance-client error mapping", () => {
 
   test("create 404 error message reports the instance name, not the workspace id", async () => {
     const transport = new FakeTransport(async () => ({ status: 404, body: {} }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     const err = await client.create({ id: "ws-1" }).catch((e) => e);
     expect(err).toBeInstanceOf(InstanceNotFoundError);
     expect((err as Error).message).toContain("dsh-ws-1");
@@ -407,7 +419,7 @@ describe("cloud-run-instance-client error mapping", () => {
         },
       },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await expect(client.get("x")).rejects.toBeInstanceOf(PermissionDeniedError);
   });
 
@@ -416,13 +428,13 @@ describe("cloud-run-instance-client error mapping", () => {
       status: 500,
       body: { error: { code: 13, message: "internal", status: "INTERNAL" } },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await expect(client.get("x")).rejects.toBeInstanceOf(InstanceClientError);
   });
 
   test("create 404 also maps correctly", async () => {
     const transport = new FakeTransport(async () => ({ status: 404, body: {} }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await expect(client.create({ id: "ws-1" })).rejects.toBeInstanceOf(InstanceNotFoundError);
   });
 });
@@ -447,7 +459,7 @@ describe("cloud-run-instance-client Google API error body (issue #53)", () => {
 
   test("400 FAILED_PRECONDITION surfaces the API message, not 'request failed with status 400'", async () => {
     const transport = new FakeTransport(async () => ({ status: 400, body: LIVE_LAUNCH_STAGE_ERROR }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     const err = await client.create({ id: "ws-1" }).catch((e) => e);
     expect(err).toBeInstanceOf(InstanceClientError);
     expect((err as Error).message).toContain("Instant sandboxes");
@@ -466,7 +478,7 @@ describe("cloud-run-instance-client Google API error body (issue #53)", () => {
         },
       },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     const err = await client.get("x").catch((e) => e);
     expect(err).toBeInstanceOf(PermissionDeniedError);
     expect((err as Error).message).toContain("Permission 'run.instances.get' denied");
@@ -478,7 +490,7 @@ describe("cloud-run-instance-client Google API error body (issue #53)", () => {
       status: 500,
       body: { error: { code: 13, message: "internal boom", status: "INTERNAL" } },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     const err = await client.get("x").catch((e) => e);
     expect(err).toBeInstanceOf(InstanceClientError);
     expect((err as InstanceClientError).status).toBe(500);
@@ -488,7 +500,7 @@ describe("cloud-run-instance-client Google API error body (issue #53)", () => {
 
   test("legacy top-level { message } bodies are still honored (older fakes)", async () => {
     const transport = new FakeTransport(async () => ({ status: 500, body: { message: "legacy boom" } }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     const err = await client.get("x").catch((e) => e);
     expect(err).toBeInstanceOf(InstanceClientError);
     expect((err as Error).message).toContain("legacy boom");
@@ -496,7 +508,7 @@ describe("cloud-run-instance-client Google API error body (issue #53)", () => {
 
   test("empty body falls back to the status-only message", async () => {
     const transport = new FakeTransport(async () => ({ status: 503, body: undefined }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     const err = await client.get("x").catch((e) => e);
     expect(err).toBeInstanceOf(InstanceClientError);
     expect((err as Error).message).toBe("request failed with status 503");
@@ -511,7 +523,7 @@ describe("cloud-run-instance-client Google API error body (issue #53)", () => {
         error: { code: 13, message: "internal boom" },
       },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     const err = await client.create({ id: "ws-1" }).catch((e) => e);
     expect(err).toBeInstanceOf(InstanceClientError);
     expect((err as Error).message).toContain("internal boom");
@@ -534,7 +546,7 @@ describe("cloud-run-instance-client launchStage (issue #53)", () => {
 
   async function createBodyWith(config?: TestConfig): Promise<Record<string, unknown>> {
     const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, ...(config ? { config } : {}) });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME, ...(config ? { config } : {}) });
     await client.create({ id: "ws-1" });
     return transport.lastRequest()!.body as Record<string, unknown>;
   }
@@ -568,6 +580,7 @@ describe("cloud-run-instance-client launchStage (issue #53)", () => {
       transport,
       basePath,
       image: IMAGE,
+      cloudSqlConnectionName: TEST_CONNECTION_NAME,
       config: {
         cpu: 4,
         memory: "8Gi",
@@ -622,7 +635,7 @@ describe("cloud-run-instance-client launchStage (issue #53)", () => {
       }
       return { status: 200, body: { done: false } };
     });
-    const client = new CloudRunInstanceClient({ transport: liveLike, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport: liveLike, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     // With the fix the create passes body validation (no 400).
     await expect(client.create({ id: "ws-1" })).resolves.toMatchObject({ state: "PENDING" });
     expect((liveLike.lastRequest()!.body as Record<string, unknown>)["launchStage"]).toBe("BETA");
@@ -643,6 +656,151 @@ describe("cloud-run-instance-client launchStage (issue #53)", () => {
   });
 });
 
+describe("cloud-run-instance-client cloudSqlInstance volume (issue #56)", () => {
+  const basePath = "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1";
+  const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
+  // Production-shaped connection name (<project>:<region>:<instance>).
+  const CONN = "test-proj:us-central1:dev-dsh-pg";
+
+  async function createBodyWithConn(conn?: string): Promise<Record<string, unknown>> {
+    const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
+    const client = new CloudRunInstanceClient({
+      transport,
+      basePath,
+      image: IMAGE,
+      ...(conn === undefined ? {} : { cloudSqlConnectionName: conn }),
+    });
+    await client.create({ id: "ws-1" });
+    return transport.lastRequest()!.body as Record<string, unknown>;
+  }
+
+  test("single source of truth: volume name mounts at /cloudsql", () => {
+    expect(CLOUD_SQL_VOLUME_NAME).toBe("cloudsql");
+    expect(CLOUD_SQL_MOUNT_PATH).toBe("/cloudsql");
+  });
+
+  test("create sends the cloudSqlInstance volume and its /cloudsql mount", async () => {
+    const body = await createBodyWithConn(CONN);
+    // Top-level volumes[] — object form validated against the live API with
+    // validateOnly=true on 2026-09-05 (a bare string is rejected).
+    expect(body["volumes"]).toEqual([
+      { name: "cloudsql", cloudSqlInstance: { instances: [CONN] } },
+    ]);
+    const containers = body["containers"] as Array<Record<string, unknown>>;
+    expect(containers).toHaveLength(1);
+    expect(containers[0]!["volumeMounts"]).toEqual([
+      { name: "cloudsql", mountPath: "/cloudsql" },
+    ]);
+  });
+
+  test("volumeMount name corresponds to the volumes[] entry", async () => {
+    const body = await createBodyWithConn(CONN);
+    const volumes = body["volumes"] as Array<Record<string, unknown>>;
+    const containers = body["containers"] as Array<Record<string, unknown>>;
+    const mounts = containers[0]!["volumeMounts"] as Array<Record<string, unknown>>;
+    const volumeNames = new Set(volumes.map((v) => v["name"]));
+    expect(mounts).toHaveLength(1);
+    // Every mount must resolve to a declared volume — a renamed-on-one-side
+    // body passes a shape check but the live API rejects it.
+    for (const mount of mounts) expect(volumeNames.has(mount["name"])).toBe(true);
+    // The socket directory the agent-host dials is mountPath/<connection-name>.
+    const instances = (volumes[0]!["cloudSqlInstance"] as Record<string, unknown>)[
+      "instances"
+    ] as Array<string>;
+    expect(`${mounts[0]!["mountPath"]}/${instances[0]}`).toBe(`/cloudsql/${CONN}`);
+  });
+
+  test("missing connection name fails create before any Instances API call", async () => {
+    for (const conn of [undefined, "", "   "]) {
+      const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
+      const client = new CloudRunInstanceClient({
+        transport,
+        basePath,
+        image: IMAGE,
+        ...(conn === undefined ? {} : { cloudSqlConnectionName: conn }),
+      });
+      const err = await client.create({ id: "ws-1" }).catch((e) => e);
+      expect(err).toBeInstanceOf(MissingCloudSqlConnectionNameError);
+      // Fail-before-create (#22 "never fake success", #41 precedent): no
+      // billable create was sent — without the volume the Instance would
+      // boot with no /cloudsql socket and crash-loop.
+      expect(transport.requests).toEqual([]);
+    }
+  });
+
+  test("missing-connection error names the fix, not the crash loop", async () => {
+    const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const err = (await client.create({ id: "ws-1" }).catch((e) => e)) as Error;
+    expect(err).toBeInstanceOf(MissingCloudSqlConnectionNameError);
+    expect(err.message).toContain("CLOUD_SQL_CONNECTION_NAME");
+    expect(err.message).toContain("sql_connection_name");
+  });
+
+  test("live-API-like fake validates the body: a volumeless create is rejected", async () => {
+    // The #56 hole was a fake that never looked at the body, so the missing
+    // volumes/volumeMounts stayed green. This fake mimics the live API: it
+    // rejects creates whose cloudSqlInstance volume (or its mount) is absent
+    // or inconsistent with the real 400 shape.
+    const liveLike = new FakeTransport(async (req) => {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const volumes = body["volumes"] as Array<Record<string, unknown>> | undefined;
+      const containers = body["containers"] as Array<Record<string, unknown>> | undefined;
+      const mounts = containers?.[0]?.["volumeMounts"] as Array<Record<string, unknown>> | undefined;
+      const volume = volumes?.find((v) => v["name"] === "cloudsql");
+      const instances = (volume?.["cloudSqlInstance"] as Record<string, unknown> | undefined)?.[
+        "instances"
+      ] as Array<string> | undefined;
+      const mount = mounts?.find((m) => m["mountPath"] === "/cloudsql");
+      const ok =
+        Array.isArray(instances) &&
+        instances.length > 0 &&
+        mount !== undefined &&
+        mount["name"] === volume?.["name"];
+      if (!ok) {
+        return {
+          status: 400,
+          body: {
+            error: {
+              code: 400,
+              message:
+                "The Cloud SQL socket is unreachable: create without a cloudSqlInstance " +
+                "volume mounted at /cloudsql leaves no socket for the agent-host to dial.",
+              status: "FAILED_PRECONDITION",
+            },
+          },
+        };
+      }
+      return { status: 200, body: { done: false } };
+    });
+    const client = new CloudRunInstanceClient({
+      transport: liveLike,
+      basePath,
+      image: IMAGE,
+      cloudSqlConnectionName: CONN,
+    });
+    // With the fix the create passes body validation (no 400).
+    await expect(client.create({ id: "ws-1" })).resolves.toMatchObject({ state: "PENDING" });
+    const sent = liveLike.lastRequest()!.body as Record<string, unknown>;
+    const sentInstances = (
+      (sent["volumes"] as Array<Record<string, unknown>>)[0]!["cloudSqlInstance"] as Record<
+        string,
+        unknown
+      >
+    )["instances"];
+    expect(sentInstances).toEqual([CONN]);
+
+    // ...and the fake itself bites on a volumeless body (proves the
+    // validation above is load-bearing, not vacuous).
+    const rejected = await liveLike.request({
+      method: "POST",
+      url: `${basePath}/instances?instanceId=dsh-probe`,
+      body: { containers: [{ image: IMAGE }] },
+    });
+    expect(rejected.status).toBe(400);
+  });
+});
+
 describe("cloud-run-instance-client container env", () => {
   const basePath = "https://run.googleapis.com/v2/projects/test-proj/locations/us-central1";
   const IMAGE = "us-docker.pkg.dev/test-proj/agent-host/agent-host:v1";
@@ -653,7 +811,7 @@ describe("cloud-run-instance-client container env", () => {
 
   test("no env option -> containers[0] carries no env key", async () => {
     const transport = new FakeTransport(async () => ({ status: 200, body: { done: false } }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await client.create({ id: "ws-1" });
     const containers = createBodyOf(transport.lastRequest()!)["containers"] as Array<
       Record<string, unknown>
@@ -667,6 +825,7 @@ describe("cloud-run-instance-client container env", () => {
       transport,
       basePath,
       image: IMAGE,
+      cloudSqlConnectionName: TEST_CONNECTION_NAME,
       env: {
         WORKSPACE_ID: "ws-1",
         CHECKPOINT_BUCKET: "bucket",
@@ -751,7 +910,7 @@ describe("cloud-run-instance-client basePath contract (issue #47)", () => {
       status: 200,
       body: { name: "x", state: "READY" },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await client.get("x");
     expect(transport.lastRequest()!.url).toBe(`${basePath}/instances/x`);
   });
@@ -763,7 +922,7 @@ describe("cloud-run-instance-client basePath contract (issue #47)", () => {
       status: 200,
       body: { name: "x", state: "READY" },
     }));
-    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE });
+    const client = new CloudRunInstanceClient({ transport, basePath, image: IMAGE, cloudSqlConnectionName: TEST_CONNECTION_NAME });
     await client.get("x");
     const url = transport.lastRequest()!.url;
     // Must survive the WHATWG URL parser that fetch() applies — the exact

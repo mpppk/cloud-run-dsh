@@ -16,6 +16,7 @@ import { SystemClock } from "./deps.js";
 import { SqlTransactionalStateStore } from "./prod-adapters.js";
 import type { ControlPlaneConfig } from "./config.js";
 import {
+  assertCloudSqlSocketConsistency,
   assertTwoMethodClock,
   buildInstanceEnv,
   buildInstancesBasePathForConfig,
@@ -41,6 +42,9 @@ function testConfig(): ControlPlaneConfig {
     githubAppPrivateKeyPem: "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n",
     // Distinctive sentinel: leak assertions below search for this exact value.
     openrouterApiKey: "sk-or-v1-test-sentinel-key-0001",
+    // Issue #56: must agree with the host= of agentHostDatabaseUrl above
+    // (/cloudsql/<connection-name>) — the consistency guard enforces it.
+    cloudSqlConnectionName: "test-proj:test-region:main",
   };
 }
 
@@ -189,6 +193,25 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     // Issue #41: the created Instance carries the LLM key (fail-before-create
     // companion tests below cover the missing-key path).
     expect(env["OPENROUTER_API_KEY"]).toBe("sk-or-v1-test-sentinel-key-0001");
+
+    // Issue #56: the created Instance carries the cloudSqlInstance volume
+    // mounted at /cloudsql — without it the agent-host crash-loops with
+    // ERR_POSTGRES_CONNECTION_REFUSED.
+    expect(body["volumes"]).toEqual([
+      {
+        name: "cloudsql",
+        cloudSqlInstance: { instances: ["test-proj:test-region:main"] },
+      },
+    ]);
+    expect(containers[0]!["volumeMounts"]).toEqual([
+      { name: "cloudsql", mountPath: "/cloudsql" },
+    ]);
+    // The socket the app dials (DATABASE_URL host=) is exactly the mounted
+    // volume's path: mountPath + the volume's connection name. (Parsed by
+    // hand: Bun's URL parser rejects socket DSNs — issue #42 — so the
+    // assertion splits the query string instead of new URL().)
+    const hostParam = env["DATABASE_URL"]!.split("?host=")[1]!.split("&")[0];
+    expect(decodeURIComponent(hostParam!)).toBe("/cloudsql/test-proj:test-region:main");
 
     // agent-host /healthz was polled at the instance URL from GET
     expect(h.healthCalls).toEqual(["https://dsh-ws-1.run.app/healthz"]);
@@ -637,5 +660,69 @@ describe("buildInstanceEnv — agent-host env contract", () => {
   test("defaultInstanceName honors an explicit instanceName, else dsh-<id>", () => {
     expect(defaultInstanceName({ id: "ws-1", instanceName: null })).toBe("dsh-ws-1");
     expect(defaultInstanceName({ id: "ws-1", instanceName: "custom" })).toBe("custom");
+  });
+});
+
+describe("assertCloudSqlSocketConsistency — issue #56 mount/DATABASE_URL contract", () => {
+  const SOCKET_URL =
+    "postgresql://dsh_app:pw@/dsh?host=/cloudsql/test-proj:test-region:main";
+  const CONN = "test-proj:test-region:main";
+
+  test("matching connection name and socket host passes", () => {
+    expect(() => assertCloudSqlSocketConsistency(SOCKET_URL, CONN)).not.toThrow();
+  });
+
+  test("mismatched connection name throws naming both sides, never the password", () => {
+    const secret = "s3cr3t-pw";
+    const url = `postgresql://dsh_app:${secret}@/dsh?host=/cloudsql/other-proj:r:other-pg`;
+    let message = "";
+    try {
+      assertCloudSqlSocketConsistency(url, CONN);
+      expect.unreachable("expected a consistency error for a mismatched host");
+    } catch (e) {
+      message = String(e);
+    }
+    expect(message).toContain("AGENT_HOST_DATABASE_URL");
+    expect(message).toContain("CLOUD_SQL_CONNECTION_NAME");
+    expect(message).toContain("/cloudsql/test-proj:test-region:main");
+    expect(message).not.toContain(secret);
+  });
+
+  test("blank connection name throws naming CLOUD_SQL_CONNECTION_NAME", () => {
+    for (const blank of ["", "   "]) {
+      expect(() => assertCloudSqlSocketConsistency(SOCKET_URL, blank)).toThrow(
+        /CLOUD_SQL_CONNECTION_NAME/,
+      );
+    }
+  });
+
+  test("non-socket (TCP / host-less) DATABASE_URL throws instead of building a doomed Instance", () => {
+    for (const url of ["postgres://dsh_app:pw@localhost:5432/dsh", "postgresql://x"]) {
+      expect(() => assertCloudSqlSocketConsistency(url, CONN)).toThrow(
+        /AGENT_HOST_DATABASE_URL/,
+      );
+    }
+  });
+
+  test("registry get() with a mismatched host rejects without touching the Instances API", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
+    const registry = makeRegistry(h, {
+      cloudSqlConnectionName: "other-proj:other-region:other-pg",
+    });
+    // Same timing as the #41 OPENROUTER_API_KEY guard: handle creation fails
+    // before open(), before any GET/create/start.
+    await expect(registry.get(workspace)).rejects.toThrow(/CLOUD_SQL_CONNECTION_NAME/);
+    expect(h.transport.requests).toEqual([]);
+  });
+
+  test("registry get() with a blank connection name rejects without touching the Instances API", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
+    const registry = makeRegistry(h, { cloudSqlConnectionName: "   " });
+    await expect(registry.get(workspace)).rejects.toThrow(/CLOUD_SQL_CONNECTION_NAME/);
+    expect(h.transport.requests).toEqual([]);
   });
 });

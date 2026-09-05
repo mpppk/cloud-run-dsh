@@ -34,6 +34,7 @@ function fullEnv(): Record<string, string> {
     GITHUB_APP_ID: "123",
     GITHUB_APP_PRIVATE_KEY_PEM: "pem",
     OPENROUTER_API_KEY: "sk-or-v1-test",
+    CLOUD_SQL_CONNECTION_NAME: "test-proj:test-region:test-pg",
   };
 }
 
@@ -59,6 +60,7 @@ describe("readControlPlaneConfig", () => {
       "GITHUB_APP_ID",
       "GITHUB_APP_PRIVATE_KEY_PEM",
       "OPENROUTER_API_KEY",
+      "CLOUD_SQL_CONNECTION_NAME",
     ];
     for (const key of required) {
       const env = fullEnv();
@@ -94,6 +96,8 @@ describe("readControlPlaneConfig", () => {
     expect(config.githubAppId).toBe("123");
     expect(config.githubAppPrivateKeyPem).toBe("pem");
     expect(config.openrouterApiKey).toBe("sk-or-v1-test");
+    // Issue #56: the volume's connection name travels as its own required key.
+    expect(config.cloudSqlConnectionName).toBe("test-proj:test-region:test-pg");
     // Optional LLM overrides default to "agent-host decides".
     expect(config.llmBaseUrl).toBeUndefined();
     expect(config.llmModel).toBeUndefined();

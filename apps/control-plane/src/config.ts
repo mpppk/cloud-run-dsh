@@ -41,6 +41,13 @@ const REQUIRED_ENV_KEYS = [
   // so a missing key fails control-plane boot — long before any Instance is
   // created — instead of failing the first turn inside the Instance.
   "OPENROUTER_API_KEY",
+  // Issue #56: the Cloud SQL connection name (<project>:<region>:<instance>,
+  // the `sql_connection_name` Terraform output) for the `cloudSqlInstance`
+  // volume the control plane attaches to every Instance it creates. Required
+  // so a missing name fails control-plane boot — long before any Instance is
+  // created — instead of billing a crash loop of Instances with no /cloudsql
+  // socket (ERR_POSTGRES_CONNECTION_REFUSED, restartPolicy ON_FAILURE).
+  "CLOUD_SQL_CONNECTION_NAME",
 ] as const;
 
 export type RequiredEnvKey = (typeof REQUIRED_ENV_KEYS)[number];
@@ -100,6 +107,16 @@ export interface ControlPlaneConfig {
    */
   readonly openrouterApiKey: string;
   /**
+   * Cloud SQL connection name (`<project>:<region>:<instance>`, the
+   * `sql_connection_name` Terraform output) for the `cloudSqlInstance` volume
+   * attached to every created Instance (issue #56 — the Instance's only path
+   * to Cloud SQL, mounted at /cloudsql). Not a secret (it also appears inside
+   * the socket-form `agentHostDatabaseUrl`), but it MUST agree with that URL's
+   * `host=` parameter — the factory refuses to build a client when they
+   * disagree, so changing one without the other fails before any create.
+   */
+  readonly cloudSqlConnectionName: string;
+  /**
    * Optional agent-host LLM overrides, passed through to created Instances
    * ONLY when set (issue #41). Unset means "defer to the agent-host
    * defaults" (LLM_BASE_URL https://openrouter.ai/api/v1,
@@ -143,6 +160,7 @@ export function readControlPlaneConfig(
     // from Secret Manager mounts are harmless for the broker.
     githubAppPrivateKeyPem: env["GITHUB_APP_PRIVATE_KEY_PEM"]!,
     openrouterApiKey: env["OPENROUTER_API_KEY"]!.trim(),
+    cloudSqlConnectionName: env["CLOUD_SQL_CONNECTION_NAME"]!.trim(),
     ...readLlmOverrides(env),
   };
 }

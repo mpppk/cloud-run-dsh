@@ -359,9 +359,10 @@ cat > "$BODY" <<EOF
       { "name": "GCP_REGION", "value": "${REGION}" }
     ]
   }],
-  "volumes": [{ "name": "cloudsql", "cloudSqlInstance": "${SQL_CONNECTION}" }],
+  "volumes": [{ "name": "cloudsql", "cloudSqlInstance": { "instances": ["${SQL_CONNECTION}"] } }],
   "serviceAccount": "${SA_EMAIL}",
-  "restartPolicy": "ON_FAILURE"
+  "restartPolicy": "ON_FAILURE",
+  "launchStage": "BETA"
 }
 EOF
 
@@ -397,6 +398,9 @@ The v2 `GoogleCloudRunV2Instance` shape (verified against the live discovery doc
 | `containers[].sandboxLauncher` | lives **on the container**, not the instance |
 | `containers[].ports[].containerPort` | array of port objects |
 | `restartPolicy` | top-level; API enum `ON_FAILURE` / `NEVER` / `ALWAYS` (never `ALWAYS`, see §23) |
+| `launchStage` | top-level; `BETA` is required when `containers[].sandboxLauncher` is set — the API default rejects it with 400 `FAILED_PRECONDITION` (issue #53) |
+| `volumes[]` | top-level; `[{ "name": "cloudsql", "cloudSqlInstance": { "instances": ["<project>:<region>:<instance>"] } }]` — the Instance's **only** path to Cloud SQL, mounted at `/cloudsql` (issue #56). The object form is required (a bare connection-name string is rejected); the value comes from the `sql_connection_name` Terraform output |
+| `containers[].volumeMounts[]` | `[{ "name": "cloudsql", "mountPath": "/cloudsql" }]` — `name` must match the `volumes[]` entry, and `/cloudsql/<connection-name>` must match the `DATABASE_URL` `host=` (the control plane enforces both before any create, issue #56) |
 | `serviceAccount` | top-level instance field |
 | instance id | passed as the `?instanceId=` **query parameter**; the body `name` field is ignored in create |
 | readOnly fields | `name` (output), `createTime`, `uid`, `urls`, `terminalCondition`, etc. — never send these; the API rejects readOnly payloads |
@@ -452,7 +456,7 @@ export CP_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-host/control-plane
 #   cross-architecture host — type safety is enforced by CI and
 #   `bunx tsc --build` instead.)
 #  (the production entrypoint is apps/control-plane/src/main.ts; it requires
-#   the 10 env keys in the table below, respects PORT, and serves /healthz +
+#   the 11 env keys in the table below, respects PORT, and serves /healthz +
 #   /readyz — see apps/control-plane/README.md. The RuntimeRegistry is wired:
 #   POST /v1/workspaces/:id/open creates-or-starts the workspace Instance.)
 #
@@ -499,6 +503,7 @@ AGENT_HOST_IMAGE: "${IMAGE}"
 AGENT_HOST_SERVICE_ACCOUNT: "${SA_EMAIL}"
 CHECKPOINT_BUCKET: "${BUCKET}"
 AGENT_HOST_DATABASE_URL: "postgresql://dsh_app:${DB_PASSWORD_URLENC}@/dsh?host=/cloudsql/${SQL_CONNECTION}"
+CLOUD_SQL_CONNECTION_NAME: "${SQL_CONNECTION}"
 GITHUB_APP_ID: "${GH_APP_ID}"
 EOF
 

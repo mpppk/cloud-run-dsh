@@ -21,6 +21,7 @@ the two.
 | `GITHUB_APP_ID` | **yes** | — | GitHub App ID injected into created Instances. |
 | `GITHUB_APP_PRIVATE_KEY_PEM` | **yes** | — | GitHub App private key PEM injected into created Instances. Prefer `--set-secrets` at deploy time so it never touches shell history. |
 | `OPENROUTER_API_KEY` | **yes** | — | OpenRouter API key injected into created Instances as `OPENROUTER_API_KEY` (issue #41 — the agent-host resolves it per LLM request via its default `LLM_API_KEY_ENV`). Without it the first turn dies with `MISSING_CREDENTIAL`, so it is required at boot: a missing key fails startup, never a turn. Same secret posture as the PEM — plain env value into Instances, never logged. Prefer `--set-secrets` at deploy time. |
+| `CLOUD_SQL_CONNECTION_NAME` | **yes** | — | Cloud SQL connection name (`<project>:<region>:<instance>`, Terraform output `sql_connection_name`) for the `cloudSqlInstance` volume attached to every created Instance (issue #56 — the Instance's only path to Cloud SQL, mounted at `/cloudsql`). Must agree with the `host=/cloudsql/<conn>` in `AGENT_HOST_DATABASE_URL` — the control plane refuses to build an Instance client when they disagree, before any create. |
 | `LLM_BASE_URL` | no | agent-host default (`https://openrouter.ai/api/v1`) | Passed through to created Instances only when set. |
 | `LLM_MODEL` | no | agent-host default (`deepseek/deepseek-v4-flash`) | Passed through to created Instances only when set. |
 | `LLM_APPROVAL_POLICY` | no | agent-host default (`ask`) | Passed through to created Instances only when set (`ask` or `never`; anything else fails startup). |
@@ -47,7 +48,7 @@ export DATABASE_URL=postgres://dsh:dsh@localhost:5432/dsh
 bun run db:migrate
 
 # run the container against the compose Postgres.
-# NOTE: the production entrypoint requires all 10 env keys in the table above
+# NOTE: the production entrypoint requires all 11 env keys in the table above
 # (it fails fast with MissingRequiredEnvError otherwise). For a bare
 # liveness probe, dummy values for the GCP/agent-host keys suffice — but
 # open/stop will then fail against the fake project. Real values come from
@@ -56,7 +57,8 @@ docker run --rm -p 8080:8080 \
   -e DATABASE_URL="postgres://dsh:dsh@host.docker.internal:5432/dsh" \
   -e GCP_PROJECT_ID="demo" -e GCP_REGION="demo-region" \
   -e AGENT_HOST_IMAGE="demo-image" -e AGENT_HOST_SERVICE_ACCOUNT="demo-sa" \
-  -e CHECKPOINT_BUCKET="demo-bucket" -e AGENT_HOST_DATABASE_URL="postgres://demo" \
+  -e CHECKPOINT_BUCKET="demo-bucket" -e AGENT_HOST_DATABASE_URL="postgres://demo@/dsh?host=/cloudsql/demo:demo:demo" \
+  -e CLOUD_SQL_CONNECTION_NAME="demo:demo:demo" \
   -e GITHUB_APP_ID="0" -e GITHUB_APP_PRIVATE_KEY_PEM="demo-pem" \
   -e OPENROUTER_API_KEY="demo-key" \
   control-plane

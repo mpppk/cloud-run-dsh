@@ -21,6 +21,8 @@
 #   CHECKPOINT_BUCKET           — GCS checkpoint bucket (REQUIRED)
 #   AGENT_HOST_DATABASE_URL     — DB URL injected into Instances, Cloud SQL
 #                                 socket form (REQUIRED)
+#   CLOUD_SQL_CONNECTION_NAME   — Cloud SQL connection name for the
+#                                 cloudSqlInstance volume (REQUIRED, issue #56)
 #   GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY_PEM — injected into Instances (REQUIRED)
 # See apps/control-plane/README.md for the full contract.
 
