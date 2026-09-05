@@ -47,6 +47,7 @@ COPY packages/cloud-run-instance-client/package.json packages/cloud-run-instance
 COPY packages/cloud-run-sandbox/package.json packages/cloud-run-sandbox/package.json
 COPY packages/controller-lease/package.json packages/controller-lease/package.json
 COPY packages/dsh-subprocess-cloud-run/package.json packages/dsh-subprocess-cloud-run/package.json
+COPY packages/gcp-token-provider/package.json packages/gcp-token-provider/package.json
 COPY packages/github-credential-broker/package.json packages/github-credential-broker/package.json
 COPY packages/observability/package.json packages/observability/package.json
 COPY packages/session-persistence-postgres/package.json packages/session-persistence-postgres/package.json
