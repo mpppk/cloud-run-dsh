@@ -483,7 +483,8 @@ describe("observability", () => {
   });
 
   // -----------------------------------------------------------------------
-  // Error IDs for 500 correlation (issue #48; 16hex is a #51 workaround)
+  // Error IDs for 500 correlation (issue #48; 16hex originated as a #51
+  // workaround, retained as-is after #51/PR #54)
   // -----------------------------------------------------------------------
 
   test("i48: newErrorId is 16 lowercase hex (ERROR_ID_RE, single source of truth)", () => {
@@ -497,7 +498,7 @@ describe("observability", () => {
     expect(ids.size).toBe(25);
   });
 
-  test("i48: newErrorId survives the redactor verbatim (the #51 workaround works)", () => {
+  test("i48: newErrorId survives the redactor verbatim (16hex retained after #51/PR #54)", () => {
     // Bare, embedded in free text, and under the real log field name —
     // the log line carrying the errorId must keep it readable.
     for (let i = 0; i < 25; i++) {

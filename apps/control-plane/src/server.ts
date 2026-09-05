@@ -130,8 +130,10 @@ export function toErrorResponse(e: unknown, opts: ToErrorResponseOptions = {}): 
   }
   // Unexpected errors -> generic 500 with no internals (仕様書 §26; see the
   // MINOR-2 note on toErrorResponse — item 7 is NOT the 500 rule).
-  // 16hex newErrorId (not a UUID) so the ID survives the entropy redactor in
-  // the log — WORKAROUND for issue #51 (see newErrorId). Revisit when #51 is fixed.
+  // 16hex newErrorId (not a UUID). History: this was a WORKAROUND for issue
+  // #51 (see newErrorId) — #51 is resolved since PR #54 (UUIDs now survive
+  // redaction). 16hex is retained as-is (compact, tested via ERROR_ID_RE);
+  // a follow-up may switch back to UUIDs.
   const errorId = newErrorId();
   opts.logger?.error("http.unexpected_error", {
     errorId,
