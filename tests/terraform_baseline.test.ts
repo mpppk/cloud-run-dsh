@@ -172,6 +172,30 @@ describe("content checks", () => {
     expect(c).toContain("control_plane_bucket_legacy_reader");
   });
 
+  test("iam.tf grants artifactregistry.reader repo-scoped to the Instance runtime SA (#58)", () => {
+    const c = tfContents["iam.tf"];
+    // Repository-scoped binding — project-wide would over-grant.
+    expect(c).toContain("google_artifact_registry_repository_iam_member");
+    // Anchor on the assignment line itself: a bare toContain("roles/...reader")
+    // also matches comments (the false-green seen before).
+    expect(c).toMatch(/^\s*role\s*=\s*"roles\/artifactregistry\.reader"\s*$/m);
+    // Wired to the agent-host repository resource, not a literal string.
+    expect(c).toMatch(/repository\s*=\s*google_artifact_registry_repository\.agent_host\./);
+    // Bound to the runtime execution SA that pulls the image at startup.
+    expect(c).toMatch(/member\s*=\s*"serviceAccount:\$\{google_service_account\.agent_host\.email\}"/);
+    // Exactly one AR binding: control-plane only passes the image URI string
+    // in the create request and never calls the AR API, so it gets nothing.
+    const arBlocks = [
+      ...c.matchAll(/resource "google_artifact_registry_repository_iam_member" "[^"]+" \{[\s\S]*?\n\}/g),
+    ];
+    expect(arBlocks.length).toBe(1);
+    // No project-wide AR grants for either runtime SA.
+    const projectAr = [
+      ...c.matchAll(/resource "google_project_iam_member" "[^"]+" \{[\s\S]*?\n\}/g),
+    ].filter((b) => b[0].includes("roles/artifactregistry."));
+    expect(projectAr.length).toBe(0);
+  });
+
   test("AI-agent operator stays within least-privilege guardrails", () => {
     // No service-account keys anywhere in the baseline (all .tf files, not just iam.tf)
     expect(allTf).not.toContain("google_service_account_key");
