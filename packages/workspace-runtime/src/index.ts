@@ -20,6 +20,8 @@ export { InMemoryTransactionalStore } from "./store.js";
 
 export { WorkspaceStateMachine } from "./machine.js";
 
+export { AGENT_HOST_HEALTH_PATH } from "./health-path.js";
+
 export {
   IDLE_TIMEOUT_MS,
   isMeaningfulActivity,

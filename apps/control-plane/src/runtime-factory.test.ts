@@ -2,9 +2,10 @@
 // No real GCP: the Instances API is a FakeTransport (imported via the
 // package's `./testing` entrypoint), the DB is the shared InMemoryFakeExecutor
 // (via its `./testing` entrypoint), GCS is an in-memory GcsClient, and the
-// agent-host /healthz is a stubbed HealthFetch.
+// agent-host readiness endpoint is a stubbed HealthFetch.
 
 import { describe, expect, test } from "bun:test";
+import { AGENT_HOST_HEALTH_PATH } from "@cloud-run-dsh/workspace-runtime";
 import { FakeTransport } from "@cloud-run-dsh/cloud-run-instance-client/testing";
 import {
   PostgresSessionPersistenceRepository,
@@ -27,6 +28,8 @@ import {
   buildInstancesBasePathForConfig,
   createProductionRuntimeRegistry,
   defaultInstanceName,
+  healthPollAudience,
+  summarizeHealthFailure,
   type HealthFetch,
 } from "./runtime-factory.js";
 
@@ -85,7 +88,7 @@ function makeHarness(): Harness {
   const healthCalls: string[] = [];
   const healthFetch: HealthFetch = async (url: string) => {
     healthCalls.push(url);
-    return { ok: true, status: 200 };
+    return { ok: true, status: 200, text: async () => JSON.stringify({ status: "READY" }) };
   };
   return { repo, executor, transport, gcs, healthFetch, healthCalls };
 }
@@ -265,8 +268,9 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     const hostParam = env["DATABASE_URL"]!.split("?host=")[1]!.split("&")[0];
     expect(decodeURIComponent(hostParam!)).toBe("/cloudsql/test-proj:test-region:main");
 
-    // agent-host /healthz was polled at the instance URL from GET
-    expect(h.healthCalls).toEqual(["https://dsh-ws-1.run.app/healthz"]);
+    // agent-host readiness was polled at the instance URL from GET, on the
+    // shared AGENT_HOST_HEALTH_PATH (issue #68 — never /healthz)
+    expect(h.healthCalls).toEqual([`https://dsh-ws-1.run.app${AGENT_HOST_HEALTH_PATH}`]);
 
     // durable row carries the name + URL for #22
     const row = await h.repo.getWorkspace("ws-1");
@@ -404,7 +408,7 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     });
     const unhealthy: HealthFetch = async (url: string) => {
       h.healthCalls.push(url);
-      return { ok: false, status: 503 };
+      return { ok: false, status: 503, text: async () => JSON.stringify({ status: "RESTORING" }) };
     };
     const registry = createProductionRuntimeRegistry({
       config: testConfig(),
@@ -423,10 +427,223 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     expect(handle.getState()).toBe("RESTORE_FAILED");
   });
 
+  test("issue #68: unhealthy answers surface status + body in the timeout error", async () => {
+    // Cause 3: the old `catch {}` + status-only error hid whether the host
+    // was unreachable, unauthenticated, or just still restoring. The last
+    // attempt's reason must travel with the timeout error.
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(async (req) => {
+      if (req.method === "GET") {
+        return { status: 200, body: instanceBody("dsh-ws-1", "https://dsh-ws-1.run.app") };
+      }
+      return { status: 200, body: {} };
+    });
+    const restoring: HealthFetch = async () => ({
+      ok: false,
+      status: 503,
+      text: async () => JSON.stringify({ status: "RESTORING", workspaceId: "ws-1" }),
+    });
+    const registry = createProductionRuntimeRegistry({
+      config: testConfig(),
+      repo: h.repo,
+      stateStore: new SqlTransactionalStateStore(h.executor),
+      clock: new SystemClock(),
+      instanceTransport: h.transport,
+      gcsClient: h.gcs,
+      healthFetch: restoring,
+      instancePoll: { maxAttempts: 2, intervalMs: 0 },
+      agentHealthPoll: { maxAttempts: 2, intervalMs: 0 },
+      sleep: async () => {},
+    });
+    const handle = await registry.get(workspace);
+    const err = await handle.open().then(
+      (): Error | null => null,
+      (e: unknown) => e as Error,
+    );
+    expect(err).not.toBeNull();
+    expect(err!.message).toMatch(/never became healthy/);
+    expect(err!.message).toMatch(/Last failure: HTTP 503/);
+    expect(err!.message).toContain("RESTORING");
+  });
+
+  test("issue #68: thrown poll failures (unreachable host) surface in the timeout error", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(async (req) => {
+      if (req.method === "GET") {
+        return { status: 200, body: instanceBody("dsh-ws-1", "https://dsh-ws-1.run.app") };
+      }
+      return { status: 200, body: {} };
+    });
+    const unreachable: HealthFetch = async () => {
+      throw new Error("connection refused");
+    };
+    const registry = createProductionRuntimeRegistry({
+      config: testConfig(),
+      repo: h.repo,
+      stateStore: new SqlTransactionalStateStore(h.executor),
+      clock: new SystemClock(),
+      instanceTransport: h.transport,
+      gcsClient: h.gcs,
+      healthFetch: unreachable,
+      instancePoll: { maxAttempts: 2, intervalMs: 0 },
+      agentHealthPoll: { maxAttempts: 2, intervalMs: 0 },
+      sleep: async () => {},
+    });
+    const handle = await registry.get(workspace);
+    await expect(handle.open()).rejects.toThrow(/Last failure: fetch failed: connection refused/);
+  });
+
+  test("issue #68: the failure summary redacts secrets instead of embedding the body raw", async () => {
+    // An error page could echo request details — the snippet goes through
+    // the observability redactor (SECRET_PATTERNS net).
+    const leaked = "upstream blew up: sk-or-v1-abcdefghij1234567890";
+    expect(summarizeHealthFailure(503, leaked)).not.toContain("sk-or-v1-abcdefghij1234567890");
+    expect(summarizeHealthFailure(503, leaked)).toContain("[REDACTED]");
+    expect(summarizeHealthFailure(503, leaked)).toContain("HTTP 503");
+    // ... and the redaction holds end to end through open().
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(async (req) => {
+      if (req.method === "GET") {
+        return { status: 200, body: instanceBody("dsh-ws-1", "https://dsh-ws-1.run.app") };
+      }
+      return { status: 200, body: {} };
+    });
+    const leaking: HealthFetch = async () => ({
+      ok: false,
+      status: 502,
+      text: async () => leaked,
+    });
+    const registry = createProductionRuntimeRegistry({
+      config: testConfig(),
+      repo: h.repo,
+      stateStore: new SqlTransactionalStateStore(h.executor),
+      clock: new SystemClock(),
+      instanceTransport: h.transport,
+      gcsClient: h.gcs,
+      healthFetch: leaking,
+      instancePoll: { maxAttempts: 2, intervalMs: 0 },
+      agentHealthPoll: { maxAttempts: 2, intervalMs: 0 },
+      sleep: async () => {},
+    });
+    const handle = await registry.get(workspace);
+    const err = await handle.open().then(
+      (): Error | null => null,
+      (e: unknown) => e as Error,
+    );
+    expect(err!.message).not.toContain("sk-or-v1-abcdefghij1234567890");
+    expect(err!.message).toContain("[REDACTED]");
+  });
+
+  test("issue #68: long bodies are truncated in the failure summary", async () => {
+    const body = `x: ${"y".repeat(500)}`;
+    const summary = summarizeHealthFailure(500, body);
+    expect(summary.length).toBeLessThan(body.length);
+    expect(summary).toContain("…");
+  });
+
+  test("healthPollAudience is the Instance origin (the #22 audience rule)", async () => {
+    expect(healthPollAudience("https://dsh-ws-1.run.app/readyz")).toBe("https://dsh-ws-1.run.app");
+    expect(healthPollAudience("https://dsh-ws-1.run.app/")).toBe("https://dsh-ws-1.run.app");
+  });
+
+  test("issue #68: the poll hits the shared path (never /healthz), even with a trailing-slash URL", async () => {
+    expect(AGENT_HOST_HEALTH_PATH).toBe("/readyz");
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app/"));
+    const registry = makeRegistry(h);
+    const handle = await registry.get(workspace);
+    await handle.open();
+    // No doubled slash, no /healthz: the exact URL the agent-host gateway serves.
+    expect(h.healthCalls).toEqual([`https://dsh-ws-1.run.app${AGENT_HOST_HEALTH_PATH}`]);
+  });
+
+  test("issue #68: the default poll mints an ID token for the Instance origin (cause 2)", async () => {
+    // No injected healthFetch: the production default must attach
+    // `Authorization: Bearer <ID token>` minted for the Instance URL —
+    // a bare fetch() 401s behind invoker IAM on every attempt.
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
+    const audiences: string[] = [];
+    const seen: { url: string; authorization: string | null }[] = [];
+    const fetchImpl = (async (url: unknown, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      seen.push({ url: String(url), authorization: headers.get("authorization") });
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ status: "READY" }),
+      };
+    }) as unknown as typeof fetch;
+    const registry = createProductionRuntimeRegistry({
+      config: testConfig(),
+      repo: h.repo,
+      stateStore: new SqlTransactionalStateStore(h.executor),
+      clock: new SystemClock(),
+      instanceTransport: h.transport,
+      gcsClient: h.gcs,
+      // The #22 provider shape, recording stub: audience must be the
+      // Instance origin (healthPollAudience rule, same as the forwarder).
+      idTokenProvider: async (audience: string) => {
+        audiences.push(audience);
+        return "test-id-token";
+      },
+      fetchImpl,
+      instancePoll: { maxAttempts: 3, intervalMs: 0 },
+      agentHealthPoll: { maxAttempts: 3, intervalMs: 0 },
+      sleep: async () => {},
+      controllerIdForWorkspace: () => "ctrl-1",
+    });
+    const handle = await registry.get(workspace);
+    await handle.open();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.url).toBe(`https://dsh-ws-1.run.app${AGENT_HOST_HEALTH_PATH}`);
+    expect(seen[0]!.authorization).toBe("Bearer test-id-token");
+    expect(audiences).toEqual(["https://dsh-ws-1.run.app"]);
+  });
+
+  test("issue #68: without a provider the default poll stays unauthenticated (local dev)", async () => {
+    // Off-GCP there is no metadata server and no invoker IAM: the default
+    // must still work, just without the Authorization header.
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
+    const seen: { authorization: string | null }[] = [];
+    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+      seen.push({ authorization: new Headers(init?.headers).get("authorization") });
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ status: "READY" }),
+      };
+    }) as unknown as typeof fetch;
+    const registry = createProductionRuntimeRegistry({
+      config: testConfig(),
+      repo: h.repo,
+      stateStore: new SqlTransactionalStateStore(h.executor),
+      clock: new SystemClock(),
+      instanceTransport: h.transport,
+      gcsClient: h.gcs,
+      fetchImpl,
+      instancePoll: { maxAttempts: 3, intervalMs: 0 },
+      agentHealthPoll: { maxAttempts: 3, intervalMs: 0 },
+      sleep: async () => {},
+      controllerIdForWorkspace: () => "ctrl-1",
+    });
+    const handle = await registry.get(workspace);
+    await handle.open();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.authorization).toBeNull();
+  });
+
   test("issue #63: agent-host restore failure surfaces the health error, not IllegalTransitionError", async () => {
     // Production split (issue #60) on the shared SQL row: the agent-host
     // fails git clone and commits RESTORE_FAILED while the control plane is
-    // still polling /healthz in STARTING. open() must reject with the health
+    // still polling the readiness endpoint in STARTING. open() must reject with the health
     // observation error — the old code replaced it with
     // "illegal state transition: STARTING -> RESTORE_FAILED", hiding the
     // real cause.
@@ -440,7 +657,7 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     const gatedUnhealthy: HealthFetch = async (url: string) => {
       h.healthCalls.push(url);
       await healthGate;
-      return { ok: false, status: 503 };
+      return { ok: false, status: 503, text: async () => JSON.stringify({ status: "RESTORING" }) };
     };
     const registry = createProductionRuntimeRegistry({
       config: testConfig(),

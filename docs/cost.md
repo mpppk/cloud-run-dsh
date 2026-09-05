@@ -35,7 +35,7 @@ terraform -chdir=infra/terraform apply -var-file=profiles/minimal.tfvars
   「low-cost test and development instances only」と公式に明記されている:
   https://cloud.google.com/sql/docs/postgres/instance-settings
 - 注意: 0.6 GiB RAM ではワークスペース実負荷は持たない想定。立ち上げ確認
-  (apply, マイグレーション, /healthz) 専用。OOM した場合は `db-g1-small`
+  (apply, マイグレーション, /livez) 専用。OOM した場合は `db-g1-small`
   (約 3 倍の単価) に上げて再確認すること。
 
 ## 月額概算 (asia-northeast1)

@@ -188,7 +188,7 @@ sequenceDiagram
 | `GET /v1/sessions/:id/events` | SSE ストリーム。seq カーソルで再生できる。 |
 | `POST /v1/sessions/:id/approvals/:approvalId` | 承認要求への応答。 |
 | `POST /v1/sessions/:id/cancel` | 実行中のターンを中断する。 |
-| `GET /healthz` · `/readyz` | ヘルスとレディネス。 |
+| `GET /livez` · `/readyz` | ライブネスとレディネス（issue #68: `/healthz` は Cloud Run が握るため使用しない）。 |
 
 ---
 

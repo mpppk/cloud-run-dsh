@@ -110,7 +110,7 @@ function main(): void {
   console.log(`[dev] control plane listening on ${url}`);
   console.log("[dev] IAP headers: x-goog-authenticated-user-id / x-goog-authenticated-user-email");
   console.log(`[dev] e.g. curl -H 'x-goog-authenticated-user-id: accounts.google.com:me' \\`);
-  console.log(`[dev]        -H 'x-goog-authenticated-user-email: me@example.com' ${url}/healthz`);
+  console.log(`[dev]        -H 'x-goog-authenticated-user-email: me@example.com' ${url}/livez`);
   console.log("[dev] See docs/local-development.md for a full walkthrough. Ctrl-C to stop.");
 
   process.on("SIGINT", () => {

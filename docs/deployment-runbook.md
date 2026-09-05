@@ -456,7 +456,7 @@ export CP_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-host/control-plane
 #   cross-architecture host — type safety is enforced by CI and
 #   `bunx tsc --build` instead.)
 #  (the production entrypoint is apps/control-plane/src/main.ts; it requires
-#   the 11 env keys in the table below, respects PORT, and serves /healthz +
+#   the 11 env keys in the table below, respects PORT, and serves /livez +
 #   /readyz — see apps/control-plane/README.md. The RuntimeRegistry is wired:
 #   POST /v1/workspaces/:id/open creates-or-starts the workspace Instance.)
 #
@@ -543,8 +543,9 @@ From a browser/session that goes through IAP:
 export DB_PASSWORD="$(gcloud secrets versions access latest --secret=db-password)"  # as in Step 4
 
 # 1. Control plane is alive (through the IAP-secured endpoint / LB URL).
-#    /healthz is served before the auth pipeline — no IAP headers needed here.
-curl -s "https://<control-plane-host>/healthz"
+#    /livez is served before the auth pipeline — no IAP headers needed here.
+#    (Never /healthz: Cloud Run reserves that exact path — issue #68.)
+curl -s "https://<control-plane-host>/livez"
 # → expect a 200 with the health payload
 
 # IAP injects BOTH headers below in front of Cloud Run; the API returns 401
@@ -594,7 +595,7 @@ PGPASSFILE="$PGPASSF" psql "postgresql://dsh_app@127.0.0.1:5433/dsh" \
 gcloud storage ls "gs://$(terraform -chdir=infra/terraform output -raw checkpoint_bucket_name)"
 ```
 
-Pass criteria: `/healthz` 200; workspace created (201, server-generated UUID `id`) + opened; an Instance exists for the workspace; the `workspaces` row shows the expected state; no 403 from IAP.
+Pass criteria: `/livez` 200; workspace created (201, server-generated UUID `id`) + opened; an Instance exists for the workspace; the `workspaces` row shows the expected state; no 403 from IAP.
 
 ---
 

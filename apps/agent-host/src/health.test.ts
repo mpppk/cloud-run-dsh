@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { IDLE_TIMEOUT_MS, IdleManager } from "@cloud-run-dsh/workspace-runtime";
-import { HealthService, healthzResponse } from "./health.js";
+import { HealthService, healthResponse } from "./health.js";
 import { FakeClock } from "./fakes.js";
 
 describe("HealthService", () => {
@@ -13,13 +13,13 @@ describe("HealthService", () => {
     expect(health.snapshot()).toEqual({ status: "READY", workspaceId: "ws-1" });
   });
 
-  test("healthz response is 200 only for READY", () => {
+  test("health response is 200 only for READY", () => {
     const health = new HealthService("ws-1");
-    expect(healthzResponse(health.snapshot()).status).toBe(503);
+    expect(healthResponse(health.snapshot()).status).toBe(503);
     health.setReady();
-    expect(healthzResponse(health.snapshot()).status).toBe(200);
+    expect(healthResponse(health.snapshot()).status).toBe(200);
     health.setRestoreFailed();
-    expect(healthzResponse(health.snapshot()).status).toBe(503);
+    expect(healthResponse(health.snapshot()).status).toBe(503);
   });
 });
 
