@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { InMemoryLogger } from "@cloud-run-dsh/observability";
 import { AGENT_HOST_HEALTH_PATH } from "@cloud-run-dsh/workspace-runtime";
 import { composeTestHost, seedWorkspace } from "./fakes.js";
+import { AgentGateway } from "./gateway.js";
 import type { AgentTurnInput, TurnStarter } from "./gateway.js";
 
 function request(
@@ -309,6 +310,132 @@ describe("AgentGateway", () => {
       }),
     );
     expect(res.status).toBe(500);
+  });
+});
+
+describe("lifecycle routes (issues #72/#75)", () => {
+  test("POST prepare-stop drains, checkpoints and stays STOPPING without stopping the instance", async () => {
+    const th = await gatewayWithReadyHost();
+    const res = await th.host.gateway.handle(request("POST", "/workspaces/ws-1/prepare-stop", IAP));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ prepared: true, state: "STOPPING" });
+    expect(th.host.runtime.getState()).toBe("STOPPING");
+    // The instance stop belongs to the control plane — the host never calls it.
+    expect(th.instance.calls).not.toContainEqual(expect.stringContaining("stop"));
+    // The sandbox was torn down and a checkpoint was attempted (clean tree:
+    // scheduler skips the write but still succeeds — the bathwater rule).
+    expect(th.sandboxRunner.recorded.some((argv) => argv.includes("delete"))).toBe(true);
+  });
+
+  test("prepare-stop is a lifecycle route, not agent input: no session, no starter, works while STOPPING-gated", async () => {
+    const th = await gatewayWithReadyHost();
+    // No sessionId in the path and no TurnStarter wired — still 200.
+    const res = await th.host.gateway.handle(request("POST", "/workspaces/ws-1/prepare-stop", IAP));
+    expect(res.status).toBe(200);
+    // A second call re-enters STOPPING instead of 409 (unfinished-stop retry).
+    const retry = await th.host.gateway.handle(
+      request("POST", "/workspaces/ws-1/prepare-stop", IAP),
+    );
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toMatchObject({ prepared: true, state: "STOPPING" });
+  });
+
+  test("prepare-stop keeps the gateway guards: 401 without identity, 403 on mismatch, 409 without lease, 405 on GET", async () => {
+    const th = await gatewayWithReadyHost();
+    expect(
+      (await th.host.gateway.handle(request("POST", "/workspaces/ws-1/prepare-stop"))).status,
+    ).toBe(401);
+    expect(
+      (await th.host.gateway.handle(request("POST", "/workspaces/other/prepare-stop", IAP)))
+        .status,
+    ).toBe(403);
+    expect(
+      (await th.host.gateway.handle(request("GET", "/workspaces/ws-1/prepare-stop", IAP)))
+        .status,
+    ).toBe(405);
+    await th.host.lease.release("ws-1", "ctrl-1");
+    const fenced = await th.host.gateway.handle(
+      request("POST", "/workspaces/ws-1/prepare-stop", IAP),
+    );
+    expect(fenced.status).toBe(409);
+    expect(await fenced.json()).toMatchObject({ error: "controller lease not held by this host" });
+  });
+
+  test("prepare-stop checkpoint failure -> 502 prepared:false with CHECKPOINT_FAILED (never 200)", async () => {
+    const th = await gatewayWithReadyHost();
+    // Sabotage AFTER recovery: git status now errors, so the lifecycle
+    // checkpoint fails and the caller must NOT stop the instance.
+    th.git.responses.set("status", { exitCode: 1, stdout: "", stderr: "disk gone" });
+    const res = await th.host.gateway.handle(
+      request("POST", "/workspaces/ws-1/prepare-stop", IAP),
+    );
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({ prepared: false, state: "CHECKPOINT_FAILED" });
+    expect(th.host.runtime.getState()).toBe("CHECKPOINT_FAILED");
+    expect(th.instance.calls).not.toContainEqual(expect.stringContaining("stop"));
+  });
+
+  test("POST checkpoint on a clean tree -> 200 checkpointed:true skipped:true (success, not a bug)", async () => {
+    const th = await gatewayWithReadyHost();
+    const keysBefore = th.storage.keys();
+    const res = await th.host.gateway.handle(request("POST", "/workspaces/ws-1/checkpoint", IAP));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      checkpointed: true,
+      skipped: true,
+      state: "READY",
+    });
+    // Nothing new to persist: no bundle written, runtime untouched.
+    expect(th.storage.keys()).toEqual(keysBefore);
+    expect(th.host.runtime.getState()).toBe("READY");
+  });
+
+  test("POST checkpoint on a dirty tree writes a real bundle -> 200 checkpointed:true skipped:false", async () => {
+    const th = await gatewayWithReadyHost();
+    th.git.responses.set("status", { exitCode: 0, stdout: " M notes.txt\n", stderr: "" });
+    const res = await th.host.gateway.handle(request("POST", "/workspaces/ws-1/checkpoint", IAP));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      checkpointed: true,
+      skipped: false,
+      state: "READY",
+    });
+    expect(th.storage.keys().length).toBeGreaterThan(0);
+  });
+
+  test("POST checkpoint failure -> 502 checkpointed:false (never a fake true)", async () => {
+    const th = await gatewayWithReadyHost();
+    th.git.responses.set("status", { exitCode: 1, stdout: "", stderr: "disk gone" });
+    const res = await th.host.gateway.handle(request("POST", "/workspaces/ws-1/checkpoint", IAP));
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({ checkpointed: false });
+  });
+
+  test("checkpoint without a wired trigger -> 503 with an explicit code (never a fake true)", async () => {
+    const th = await gatewayWithReadyHost();
+    const bare = new AgentGateway({
+      config: th.host.config,
+      health: th.host.health,
+      runtime: th.host.runtime,
+      lease: th.host.lease,
+      logger: th.host.logger,
+    });
+    const res = await bare.handle(request("POST", "/workspaces/ws-1/checkpoint", IAP));
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({
+      code: "checkpoint_not_implemented",
+      checkpointed: false,
+    });
+  });
+
+  test("checkpoint keeps the gateway guards: 401 without identity, 403 on mismatch", async () => {
+    const th = await gatewayWithReadyHost();
+    expect(
+      (await th.host.gateway.handle(request("POST", "/workspaces/ws-1/checkpoint"))).status,
+    ).toBe(401);
+    expect(
+      (await th.host.gateway.handle(request("POST", "/workspaces/other/checkpoint", IAP))).status,
+    ).toBe(403);
   });
 });
 

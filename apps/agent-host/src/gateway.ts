@@ -5,9 +5,9 @@
 // heartbeats and health checks never reset the idle timer (仕様書 section 11).
 
 import type { WorkspaceRuntime } from "@cloud-run-dsh/workspace-runtime";
-import { AgentInputRefusedError } from "@cloud-run-dsh/workspace-runtime";
+import { AgentInputRefusedError, InvalidOperationError } from "@cloud-run-dsh/workspace-runtime";
 import { AGENT_HOST_HEALTH_PATH } from "@cloud-run-dsh/workspace-runtime";
-import type { InvalidOperationError } from "@cloud-run-dsh/workspace-runtime";
+import type { LifecycleResult } from "@cloud-run-dsh/workspace-checkpoint";
 import type { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
 import type { Logger } from "@cloud-run-dsh/observability";
 import { describeError, newErrorId } from "@cloud-run-dsh/observability";
@@ -40,6 +40,19 @@ export interface AgentGatewayDeps {
    * turn never looks delivered. The control plane maps that to its 502.
    */
   readonly turnStarter?: TurnStarter;
+  /**
+   * Runs one lifecycle checkpoint (issue #72/#75 seam for the manual
+   * `checkpoint` route). Wired to the checkpoint scheduler's
+   * runLifecycleCheckpoint in production; the gateway runs it inside
+   * runtime.runCheckpoint() so a concurrent stop drains it instead of
+   * racing it, and the clean-tree skip surfaces as `skipped: true`
+   * (still success — the durable snapshot already covers the tree).
+   *
+   * When absent the gateway answers 503 (checkpoint_not_implemented) so a
+   * missing checkpoint never looks taken. The control plane maps that to
+   * its 502.
+   */
+  readonly manualCheckpoint?: () => Promise<LifecycleResult>;
 }
 
 /**
@@ -97,7 +110,7 @@ export type ApprovalDecision = "approved" | "rejected";
 export const describeGatewayError = describeError;
 
 const GATEWAY_ROUTE_RE =
-  /^\/workspaces\/([^/]+)(?:\/sessions\/([^/]+))?\/(messages|approvals|cancel|events)$/;
+  /^\/workspaces\/([^/]+)(?:\/sessions\/([^/]+))?\/(messages|approvals|cancel|events|prepare-stop|checkpoint)$/;
 
 /**
  * Best-effort route correlation ids for the unexpected-error log. Never
@@ -209,6 +222,16 @@ export class AgentGateway {
     }
     if (request.method !== "POST") return this.methodNotAllowed();
 
+    // Controller-lease decision (issue #72): the check STAYS for the two
+    // lifecycle routes below. It is NOT caller authorization — the control
+    // plane already authenticated the caller and checked workspace
+    // membership before forwarding. It is generation fencing (仕様書
+    // section 26 item 8): this host adopted the open-established lease, so
+    // a request arriving while another controller holds the lease comes
+    // from a stale generation (or a second host) and must NOT mutate
+    // checkpoint/sandbox state. A fenced-out prepare-stop fails the
+    // control-plane stop with 409 instead of silently checkpointing the
+    // wrong generation's workspace.
     const leaseRefused = await this.assertControllerLease();
     if (leaseRefused) return leaseRefused;
 
@@ -219,6 +242,13 @@ export class AgentGateway {
         return this.agentInput(request, workspaceId, sessionId, identity, "approval");
       case "cancel":
         return this.agentInput(request, workspaceId, sessionId, identity, "workspace_operation");
+      case "prepare-stop":
+        // Lifecycle (issue #72): deliberately NOT via agentInput() — that
+        // path is for user input and assertAgentInputAllowed() refuses
+        // STOPPING, which is exactly the state a stop preparation runs in.
+        return this.prepareStop(workspaceId, identity);
+      case "checkpoint":
+        return this.manualCheckpoint(workspaceId, identity);
       default:
         return this.json(404, { error: "not found" });
     }
@@ -230,6 +260,109 @@ export class AgentGateway {
       return this.json(409, { error: "controller lease not held by this host" });
     }
     return null;
+  }
+
+  /**
+   * Stop preparation for the control plane (issue #72:
+   * `POST /workspaces/:id/prepare-stop`): drains in-flight turns, runs the
+   * lifecycle checkpoint, flushes session persistence and deletes the
+   * sandbox via runtime.prepareStop(). Leaves STOPPING — the caller owns
+   * the instance stop that follows.
+   *
+   * Status contract the control plane branches on: 200 prepared:true means
+   * "safe to stop the instance"; 502 prepared:false with
+   * state CHECKPOINT_FAILED means "do NOT stop — the workspace was never
+   * saved"; 409 means "wrong state/generation, operator action needed".
+   */
+  private async prepareStop(workspaceId: string, identity: string): Promise<Response> {
+    let state: string;
+    try {
+      state = await this.deps.runtime.prepareStop();
+    } catch (e) {
+      if (e instanceof InvalidOperationError) {
+        return this.json(409, {
+          prepared: false,
+          state: this.deps.runtime.getState(),
+          error: e.message,
+        });
+      }
+      throw e;
+    }
+    if (state === "CHECKPOINT_FAILED") {
+      this.deps.logger.error("gateway.prepare_stop.checkpoint_failed", {
+        userId: identity,
+        workspaceId,
+        state,
+      });
+      return this.json(502, {
+        prepared: false,
+        state,
+        error: "lifecycle checkpoint failed — the workspace was not saved, instance stop refused",
+      });
+    }
+    this.deps.logger.info("gateway.prepare_stop.prepared", {
+      userId: identity,
+      workspaceId,
+      state,
+    });
+    return this.json(200, { prepared: true, state });
+  }
+
+  /**
+   * Manual checkpoint trigger (issue #75:
+   * `POST /workspaces/:id/checkpoint`): runs one lifecycle checkpoint as a
+   * tracked operation so a concurrent stop drains it instead of racing it.
+   * `skipped: true` (clean tree, nothing written) is still success — the
+   * durable snapshot already covers the tree (issue #72 bathwater rule).
+   */
+  private async manualCheckpoint(workspaceId: string, identity: string): Promise<Response> {
+    const trigger = this.deps.manualCheckpoint;
+    if (!trigger) {
+      this.deps.logger.error("gateway.checkpoint.not_implemented", {
+        userId: identity,
+        workspaceId,
+      });
+      return this.json(503, {
+        error: "checkpoint not implemented: no checkpoint trigger is wired",
+        code: "checkpoint_not_implemented",
+        checkpointed: false,
+      });
+    }
+    let result: LifecycleResult;
+    try {
+      result = await this.deps.runtime.runCheckpoint(trigger);
+    } catch (e) {
+      if (e instanceof AgentInputRefusedError) {
+        return this.json(409, {
+          checkpointed: false,
+          state: this.deps.runtime.getState(),
+          error: e.message,
+        });
+      }
+      throw e;
+    }
+    const state = this.deps.runtime.getState();
+    if (!result.ok) {
+      this.deps.logger.error("gateway.checkpoint.failed", {
+        userId: identity,
+        workspaceId,
+        state,
+        error: result.error.message,
+        ...describeGatewayError(result.error),
+      });
+      return this.json(502, {
+        checkpointed: false,
+        state,
+        error: "lifecycle checkpoint failed — no durable snapshot was written",
+      });
+    }
+    this.deps.logger.info("gateway.checkpoint.completed", {
+      userId: identity,
+      workspaceId,
+      state,
+      skipped: result.skipped,
+    });
+    return this.json(200, { checkpointed: true, skipped: result.skipped, state });
   }
 
   private async agentInput(

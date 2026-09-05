@@ -606,6 +606,110 @@ describe("WorkspaceRuntime — graceful stop (実装手順書 section 29)", () =
   });
 });
 
+describe("WorkspaceRuntime — prepareStop (issue #72)", () => {
+  test("prepareStop runs the stop sequence WITHOUT the instance stop and stays STOPPING", async () => {
+    const h = makeHarness();
+    await h.runtime.open();
+    h.instance.calls = [];
+    h.steps.calls = [];
+    h.store.clearHistory();
+    const state = await h.runtime.prepareStop();
+    expect(state).toBe("STOPPING");
+    expect(h.runtime.getState()).toBe("STOPPING");
+    expect(h.steps.calls).toEqual([
+      "runLifecycleCheckpoint",
+      "flushSessionPersistence",
+      "deleteSandbox",
+    ]);
+    // The Cloud Run instance stop is the CALLER's job — never here.
+    expect(h.instance.calls).toEqual([]);
+    expect(h.store.getHistory().map((r) => `${r.from}->${r.to}`)).toEqual(["READY->STOPPING"]);
+  });
+
+  test("stop() is exactly prepareStop() plus the instance stop (no second sequence copy)", async () => {
+    const h = makeHarness();
+    await h.runtime.open();
+    h.instance.calls = [];
+    h.steps.calls = [];
+    expect(await h.runtime.stop()).toBe("STOPPED");
+    expect(h.steps.calls).toEqual([
+      "runLifecycleCheckpoint",
+      "flushSessionPersistence",
+      "deleteSandbox",
+    ]);
+    expect(h.instance.calls).toEqual(["stop:dsh-ws-1"]);
+  });
+
+  test("prepareStop checkpoint failure -> CHECKPOINT_FAILED and instance stop NOT called", async () => {
+    const h = makeHarness();
+    await h.runtime.open();
+    h.instance.calls = [];
+    h.steps.calls = [];
+    h.steps.failures.set("runLifecycleCheckpoint", () => new Error("checkpoint failed"));
+    const state = await h.runtime.prepareStop();
+    expect(state).toBe("CHECKPOINT_FAILED");
+    expect(h.instance.calls).toEqual([]);
+    expect(h.steps.calls).toEqual(["runLifecycleCheckpoint"]);
+  });
+
+  test("prepareStop when already STOPPED is a no-op", async () => {
+    const h = makeHarness();
+    await h.runtime.open();
+    await h.runtime.stop();
+    h.instance.calls = [];
+    h.steps.calls = [];
+    expect(await h.runtime.prepareStop()).toBe("STOPPED");
+    expect(h.steps.calls).toEqual([]);
+    expect(h.instance.calls).toEqual([]);
+  });
+
+  test("prepareStop from STOPPING resumes instead of throwing (unfinished-stop retry)", async () => {
+    const h = makeHarness();
+    await h.runtime.open();
+    await h.runtime.prepareStop();
+    expect(h.runtime.getState()).toBe("STOPPING");
+    h.steps.calls = [];
+    // A previous stop marked the row but never finished (e.g. the caller
+    // crashed before the instance stop): re-running must NOT throw
+    // IllegalTransitionError on the STOPPING->STOPPING "transition".
+    expect(await h.runtime.prepareStop()).toBe("STOPPING");
+    expect(h.steps.calls).toEqual([
+      "runLifecycleCheckpoint",
+      "flushSessionPersistence",
+      "deleteSandbox",
+    ]);
+  });
+
+  test("stop() from STOPPING resumes to STOPPED (retry after a crash between prepare and instance stop)", async () => {
+    const h = makeHarness();
+    await h.runtime.open();
+    await h.runtime.prepareStop();
+    h.instance.calls = [];
+    expect(await h.runtime.stop()).toBe("STOPPED");
+    expect(h.instance.calls).toEqual(["stop:dsh-ws-1"]);
+  });
+
+  test("prepareStop is refused in STARTING/RESTORING", async () => {
+    const h = makeHarness();
+    const gate = deferred<void>();
+    h.steps.gates.set("waitForInstanceHealth", gate as unknown as ReturnType<typeof deferred<void>>);
+    const openPromise = h.runtime.open();
+    await new Promise((r) => setTimeout(r, 5));
+    await expect(h.runtime.prepareStop()).rejects.toThrow(InvalidOperationError);
+    gate.resolve();
+    await openPromise;
+  });
+
+  test("concurrent prepareStop calls coalesce", async () => {
+    const h = makeHarness();
+    await h.runtime.open();
+    const [a, b] = await Promise.all([h.runtime.prepareStop(), h.runtime.prepareStop()]);
+    expect(a).toBe("STOPPING");
+    expect(b).toBe("STOPPING");
+    expect(h.steps.calls.filter((c) => c === "runLifecycleCheckpoint")).toHaveLength(1);
+  });
+});
+
 describe("WorkspaceRuntime — idle integration (仕様書 section 11)", () => {
   test("open and agent turns are meaningful; 30 min of silence triggers idle stop", async () => {
     const h = makeHarness();

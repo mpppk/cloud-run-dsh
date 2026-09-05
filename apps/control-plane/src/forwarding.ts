@@ -252,6 +252,45 @@ export interface ForwardCancelArgs {
   readonly identity: ForwardIdentity;
 }
 
+export interface ForwardPrepareStopArgs {
+  /** Instance base URL (scheme + host, no trailing slash handling needed). */
+  readonly instanceUrl: string;
+  readonly workspaceId: string;
+  /**
+   * Caller identity, propagated so the host's gateway check can run.
+   * This MUST be the stop request's real caller (handlers.stopWorkspace
+   * passes ctx.user) — never a fabricated service-account identity. The
+   * value travels only in the forwarded header; the trust root stays the
+   * invoker IAM binding (see postToHost).
+   */
+  readonly identity: ForwardIdentity;
+}
+
+export interface ForwardCheckpointArgs {
+  /** Instance base URL (scheme + host, no trailing slash handling needed). */
+  readonly instanceUrl: string;
+  readonly workspaceId: string;
+  /**
+   * Caller identity, propagated so the host's gateway check can run.
+   * Same rule as ForwardPrepareStopArgs.identity: the real manual-checkpoint
+   * caller (handlers.manualCheckpoint passes ctx.user), never fabricated.
+   */
+  readonly identity: ForwardIdentity;
+}
+
+export interface PrepareStopForwardResult {
+  readonly status: number;
+  readonly prepared: boolean;
+  readonly state: string;
+}
+
+export interface CheckpointForwardResult {
+  readonly status: number;
+  readonly checkpointed: boolean;
+  readonly skipped: boolean;
+  readonly state: string;
+}
+
 export interface AgentHostForwardResult {
   readonly status: number;
   readonly turnStarted: boolean;
@@ -269,6 +308,21 @@ export interface MessageForwarder {
   forward(args: ForwardMessageArgs): Promise<AgentHostForwardResult>;
   forwardApproval(args: ForwardApprovalArgs): Promise<AgentHostForwardResult>;
   forwardCancel(args: ForwardCancelArgs): Promise<AgentHostForwardResult>;
+  /**
+   * Stop preparation (issue #72): POSTs the agent-host `prepare-stop` route
+   * so in-flight turns drain and the workspace is checkpointed INSIDE the
+   * instance before the control plane stops it from the outside. Resolves
+   * only when the host reports prepared:true; any refusal or failure
+   * rejects (conflict vs forward error, same contract as messages) so the
+   * caller can refuse the instance stop.
+   */
+  forwardPrepareStop(args: ForwardPrepareStopArgs): Promise<PrepareStopForwardResult>;
+  /**
+   * Manual checkpoint trigger (issue #75): POSTs the agent-host `checkpoint`
+   * route so the durable snapshot is actually written. Resolves only when
+   * the host reports checkpointed:true.
+   */
+  forwardCheckpoint(args: ForwardCheckpointArgs): Promise<CheckpointForwardResult>;
 }
 
 /** The agent-host refused the message for a caller-visible reason (maps to 409). */
@@ -391,6 +445,67 @@ export class HttpAgentHostForwarder implements MessageForwarder {
   }
 
   /**
+   * Stop preparation (issue #72). The host answers 200 prepared:true only
+   * after draining turns and persisting the workspace; anything else
+   * rejects via postToHost's 409/502 classification (a CHECKPOINT_FAILED
+   * host answers 502 → forward error → the control-plane stop records
+   * CHECKPOINT_FAILED and skips the instance stop).
+   */
+  async forwardPrepareStop(args: ForwardPrepareStopArgs): Promise<PrepareStopForwardResult> {
+    const path = `/workspaces/${encodeURIComponent(args.workspaceId)}/prepare-stop`;
+    const res = await this.postToHost({
+      instanceUrl: args.instanceUrl,
+      path,
+      body: { workspaceId: args.workspaceId },
+      identity: args.identity,
+    });
+    const parsed = await safeJson(res);
+    if (parsed?.["prepared"] !== true) {
+      throw new AgentHostForwardError(
+        "agent-host answered 200 but reported prepared:false — refusing the instance stop",
+      );
+    }
+    this.opts.logger?.info("control-plane.forward.delivered", {
+      kind: "prepare-stop",
+      workspaceId: args.workspaceId,
+      status: res.status,
+    });
+    return { status: res.status, prepared: true, state: String(parsed?.["state"] ?? "") };
+  }
+
+  /**
+   * Manual checkpoint trigger (issue #75). Resolves with the host's skipped
+   * flag (clean tree, nothing written — still success) so the API response
+   * stays truthful about what happened.
+   */
+  async forwardCheckpoint(args: ForwardCheckpointArgs): Promise<CheckpointForwardResult> {
+    const path = `/workspaces/${encodeURIComponent(args.workspaceId)}/checkpoint`;
+    const res = await this.postToHost({
+      instanceUrl: args.instanceUrl,
+      path,
+      body: { workspaceId: args.workspaceId },
+      identity: args.identity,
+    });
+    const parsed = await safeJson(res);
+    if (parsed?.["checkpointed"] !== true) {
+      throw new AgentHostForwardError(
+        "agent-host answered 200 but reported checkpointed:false — no durable snapshot was written",
+      );
+    }
+    this.opts.logger?.info("control-plane.forward.delivered", {
+      kind: "checkpoint",
+      workspaceId: args.workspaceId,
+      status: res.status,
+    });
+    return {
+      status: res.status,
+      checkpointed: true,
+      skipped: parsed?.["skipped"] === true,
+      state: String(parsed?.["state"] ?? ""),
+    };
+  }
+
+  /**
    * Shared POST to the Instance gateway: ID-token mint, timeout, and the
    * 409-vs-502 classification. Every forward reuses this — never a second
    * copy of the auth/timeout/error mapping (issue #39).
@@ -482,5 +597,18 @@ async function safeText(res: Response): Promise<string> {
     return (await res.text()).trim();
   } catch {
     return "";
+  }
+}
+
+/** Best-effort JSON body read; null when the body is absent or malformed. */
+async function safeJson(res: Response): Promise<Record<string, unknown> | null> {
+  try {
+    const parsed = (await res.json()) as unknown;
+    if (typeof parsed === "object" && parsed !== null) {
+      return parsed as Record<string, unknown>;
+    }
+    return null;
+  } catch {
+    return null;
   }
 }

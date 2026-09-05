@@ -186,7 +186,9 @@ export const stopWorkspace: RouteHandler = async (ctx) => {
   const workspace = await loadWorkspace(ctx.deps, id);
   await assertMember(ctx.deps, workspace.id, ctx.user.id);
   const handle = await ctx.deps.runtimes.get(workspace);
-  const state = await handle.stop();
+  // Issue #72: the REAL caller travels into the agent-host prepare-stop
+  // forward (the factory refuses a faceless stop when a forwarder is wired).
+  const state = await handle.stop({ id: ctx.user.id, email: ctx.user.email });
   return json({ workspaceId: workspace.id, state });
 };
 
@@ -220,7 +222,12 @@ export const manualCheckpoint: RouteHandler = async (ctx) => {
   // Manual checkpoint is controller-only (仕様書 section 20).
   await requireController(ctx.deps.leases, workspace.id, ctx.user.id);
   const handle = await ctx.deps.runtimes.get(workspace);
-  await handle.runManualCheckpoint();
+  // Issue #75: the REAL caller travels into the agent-host checkpoint
+  // forward, and `checkpointed: true` is now backed by a real durable
+  // snapshot (a clean-tree host skip is still success — its snapshot
+  // already covers the tree; a failure rejects and never reaches this
+  // line). The marker records the host's skip flag for audit.
+  await handle.runManualCheckpoint({ id: ctx.user.id, email: ctx.user.email });
   return json({ workspaceId: workspace.id, checkpointed: true });
 };
 

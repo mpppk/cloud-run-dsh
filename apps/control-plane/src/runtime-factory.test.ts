@@ -32,6 +32,13 @@ import {
   summarizeHealthFailure,
   type HealthFetch,
 } from "./runtime-factory.js";
+import {
+  AgentHostConflictError,
+  AgentHostForwardError,
+  type ForwardCheckpointArgs,
+  type ForwardPrepareStopArgs,
+  type MessageForwarder,
+} from "./forwarding.js";
 
 const BASE_PATH = "https://run.googleapis.com/v2/projects/test-proj/locations/test-region";
 
@@ -140,7 +147,11 @@ function openFlowHandler(instanceName: string, url: string) {
   };
 }
 
-function makeRegistry(h: Harness, configOverride?: Partial<ControlPlaneConfig>) {
+function makeRegistry(
+  h: Harness,
+  configOverride?: Partial<ControlPlaneConfig>,
+  extra?: { forwarder?: MessageForwarder },
+) {
   return createProductionRuntimeRegistry({
     config: { ...testConfig(), ...configOverride },
     repo: h.repo,
@@ -153,6 +164,7 @@ function makeRegistry(h: Harness, configOverride?: Partial<ControlPlaneConfig>) 
     agentHealthPoll: { maxAttempts: 3, intervalMs: 0 },
     sleep: async () => {},
     controllerIdForWorkspace: () => "ctrl-1",
+    messageForwarder: extra?.forwarder,
   });
 }
 
@@ -946,6 +958,242 @@ describe("runManualCheckpoint — GCS marker", () => {
     >;
     expect(marker["workspaceId"]).toBe("ws-1");
     expect(typeof marker["requestedAt"]).toBe("string");
+  });
+});
+
+describe("stop() remote preparation (issue #72)", () => {
+  const CALLER = { id: "alice", email: "alice@example.com" };
+
+  /** MessageForwarder fake with switchable prepare-stop behavior. */
+  class FakeLifecycleForwarder implements MessageForwarder {
+    prepareCalls: ForwardPrepareStopArgs[] = [];
+    checkpointCalls: ForwardCheckpointArgs[] = [];
+    prepareBehavior: "ok" | "forward-error" | "conflict" = "ok";
+    checkpointSkipped = false;
+
+    async forward(): Promise<{ status: number; turnStarted: boolean }> {
+      throw new Error("message forward not used in lifecycle tests");
+    }
+    async forwardApproval(): Promise<{ status: number; turnStarted: boolean }> {
+      throw new Error("approval forward not used in lifecycle tests");
+    }
+    async forwardCancel(): Promise<{ status: number; turnStarted: boolean }> {
+      throw new Error("cancel forward not used in lifecycle tests");
+    }
+    async forwardPrepareStop(args: ForwardPrepareStopArgs) {
+      this.prepareCalls.push(args);
+      if (this.prepareBehavior === "forward-error") {
+        throw new AgentHostForwardError("agent-host answered 502: checkpoint failed");
+      }
+      if (this.prepareBehavior === "conflict") {
+        throw new AgentHostConflictError("agent-host refused the request (status 409)");
+      }
+      return { status: 200, prepared: true, state: "STOPPING" };
+    }
+    async forwardCheckpoint(args: ForwardCheckpointArgs) {
+      this.checkpointCalls.push(args);
+      return {
+        status: 200,
+        checkpointed: true,
+        skipped: this.checkpointSkipped,
+        state: "READY",
+      };
+    }
+  }
+
+  /** Open + agent restore, ready to stop, against a live-looking instance. */
+  async function openReady(h: Harness, registry: ReturnType<typeof makeRegistry>) {
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(async (req) => {
+      if (req.method === "GET") {
+        return { status: 200, body: instanceBody("dsh-ws-1", "https://dsh-ws-1.run.app") };
+      }
+      return { status: 200, body: {} };
+    });
+    const handle = await registry.get(workspace);
+    await handle.open();
+    await driveAgentRestore(h);
+    expect(await handle.open()).toBe("READY");
+    return handle;
+  }
+
+  function stopCalled(h: Harness): boolean {
+    return h.transport.requests.some(
+      (r) => r.method === "POST" && r.url === `${BASE_PATH}/instances/dsh-ws-1:stop`,
+    );
+  }
+
+  test("stop() prepares remotely with the caller identity, then stops the instance", async () => {
+    const h = makeHarness();
+    const forwarder = new FakeLifecycleForwarder();
+    const registry = makeRegistry(h, undefined, { forwarder });
+    const handle = await openReady(h, registry);
+    expect(await handle.stop(CALLER)).toBe("STOPPED");
+    // The prepare-stop reached the host with the REAL caller — never a
+    // fabricated service-account identity.
+    expect(forwarder.prepareCalls).toHaveLength(1);
+    expect(forwarder.prepareCalls[0]!.identity).toEqual(CALLER);
+    expect(forwarder.prepareCalls[0]!.instanceUrl).toBe("https://dsh-ws-1.run.app");
+    expect(stopCalled(h)).toBe(true);
+  });
+
+  test("prepare-stop failure -> CHECKPOINT_FAILED and the Cloud Run :stop is NEVER called", async () => {
+    const h = makeHarness();
+    const forwarder = new FakeLifecycleForwarder();
+    forwarder.prepareBehavior = "forward-error";
+    const registry = makeRegistry(h, undefined, { forwarder });
+    const handle = await openReady(h, registry);
+    // The checkpoint guard (issue #72): the workspace was never saved, so
+    // the instance stop — which would discard everything — must not run.
+    expect(await handle.stop(CALLER)).toBe("CHECKPOINT_FAILED");
+    expect(forwarder.prepareCalls).toHaveLength(1);
+    expect(stopCalled(h)).toBe(false);
+    expect((await h.repo.getWorkspace("ws-1"))!.runtimeState).toBe("CHECKPOINT_FAILED");
+  });
+
+  test("prepare-stop conflict (stale host generation) also blocks the instance stop", async () => {
+    const h = makeHarness();
+    const forwarder = new FakeLifecycleForwarder();
+    forwarder.prepareBehavior = "conflict";
+    const registry = makeRegistry(h, undefined, { forwarder });
+    const handle = await openReady(h, registry);
+    // A host-side refusal is a checkpoint-step failure too: the workspace
+    // state is unverified, so stopping would risk silent work loss.
+    expect(await handle.stop(CALLER)).toBe("CHECKPOINT_FAILED");
+    expect(stopCalled(h)).toBe(false);
+  });
+
+  test("stop() with a forwarder but no caller identity fails closed (never faceless)", async () => {
+    const h = makeHarness();
+    const forwarder = new FakeLifecycleForwarder();
+    const registry = makeRegistry(h, undefined, { forwarder });
+    const handle = await openReady(h, registry);
+    expect(await handle.stop()).toBe("CHECKPOINT_FAILED");
+    expect(forwarder.prepareCalls).toHaveLength(0);
+    expect(stopCalled(h)).toBe(false);
+  });
+
+  test("already-stopped workspace: stop() never attempts a remote preparation", async () => {
+    const h = makeHarness();
+    const forwarder = new FakeLifecycleForwarder();
+    const registry = makeRegistry(h, undefined, { forwarder });
+    const workspace = await seedWorkspace(h.repo);
+    const handle = await registry.get(workspace);
+    expect(await handle.stop(CALLER)).toBe("STOPPED");
+    expect(forwarder.prepareCalls).toHaveLength(0);
+    expect(stopCalled(h)).toBe(false);
+  });
+
+  test("instance already gone (GET 404): stop() skips the remote call and still lands STOPPED", async () => {
+    const h = makeHarness();
+    const forwarder = new FakeLifecycleForwarder();
+    const registry = makeRegistry(h, undefined, { forwarder });
+    const handle = await openReady(h, registry);
+    // The instance vanished out of band (operator deleted it, previous
+    // generation): there is nothing alive left to preserve, so the stop
+    // must succeed instead of failing on an unreachable prepare-stop.
+    h.transport.setHandler(async (req) => {
+      if (req.method === "GET") return { status: 404, body: { message: "not found" } };
+      if (req.method === "POST" && req.url.endsWith(":stop")) {
+        return { status: 404, body: { message: "not found" } };
+      }
+      return { status: 200, body: {} };
+    });
+    expect(await handle.stop(CALLER)).toBe("STOPPED");
+    expect(forwarder.prepareCalls).toHaveLength(0);
+  });
+});
+
+describe("runManualCheckpoint remote trigger (issue #75)", () => {
+  const CALLER = { id: "alice", email: "alice@example.com" };
+
+  class FakeCheckpointForwarder implements MessageForwarder {
+    checkpointCalls: ForwardCheckpointArgs[] = [];
+    checkpointSkipped = false;
+    async forward(): Promise<{ status: number; turnStarted: boolean }> {
+      throw new Error("not used");
+    }
+    async forwardApproval(): Promise<{ status: number; turnStarted: boolean }> {
+      throw new Error("not used");
+    }
+    async forwardCancel(): Promise<{ status: number; turnStarted: boolean }> {
+      throw new Error("not used");
+    }
+    async forwardPrepareStop(): Promise<{
+      status: number;
+      prepared: boolean;
+      state: string;
+    }> {
+      throw new Error("not used");
+    }
+    async forwardCheckpoint(args: ForwardCheckpointArgs) {
+      this.checkpointCalls.push(args);
+      return {
+        status: 200,
+        checkpointed: true,
+        skipped: this.checkpointSkipped,
+        state: "READY",
+      };
+    }
+  }
+
+  async function openReady(h: Harness, registry: ReturnType<typeof makeRegistry>) {
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(async (req) => {
+      if (req.method === "GET") {
+        return { status: 200, body: instanceBody("dsh-ws-1", "https://dsh-ws-1.run.app") };
+      }
+      return { status: 200, body: {} };
+    });
+    const handle = await registry.get(workspace);
+    await handle.open();
+    await driveAgentRestore(h);
+    expect(await handle.open()).toBe("READY");
+    return handle;
+  }
+
+  function readMarker(h: Harness): Record<string, unknown> {
+    const keys = [...h.gcs.objects.keys()];
+    expect(keys).toHaveLength(1);
+    return JSON.parse(new TextDecoder().decode(h.gcs.objects.get(keys[0]!)!)) as Record<
+      string,
+      unknown
+    >;
+  }
+
+  test("takes a real host checkpoint first, then writes the marker with the skip flag", async () => {
+    const h = makeHarness();
+    const forwarder = new FakeCheckpointForwarder();
+    const registry = makeRegistry(h, undefined, { forwarder });
+    const handle = await openReady(h, registry);
+    await handle.runManualCheckpoint(CALLER);
+    expect(forwarder.checkpointCalls).toHaveLength(1);
+    expect(forwarder.checkpointCalls[0]!.identity).toEqual(CALLER);
+    expect(forwarder.checkpointCalls[0]!.instanceUrl).toBe("https://dsh-ws-1.run.app");
+    const marker = readMarker(h);
+    expect(marker["workspaceId"]).toBe("ws-1");
+    expect(marker["checkpointSkipped"]).toBe(false);
+  });
+
+  test("host clean-tree skip is recorded on the marker (still success)", async () => {
+    const h = makeHarness();
+    const forwarder = new FakeCheckpointForwarder();
+    forwarder.checkpointSkipped = true;
+    const registry = makeRegistry(h, undefined, { forwarder });
+    const handle = await openReady(h, registry);
+    await handle.runManualCheckpoint(CALLER);
+    expect(readMarker(h)["checkpointSkipped"]).toBe(true);
+  });
+
+  test("stopped instance (no URL): manual checkpoint is a caller-visible conflict, no marker", async () => {
+    const h = makeHarness();
+    const forwarder = new FakeCheckpointForwarder();
+    const registry = makeRegistry(h, undefined, { forwarder });
+    const handle = await openReady(h, registry);
+    h.transport.setHandler(async () => ({ status: 404, body: { message: "not found" } }));
+    await expect(handle.runManualCheckpoint(CALLER)).rejects.toThrow(/not running/);
+    expect(forwarder.checkpointCalls).toHaveLength(0);
+    expect([...h.gcs.objects.keys()]).toHaveLength(0);
   });
 });
 
