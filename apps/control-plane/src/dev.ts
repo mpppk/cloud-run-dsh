@@ -66,8 +66,11 @@ export class LoggingWorkspaceRuntimeHandle implements WorkspaceRuntimeHandle {
     // Local dev: always allowed when the workspace is open.
   }
 
-  async runManualCheckpoint(): Promise<void> {
+  async runManualCheckpoint(): Promise<{ skipped: boolean }> {
     this.recordActivity("checkpoint");
+    // Local dev has no agent-host to consult, so there is never a
+    // clean-tree skip to report (issue #89).
+    return { skipped: false };
   }
 
   async getInstanceUrl(): Promise<string | null> {

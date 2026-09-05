@@ -228,11 +228,13 @@ class FakeHandle implements WorkspaceRuntimeHandle {
   }
 
   checkpointIdentities: { id: string; email: string }[] = [];
+  checkpointSkipped = false;
 
-  async runManualCheckpoint(identity?: { id: string; email: string }): Promise<void> {
+  async runManualCheckpoint(identity?: { id: string; email: string }): Promise<{ skipped: boolean }> {
     this.checkpointCalls++;
     if (identity) this.checkpointIdentities.push(identity);
     this.recordActivity("checkpoint");
+    return { skipped: this.checkpointSkipped };
   }
 
   instanceUrl: string | null = null;
@@ -834,6 +836,24 @@ describe("controller enforcement", () => {
     expect(h.handles.get(workspaceId)!.checkpointIdentities).toEqual([
       { id: "alice", email: "alice@example.com" },
     ]);
+    // Issue #89: the response carries the host's skip flag so callers can
+    // tell a real snapshot (skipped: false) from a clean-tree skip.
+    expect(await res.json()).toEqual({ workspaceId, checkpointed: true, skipped: false });
+  });
+
+  test("manual checkpoint response reports a clean-tree host skip (issue #89)", async () => {
+    h.handles.get(workspaceId)!.checkpointSkipped = true;
+    try {
+      const res = await h.fetchAs("alice", `/v1/workspaces/${workspaceId}/checkpoints`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ workspaceId, checkpointed: true, skipped: true });
+    } finally {
+      h.handles.get(workspaceId)!.checkpointSkipped = false;
+    }
   });
 
   test("stop passes the real caller identity to the runtime handle (issue #72)", async () => {
@@ -1139,7 +1159,7 @@ describe("open/stop composition with the T8 runtime", () => {
     try {
       const ws = await h.createWorkspace("alice");
       const { runtime, startCalls } = makeRealRuntime(ws.id);
-      h.deps.runtimes.set(ws.id, new WorkspaceRuntimeHandleAdapter(runtime, async () => {}));
+      h.deps.runtimes.set(ws.id, new WorkspaceRuntimeHandleAdapter(runtime, async () => ({ skipped: false })));
 
       const [r1, r2, r3] = await Promise.all([
         h.fetchAs("alice", `/v1/workspaces/${ws.id}/open`, {
@@ -1190,7 +1210,7 @@ describe("open/stop composition with the T8 runtime", () => {
     try {
       const ws = await h.createWorkspace("alice");
       const { runtime } = makeRealRuntime(ws.id);
-      h.deps.runtimes.set(ws.id, new WorkspaceRuntimeHandleAdapter(runtime, async () => {}));
+      h.deps.runtimes.set(ws.id, new WorkspaceRuntimeHandleAdapter(runtime, async () => ({ skipped: false })));
       // drive the runtime to BUSY via the state machine
       await runtime.open();
       await runtime.beginAgentTurn();
@@ -1213,7 +1233,7 @@ describe("open/stop composition with the T8 runtime", () => {
     try {
       const ws = await h.createWorkspace("alice");
       const { runtime, stopCalls } = makeRealRuntime(ws.id);
-      h.deps.runtimes.set(ws.id, new WorkspaceRuntimeHandleAdapter(runtime, async () => {}));
+      h.deps.runtimes.set(ws.id, new WorkspaceRuntimeHandleAdapter(runtime, async () => ({ skipped: false })));
       await runtime.open();
 
       const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/stop`, {
@@ -1259,7 +1279,7 @@ describe("open/stop composition with the T8 runtime", () => {
         getState: () => "STOPPING",
         recordActivity: () => {},
         assertAgentInputAllowed: () => {},
-        runManualCheckpoint: async () => {},
+        runManualCheckpoint: async () => ({ skipped: false }),
         getInstanceUrl: async () => null,
       };
       h.deps.runtimes.set(ws.id, losing);
@@ -1292,7 +1312,7 @@ describe("open/stop composition with the T8 runtime", () => {
     try {
       const ws = await h.createWorkspace("alice");
       const runtime = makeRealRuntime(ws.id).runtime;
-      h.deps.runtimes.set(ws.id, new WorkspaceRuntimeHandleAdapter(runtime, async () => {}));
+      h.deps.runtimes.set(ws.id, new WorkspaceRuntimeHandleAdapter(runtime, async () => ({ skipped: false })));
 
       const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/open`, {
         method: "POST",
@@ -1951,7 +1971,7 @@ describe("unexpected error observability (issue #48)", () => {
         getState: () => "STOPPED",
         recordActivity: () => {},
         assertAgentInputAllowed: () => {},
-        runManualCheckpoint: async () => {},
+        runManualCheckpoint: async () => ({ skipped: false }),
         getInstanceUrl: async () => null,
       };
       h.deps.runtimes.set(ws.id, throwing);
