@@ -399,11 +399,18 @@ class EnsureCreatedInstanceRuntime implements InstanceRuntime {
  * itself; it is the frontend saying no generation is behind the URL yet.
  * Such answers must not consume the agent-health budget — they are the
  * shutdown window, not evidence of unhealth.
+ *
+ * The match is deliberately `<html` ONLY (no `server error` alternative):
+ * the agent-host's own catch-all is `500 {"error":"internal server error",
+ * ...}` (gateway handle()), which contains that phrase — matching on it
+ * would misclassify a genuinely broken host as "still shutting down" and
+ * burn the 3-minute shutdown budget instead of failing fast on the health
+ * budget. Google-frontend error pages are always HTML, so nothing real is
+ * lost by requiring the tag.
  */
 export function isFrontendShutdownResponse(status: number, bodyText: string): boolean {
   if (status < 500 || status > 599) return false;
-  const body = bodyText.toLowerCase();
-  return body.includes("<html") || body.includes("server error");
+  return bodyText.toLowerCase().includes("<html");
 }
 
 /**

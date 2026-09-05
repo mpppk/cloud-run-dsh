@@ -1617,6 +1617,16 @@ describe("issue #121 — the Cloud Run shutdown window vs the readiness budget",
     // count against the health budget, never the shutdown allowance.
     expect(isFrontendShutdownResponse(503, HOST_RESTORING_JSON)).toBe(false);
     expect(isFrontendShutdownResponse(500, JSON.stringify({ error: "boom" }))).toBe(false);
+    // The host's catch-all 500 (gateway handle()) literally contains
+    // "internal server error" — it must NOT match either, or a genuinely
+    // broken host would burn the 3-minute shutdown budget instead of
+    // failing fast on the health budget.
+    expect(
+      isFrontendShutdownResponse(
+        500,
+        JSON.stringify({ error: "internal server error", errorId: "abc123" }),
+      ),
+    ).toBe(false);
     // Non-5xx is never the shutdown window (401 invoker-IAM, 404 no route…).
     expect(isFrontendShutdownResponse(401, FRONTEND_500_HTML)).toBe(false);
     expect(isFrontendShutdownResponse(200, FRONTEND_500_HTML)).toBe(false);
