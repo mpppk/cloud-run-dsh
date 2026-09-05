@@ -62,6 +62,7 @@ function testConfig(): ControlPlaneConfig {
     cloudSqlConnectionName: "test-proj:test-region:main",
     instanceGcIntervalMs: 3_600_000,
     instanceGcStaleAfterMs: 30 * 24 * 3_600_000,
+    instanceGcMaxDeletesPerSweep: 10,
   };
 }
 

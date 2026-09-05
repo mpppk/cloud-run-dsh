@@ -57,7 +57,10 @@ curl -sS -H "Authorization: Bearer ${TOK}" "${BASE}/instances" | python3 -c \
 - **案B: 明示的な削除 API。** `DELETE /v1/workspaces/:id` を新設した。
   先に Instance を消し、成功したら workspace 行を子（sessions /
   session_events / checkpoints / lease）ごと削除する。Instance 削除に失敗
-  したら 502 で行を残す（リトライ可能）。
+  したら 502 で行を残す（リトライ可能）。**STOPPED 以外（稼働中含む）でも
+  強制削除する**（rm -rf semantics。409 ゲートを付けても list→delete と
+  同じ TOCTOU が残り保証にならないため、付けずに文書化した）。
+  メンバーシップ検査は既存ハンドラと同じ `assertMember`（非メンバーは 403）。
 
 両方にした理由: B だけでは「消し忘れ」が溜まり続け、A だけでは「今すぐ
 消したい」に応えられない。どちらも失うのは起動時間だけで、状態は GCS
@@ -69,12 +72,23 @@ curl -sS -H "Authorization: Bearer ${TOK}" "${BASE}/instances" | python3 -c \
 - GC 適格は **STOPPED のみ**。READY / BUSY / CHECKPOINTING / STOPPING /
   STARTING / RESTORING / ERROR / RESTORE_FAILED / CHECKPOINT_FAILED は、
   何日経っても触らない（`isGcEligible` が純粋関数として行列テストを持つ）。
-- 最終利用は `max(lastActivityAt, updatedAt)`。STOPPED 行の `updatedAt`
-  は stop 完了の遷移時刻そのものなので、**スキーマ変更（新列）は不要**
-  と判断した（#73 の destroy 問題を抱えるマイグレーションを増やさない）。
+- 最終利用は `max(lastActivityAt, updatedAt, createdAt)` の3要素。
+  **ただし `lastActivityAt` は現状 production のどこからも書かれていない**
+  （書くのはテストのみ）ため、実質は `max(updatedAt, createdAt)` で判定
+  している。将来 `lastActivityAt` の書き手が増えても GC 側の変更は不要。
+  STOPPED 行の `updatedAt` は stop 完了の遷移時刻そのものなので、
+  **スキーマ変更（新列）は不要**と判断した（#73 の destroy 問題を抱える
+  マイグレーションを増やさない）。
+- 削除直前に行を取り直し、**STOPPED のまま・`instanceName` が同一**のとき
+  だけ消す（TOCTOU 対策。list→delete の間に open された稼働中 Instance
+  は skip＋ログ。完全な fencing ではないが window は API 1往復分）。
+- 1 sweep の削除は **10 件まで**（oldest-first、残りは次回＋ログ）。
+  判定バグや operator error の blast radius を抑える。
+  `staleAfterMs` は1時間未満を受け付けない。
 - 1 workspace の失敗は sweep 全体を止めない（per-workspace try/catch）。
-- 削除・失敗は必ず構造化ログに残す（`control-plane.instance-gc.deleted` /
-  `.failed`、`control-plane.workspace-deleted` — いずれも `workspaceId` +
+- 削除・失敗・skip・defer は必ず構造化ログに残す
+  （`control-plane.instance-gc.deleted` / `.failed` / `.skipped` /
+  `.deferred`、`control-plane.workspace-deleted` — いずれも `workspaceId` +
   `instanceName` 付き）。
 - `DELETE /v1/workspaces/:id` は既存ハンドラと同じ `assertMember` を通す
   （他人の workspace は 403 で何も消えない）。
@@ -84,7 +98,16 @@ curl -sS -H "Authorization: Bearer ${TOK}" "${BASE}/instances" | python3 -c \
 | 環境変数 | 既定 | 意味 |
 |---|---|---|
 | `INSTANCE_GC_INTERVAL_MS` | 3600000（1時間） | sweeper の間隔。`0` で無効化（DELETE API は使えるまま） |
-| `INSTANCE_GC_STALE_AFTER_MS` | 2592000000（30日） | この期間無触の STOPPED workspace の Instance を消す |
+| `INSTANCE_GC_STALE_AFTER_MS` | 2592000000（30日） | この期間無触の STOPPED workspace の Instance を消す。1時間未満は起動時エラー |
+| `INSTANCE_GC_MAX_DELETES_PER_SWEEP` | 10 | 1 sweep の削除上限（oldest-first、残りは次回）。1未満は起動時エラー |
+
+## 既知の残件
+
+- **DELETE は GCS 上の checkpoint 実体を残す。** 消えるのは DB の
+  `workspace_checkpoints` 行だけで、バケットの tar.gz は orphan として
+  残る。バケットはバージョニング有効・非現行30日削除だが、現行 orphan
+  の掃除手段は無い（将来: DELETE 時に GCS オブジェクトも消すか、orphan
+  sweeper を足す）。
 
 ログの見方:
 

@@ -6,6 +6,8 @@ import { describe, expect, test } from "bun:test";
 import { InMemoryLogger } from "@cloud-run-dsh/observability";
 import { PostgresSessionPersistenceRepository } from "@cloud-run-dsh/session-persistence-postgres";
 import type {
+  SessionPersistenceRepository,
+  UpdateWorkspacePatch,
   Workspace,
   WorkspaceRuntimeState,
 } from "@cloud-run-dsh/session-persistence-postgres";
@@ -116,6 +118,54 @@ describe("isGcEligible", () => {
     expect(isGcEligible(baseWorkspace(), NOW_MS, STALE_MS)).toBe(true);
   });
 
+  test("exactly at the threshold (>=) is eligible; 1ms before is not", () => {
+    const atThreshold = new Date(NOW_MS - STALE_MS).toISOString();
+    expect(
+      isGcEligible(
+        baseWorkspace({ updatedAt: atThreshold, createdAt: atThreshold }),
+        NOW_MS,
+        STALE_MS,
+      ),
+    ).toBe(true);
+    const justBefore = new Date(NOW_MS - STALE_MS + 1).toISOString();
+    expect(
+      isGcEligible(
+        baseWorkspace({ updatedAt: justBefore, createdAt: justBefore }),
+        NOW_MS,
+        STALE_MS,
+      ),
+    ).toBe(false);
+  });
+
+  test("real 30-day boundary: exactly 30 days is eligible, just under is not", () => {
+    const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+    expect(DEFAULT_STALE_AFTER_MS).toBe(thirtyDays);
+    const atThreshold = new Date(NOW_MS - thirtyDays).toISOString();
+    expect(
+      isGcEligible(
+        baseWorkspace({ updatedAt: atThreshold, createdAt: atThreshold }),
+        NOW_MS,
+        DEFAULT_STALE_AFTER_MS,
+      ),
+    ).toBe(true);
+    const justUnder = new Date(NOW_MS - thirtyDays + 1).toISOString();
+    expect(
+      isGcEligible(
+        baseWorkspace({ updatedAt: justUnder, createdAt: justUnder }),
+        NOW_MS,
+        DEFAULT_STALE_AFTER_MS,
+      ),
+    ).toBe(false);
+    const over = new Date(NOW_MS - 31 * 24 * 60 * 60 * 1000).toISOString();
+    expect(
+      isGcEligible(
+        baseWorkspace({ updatedAt: over, createdAt: over }),
+        NOW_MS,
+        DEFAULT_STALE_AFTER_MS,
+      ),
+    ).toBe(true);
+  });
+
   test("unparseable timestamps are never eligible (fail closed)", () => {
     expect(
       isGcEligible(
@@ -178,7 +228,10 @@ interface ReapHarness {
   ) => Promise<Workspace>;
 }
 
-function startReapHarness(failIds: Set<string> = new Set()): ReapHarness {
+function startReapHarness(
+  failIds: Set<string> = new Set(),
+  extra: { maxDeletesPerSweep?: number } = {},
+): ReapHarness {
   const executor = new InMemoryFakeExecutor();
   const repo = new PostgresSessionPersistenceRepository(executor);
   const handles = new Map<string, RecordingHandle>();
@@ -198,6 +251,7 @@ function startReapHarness(failIds: Set<string> = new Set()): ReapHarness {
     clock,
     logger,
     staleAfterMs: STALE_MS,
+    ...extra,
   };
   return {
     repo,
@@ -314,8 +368,157 @@ describe("reapStaleStoppedInstances", () => {
       eligible: 0,
       deleted: 0,
       failed: 0,
+      skipped: 0,
+      deferred: 0,
       failures: [],
     });
+  });
+});
+
+describe("pre-delete re-read (TOCTOU: never delete a live Instance)", () => {
+  test("opened between list and delete (READY) is skipped, not deleted", async () => {
+    const h = startReapHarness();
+    await h.seed("ws-race", { backdateMs: 60_000 });
+    // Freeze the eligible snapshot, THEN land the open: the re-read sees
+    // READY with a live Instance under the same name.
+    const snapshot = await h.repo.listWorkspaces();
+    expect(snapshot).toHaveLength(1);
+    await h.repo.updateRuntimeState("ws-race", "READY");
+    const liveRepo = h.repo;
+    const deps: ReapDeps = {
+      ...h.deps,
+      repo: {
+        listWorkspaces: async () => snapshot,
+        getWorkspace: (id: string) => liveRepo.getWorkspace(id),
+        updateWorkspace: (id: string, patch: UpdateWorkspacePatch) =>
+          liveRepo.updateWorkspace(id, patch),
+      } as unknown as SessionPersistenceRepository,
+    };
+
+    const result = await reapStaleStoppedInstances(deps);
+
+    expect(result.eligible).toBe(1);
+    expect(result.deleted).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(h.handles.get("ws-race")?.deleteCalls ?? 0).toBe(0);
+    // The live row is untouched — no URL clearing either.
+    expect((await h.repo.getWorkspace("ws-race"))?.instanceUrl).toBe(
+      "https://ws-race.run.app",
+    );
+    const skipped = h.logger.parsed.find(
+      (e) => e["event"] === "control-plane.instance-gc.skipped",
+    );
+    expect(skipped).toBeTruthy();
+    expect(skipped!["workspaceId"]).toBe("ws-race");
+    expect(skipped!["instanceName"]).toBe("dsh-ws-race");
+    expect(skipped!["reason"]).toBe("state-changed");
+    expect(skipped!["runtimeState"]).toBe("READY");
+  });
+
+  test("renamed between list and delete is skipped, not deleted", async () => {
+    const h = startReapHarness();
+    await h.seed("ws-renamed", { backdateMs: 60_000 });
+    const snapshot = await h.repo.listWorkspaces();
+    expect(snapshot).toHaveLength(1);
+    await h.repo.updateWorkspace("ws-renamed", { instanceName: "dsh-ws-renamed-v2" });
+    const liveRepo = h.repo;
+    const deps: ReapDeps = {
+      ...h.deps,
+      repo: {
+        listWorkspaces: async () => snapshot,
+        getWorkspace: (id: string) => liveRepo.getWorkspace(id),
+        updateWorkspace: (id: string, patch: UpdateWorkspacePatch) =>
+          liveRepo.updateWorkspace(id, patch),
+      } as unknown as SessionPersistenceRepository,
+    };
+
+    const result = await reapStaleStoppedInstances(deps);
+
+    expect(result.eligible).toBe(1);
+    expect(result.deleted).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(h.handles.get("ws-renamed")?.deleteCalls ?? 0).toBe(0);
+    const skipped = h.logger.parsed.find(
+      (e) => e["event"] === "control-plane.instance-gc.skipped",
+    );
+    expect(skipped!["reason"]).toBe("instance-renamed");
+  });
+
+  test("workspace gone between list and delete is skipped, not failed", async () => {
+    const logger = new InMemoryLogger();
+    const snapshot: Workspace = {
+      id: "ws-gone",
+      ownerId: "alice",
+      repositoryOwner: "mpppk",
+      repositoryName: "demo",
+      baseBranch: "main",
+      instanceName: "dsh-ws-gone",
+      instanceUrl: "https://ws-gone.run.app",
+      runtimeState: "STOPPED",
+      lastActivityAt: null,
+      createdAt: OLD_ISO,
+      updatedAt: OLD_ISO,
+    };
+    const deps: ReapDeps = {
+      repo: {
+        listWorkspaces: async () => [snapshot],
+        getWorkspace: async () => null,
+        updateWorkspace: async () => {
+          throw new Error("must not be called for a skipped workspace");
+        },
+      } as unknown as SessionPersistenceRepository,
+      runtimes: {
+        get: async () => {
+          throw new Error("must not be called for a skipped workspace");
+        },
+      },
+      clock,
+      logger,
+      staleAfterMs: STALE_MS,
+    };
+
+    const result = await reapStaleStoppedInstances(deps);
+
+    expect(result).toMatchObject({ checked: 1, eligible: 1, deleted: 0, failed: 0, skipped: 1 });
+    const skipped = logger.parsed.find(
+      (e) => e["event"] === "control-plane.instance-gc.skipped",
+    );
+    expect(skipped!["reason"]).toBe("workspace-gone");
+  });
+});
+
+describe("per-sweep delete cap (oldest-first, remainder deferred)", () => {
+  test("cap 2 of 3 eligible: the two oldest are deleted, the newest waits", async () => {
+    const h = startReapHarness(new Set(), { maxDeletesPerSweep: 2 });
+    await h.seed("ws-oldest", { backdateMs: 90_000 });
+    await h.seed("ws-middle", { backdateMs: 60_000 });
+    await h.seed("ws-newest", { backdateMs: 30_000 });
+
+    const result = await reapStaleStoppedInstances(h.deps);
+
+    expect(result).toMatchObject({ checked: 3, eligible: 3, deleted: 2, deferred: 1 });
+    expect(h.handles.get("ws-oldest")?.deleteCalls).toBe(1);
+    expect(h.handles.get("ws-middle")?.deleteCalls).toBe(1);
+    expect(h.handles.get("ws-newest")?.deleteCalls ?? 0).toBe(0);
+    expect((await h.repo.getWorkspace("ws-newest"))?.instanceUrl).toBe(
+      "https://ws-newest.run.app",
+    );
+    const deferred = h.logger.parsed.find(
+      (e) => e["event"] === "control-plane.instance-gc.deferred",
+    );
+    expect(deferred).toBeTruthy();
+    expect(deferred!["deferred"]).toBe(1);
+  });
+
+  test("default cap 10: 11 eligible workspaces leave exactly 1 deferred", async () => {
+    const h = startReapHarness();
+    for (let i = 0; i < 11; i++) {
+      await h.seed(`ws-cap-${i}`, { backdateMs: 60_000 + i * 1000 });
+    }
+
+    const result = await reapStaleStoppedInstances(h.deps);
+
+    expect(result).toMatchObject({ eligible: 11, deleted: 10, deferred: 1 });
   });
 });
 

@@ -111,6 +111,7 @@ async function main(): Promise<void> {
             clock,
             logger,
             staleAfterMs: config.instanceGcStaleAfterMs,
+            maxDeletesPerSweep: config.instanceGcMaxDeletesPerSweep,
           },
           { intervalMs: config.instanceGcIntervalMs },
         )

@@ -25,6 +25,9 @@ export const DEFAULT_PORT = 8080;
  */
 export const DEFAULT_INSTANCE_GC_INTERVAL_MS = 60 * 60 * 1000;
 export const DEFAULT_INSTANCE_GC_STALE_AFTER_MS = 30 * 24 * 60 * 60 * 1000;
+/** Smallest accepted staleness: 1 hour (a 1ms threshold would GC everything). */
+export const MIN_INSTANCE_GC_STALE_AFTER_MS = 60 * 60 * 1000;
+export const DEFAULT_INSTANCE_GC_MAX_DELETES_PER_SWEEP = 10;
 
 /**
  * Default Cloud Run Instances API origin + version (issue #47). Overridable
@@ -141,9 +144,17 @@ export interface ControlPlaneConfig {
   readonly instanceGcIntervalMs: number;
   /**
    * How long a STOPPED workspace must be untouched before its Instance is
-   * GC-deleted. Defaults to 30 days.
+   * GC-deleted. Defaults to 30 days; values below 1 hour are rejected (an
+   * absurdly small threshold combined with the hourly sweeper would wipe
+   * every stopped Instance at once).
    */
   readonly instanceGcStaleAfterMs: number;
+  /**
+   * Per-sweep delete cap (issue #85: bounds the blast radius of a future
+   * eligibility bug). Oldest-first; the remainder waits for the next sweep.
+   * Defaults to 10.
+   */
+  readonly instanceGcMaxDeletesPerSweep: number;
 }
 
 export function readControlPlaneConfig(
@@ -191,6 +202,12 @@ export function readControlPlaneConfig(
       env["INSTANCE_GC_STALE_AFTER_MS"],
       "INSTANCE_GC_STALE_AFTER_MS",
       DEFAULT_INSTANCE_GC_STALE_AFTER_MS,
+      MIN_INSTANCE_GC_STALE_AFTER_MS,
+    ),
+    instanceGcMaxDeletesPerSweep: readOptionalMs(
+      env["INSTANCE_GC_MAX_DELETES_PER_SWEEP"],
+      "INSTANCE_GC_MAX_DELETES_PER_SWEEP",
+      DEFAULT_INSTANCE_GC_MAX_DELETES_PER_SWEEP,
       1,
     ),
   };

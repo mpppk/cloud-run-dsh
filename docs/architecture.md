@@ -193,7 +193,7 @@ sequenceDiagram
 |---|---|
 | `POST /v1/workspaces` | ワークスペースを作成する。id はサーバが採番する。 |
 | `GET /v1/workspaces/:id` | 状態を取得する。 |
-| `DELETE /v1/workspaces/:id` | ワークスペースを削除する。先に Instance を消し、成功したら行を子（セッション・イベント・チェックポイント・リース）ごと削除する。Instance 削除に失敗したら 502 で行を残す。メンバーシップ必須（#85）。 |
+| `DELETE /v1/workspaces/:id` | ワークスペースを削除する。**STOPPED 以外（稼働中含む）でも強制削除する**（rm -rf semantics。409 ゲートは同一 TOCTOU で保証にならないため付けない）。先に Instance を消し、成功したら行を子（セッション・イベント・チェックポイント・リース）ごと削除する。Instance 削除に失敗したら 502 で行を残す。メンバーシップ必須（#85）。**GCS 上の checkpoint 実体は残る**（バケットに orphan が溜まる。既知の残件）。 |
 | `POST /v1/workspaces/:id/open` | Instance を起動する（同時実行は合流）。 |
 | `POST /v1/workspaces/:id/stop` | 停止する。agent-host の停止準備（`POST 停止準備`→チェックポイント保存）が成功してから Instance を stop する。準備に失敗したら `CHECKPOINT_FAILED` で stop しない（#72）。Instance は delete せず残す（#85）。 |
 | `POST /v1/workspaces/:id/checkpoints` | 手動チェックポイント。agent-host で実スナップショットを取ってから `checkpointed: true` を返す（#75）。clean tree のスキップは成功扱いで、応答の `skipped` が `true` になる（実際に取られたときは `false`）（#89）。Instance が止まっているときは 409。 |
