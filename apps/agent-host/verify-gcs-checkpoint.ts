@@ -2,6 +2,11 @@
 //   GCP_ACCESS_TOKEN="$(gcloud auth print-access-token)" \
 //   CHECKPOINT_BUCKET=<bucket> bun run apps/agent-host/verify-gcs-checkpoint.ts
 //
+// 認証は本番と同じ createGcsTokenProvider()（#27: metadata-server → ADC →
+// GCP_ACCESS_TOKEN の順）を使うため、GCP_ACCESS_TOKEN はフォールバックである。
+// ADC 済み環境（`gcloud auth application-default login` 後）ではそちらが優先
+// される。CHECKPOINT_BUCKET は必須。
+//
 // 本番アダプタのみを使う（フェイクなし）。2026-09-05 に実バケットで成功を確認。
 
 // #26 verification: checkpoint save/restore against the REAL GCS bucket.

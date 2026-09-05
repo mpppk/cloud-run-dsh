@@ -62,7 +62,7 @@ export interface AgentHostDependencies {
   readonly secretProvider: SecretProvider;
   /** Real: fetch-based transport. Test: canned transport. */
   readonly brokerTransport: HttpTransport;
-  /** Real: BunSqlLeaseStore. Test: InMemoryLeaseStore (from ./testing). */
+  /** Real: BunSqlLeaseStore. Test: InMemoryLeaseStore (from @cloud-run-dsh/controller-lease/testing). */
   readonly leaseStore: LeaseStore;
   /**
    * Interval scheduler driving the controller-lease heartbeat loop.

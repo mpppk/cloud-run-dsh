@@ -344,8 +344,11 @@ export class AgentGateway {
       });
     }
     if (!starter) {
-      // No turn implementation is wired (issue #21 has not landed): say so
-      // OUT LOUD (503 + explicit code + structured log) instead of 202.
+      // No turn implementation is wired (issue #21 landed in PR #38 and
+      // production always wires HarnessTurnStarter in index.ts, so this is
+      // now a defensive path for starter-less compositions such as unit
+      // tests): say so OUT LOUD (503 + explicit code + structured log)
+      // instead of 202.
       // A 202 here would re-create the exact "looks delivered but nothing
       // runs" failure the control-plane forwarding exists to remove.
       this.deps.logger.error("gateway.turn.not_implemented", {
