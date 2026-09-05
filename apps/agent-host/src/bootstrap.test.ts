@@ -57,11 +57,22 @@ describe("WorkspaceBootstrapper", () => {
     const args = git.calls[0]!.args;
     expect(args).toContain("clone");
     // Token travels via http.extraheader, not in the remote URL.
+    // Issue #62: git requires Basic base64("x-access-token:<token>"), not Bearer.
     const header = args.find((arg) => arg.includes("extraheader"));
-    expect(header).toContain(`Bearer ${FAKE_INSTALLATION_TOKEN}`);
+    const expectedB64 = Buffer.from(`x-access-token:${FAKE_INSTALLATION_TOKEN}`, "utf8").toString(
+      "base64",
+    );
+    expect(header).toContain(`Authorization: Basic ${expectedB64}`);
+    expect(header).not.toContain("Bearer");
+    // Decode round-trip: shape match alone must not pass with wrong content.
+    const b64 = header!.split("Authorization: Basic ")[1]!.trim();
+    expect(Buffer.from(b64, "base64").toString("utf8")).toBe(
+      `x-access-token:${FAKE_INSTALLATION_TOKEN}`,
+    );
     const url = args.find((arg) => arg.startsWith("https://"));
     expect(url).toBe("https://github.com/mpppk/cloud-run-dsh.git");
     expect(url!.includes(FAKE_INSTALLATION_TOKEN)).toBe(false);
+    expect(url!.includes(b64)).toBe(false);
   });
 
   test("mkdir /workspace happens before clone", async () => {
@@ -118,15 +129,20 @@ describe("WorkspaceBootstrapper", () => {
     const restored = await fs.readFile("/workspace/notes.txt");
     expect(new TextDecoder().decode(restored)).toBe("hello from checkpoint");
 
-    // Token discarded and never persisted.
+    // Token discarded and never persisted (raw token AND its base64 form are both secret).
     expect(bootstrapper.isTokenDiscarded).toBe(true);
+    const expectedB64 = Buffer.from(`x-access-token:${FAKE_INSTALLATION_TOKEN}`, "utf8").toString(
+      "base64",
+    );
     for (const write of fs.writes) {
       const text = new TextDecoder().decode(write.data);
       expect(text.includes(FAKE_INSTALLATION_TOKEN)).toBe(false);
+      expect(text.includes(expectedB64)).toBe(false);
     }
-    // No git call after the clone carries the token.
+    // No git call after the clone carries the token (raw or base64).
     for (const call of git.calls.slice(1)) {
       expect(call.args.some((a) => a.includes(FAKE_INSTALLATION_TOKEN))).toBe(false);
+      expect(call.args.some((a) => a.includes(expectedB64))).toBe(false);
     }
   });
 

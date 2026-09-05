@@ -275,9 +275,16 @@ export function createGitHubCredentialBroker(
   function gitAuthArgs(token: string): readonly string[] {
     // Use http.extraheader so the token never appears in a remote URL.
     // Caller should pass these as `git -c http.extraHeader=... clone ...`
+    // NOTE: git-over-HTTPS rejects `Authorization: Bearer <installation-token>`
+    // (REST API accepts Bearer, git transport does not — issue #62). GitHub
+    // requires Basic with the fixed username "x-access-token".
+    // The base64 blob decodes to "x-access-token:<token>", so it IS the secret
+    // itself (base64 is not encryption): it lives in argv (unavoidable for git),
+    // but must never be persisted in a remote URL nor emitted to logs/errors.
+    const credentials = Buffer.from(`x-access-token:${token}`, "utf8").toString("base64");
     return [
       "-c",
-      `http.https://github.com/.extraheader=Authorization: Bearer ${token}`,
+      `http.https://github.com/.extraheader=Authorization: Basic ${credentials}`,
     ] as const;
   }
 
