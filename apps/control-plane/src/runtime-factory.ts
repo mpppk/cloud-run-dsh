@@ -40,7 +40,7 @@
 //   runLifecycleCheckpoint NO-OP success: durable checkpoints are written
 //                          continuously by the agent-host periodic scheduler.
 //                          A control-plane-driven remote checkpoint trigger is
-//                          follow-up work for #22 (no agent-host endpoint
+//                          follow-up work in #75 (no agent-host endpoint
 //                          exists yet to trigger one).
 //   flushSessionPersistence NO-OP: session events are append-only at write
 //                          time (same rationale as the agent-host steps).
@@ -432,9 +432,10 @@ async function waitForInstanceHealth(args: {
  * Manual-checkpoint work for runManualCheckpoint: records a durable,
  * timestamped request marker in the checkpoint bucket. The control plane has
  * no workspace files (and no git) so it cannot build a T5 bundle itself; the
- * agent-host owns bundle creation. #22 teaches the agent-host to honor these
- * markers (or replaces them with a direct trigger call); until then the
- * marker is an auditable record of operator intent, never a silent no-op.
+ * agent-host owns bundle creation. #75 tracks teaching the agent-host to
+ * honor these markers (or replacing them with a direct trigger call); until
+ * then the marker is an auditable record of operator intent, never a silent
+ * no-op.
  */
 export function buildManualCheckpointFn(
   storage: GcsCheckpointStorage,

@@ -194,7 +194,9 @@ export class RuntimeRegistry {
 /**
  * Readiness report served by GET /readyz. Unlike /livez (liveness: the
  * process is up), readiness must honestly reflect degraded capability —
- * e.g. the production runtime registry being a placeholder.
+ * e.g. the database being unreachable. (An earlier revision named "the
+ * production runtime registry being a placeholder" as the example; the
+ * placeholder was removed in #23, so the example was updated.)
  */
 export interface ControlPlaneReadiness {
   readonly ready: boolean;
@@ -223,8 +225,8 @@ export interface ControlPlaneDeps extends AuthDeps {
   readonly sseHeartbeatMs?: number;
   /**
    * Optional readiness probe (GET /readyz). When absent, /readyz reports
-   * ready. When present it must report honestly — a control plane whose
-   * runtime registry is a placeholder reports NOT ready with the reason.
+   * ready. When present it must report honestly — a control plane that has
+   * lost its database reports NOT ready with the reason.
    */
   readonly readiness?: () => ControlPlaneReadiness;
   /**

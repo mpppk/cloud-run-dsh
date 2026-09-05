@@ -389,10 +389,12 @@ export type FetchFn = (
  * timeout so a non-GCP environment fails fast with a clear error instead of
  * hanging the first Instance operation.
  *
- * NOTE (#27): a production-grade metadata-server implementation (caching,
- * refresh, ADC fallback) is #27's scope. This is the minimal stopgap that
- * keeps the control plane shippable until then — same shape as the
- * agent-host's envGcsTokenProvider precedent.
+ * NOTE (#27 closed, #76): #27 landed production-grade token handling
+ * (caching, refresh, ADC fallback) on the agent-host side only
+ * (RefreshingGcsTokenProvider, PR #33). This control-plane provider is still
+ * the minimal stopgap — no cache, no ADC fallback — and stays shippable
+ * because Instance API / GCS calls are infrequent. Parity is tracked in #76;
+ * see also the agent-host's envGcsTokenProvider precedent.
  */
 export function createGcpAccessTokenProvider(
   env: Readonly<Record<string, string | undefined>> = process.env,

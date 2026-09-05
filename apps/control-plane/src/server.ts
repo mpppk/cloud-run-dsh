@@ -208,8 +208,11 @@ export function createFetchHandler(deps: ControlPlaneDeps): (request: Request) =
       }
 
       // Readiness endpoint: honestly reflects degraded capability (e.g. the
-      // production runtime registry being a placeholder). Served before auth,
-      // like /livez — it must be probeable by the platform.
+      // database being unreachable — an earlier revision named "the
+      // production runtime registry being a placeholder" here, but the
+      // placeholder was removed in #23). Served before auth,
+      // like /livez — it must be probeable by the platform (/readyz reaches
+      // the container; only the exact "/healthz" is reserved, see above).
       if (url.pathname === "/readyz" && request.method === "GET") {
         const report = deps.readiness?.();
         if (report && !report.ready) {
