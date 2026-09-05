@@ -9,9 +9,9 @@ workspace 復元」を実機で通した記録**である。
 [#75](https://github.com/mpppk/cloud-run-dsh/issues/75)）が正しいことを実機で確認し、
 その過程で**新たに 5 件の問題**を発見した。
 
-その後、**同じ日にもう 2 周**（環境の構築 → 確認 → 撤収）を回している。
-2周目は §6、3周目は §7、3 周を通した総括は §9 にある。
-**復元は 3 周とも成立した。**
+その後、**さらに 3 周**（環境の構築 → 確認 → 撤収）を回している。
+2周目は §6、3周目は §7、4周目は §8、4 周を通した総括は §10 にある。
+**復元は 4 周とも成立した**（4周目だけは open を呼び直す必要があった — §8.3）。
 
 検証後、GCP リソースはすべて削除済み（各周の撤収節）。
 
@@ -568,11 +568,182 @@ Cloud SQL: なし   Cloud Run: なし   バケット: なし   Secret: なし   
 | `CHECKPOINT_FAILED` の保護の実機確認 | **1周目から未確認。**チェックポイントを安全に失敗させる方法が無い |
 | 同時 stop のレース（#88） | ローカルで決定論的に再現済み。**実機では未確認** |
 | IAP フロントエンド | 未作成（ブランドは一度作ると削除できない）。**IAP 経由の経路は依然未検証** |
-| #115 のドレイン確認ゲート | **未検証どころか壊れていた。** レポート執筆中に Monitoring を読み直したところ、ゲートのフィルタが `database_id` を `project:instance` ではなくインスタンス名単体で指定しており、時系列が 1 本も返らない。ゲートを越えられず **destroy に到達できない**（[#118](https://github.com/mpppk/cloud-run-dsh/issues/118)）。ゲージ自体は上記のとおり正しい信号を出しているので、壊れているのはフィルタ 1 行 |
+| #115 のドレイン確認ゲート | **未検証どころか壊れていた。** レポート執筆中に Monitoring を読み直したところ、ゲートのフィルタが `database_id` を `project:instance` ではなくインスタンス名単体で指定しており、時系列が 1 本も返らない。ゲートを越えられず **destroy に到達できない**（[#118](https://github.com/mpppk/cloud-run-dsh/issues/118)）。ゲージ自体は上記のとおり正しい信号を出しているので、壊れているのはフィルタ 1 行。**4周目で修正版を実機検証し、destroy が 1 回で成功した（§8.1）** |
 
 ---
 
-## 8. 1周目レポート（open まで）との差分
+## 8. 4周目（2026-09-05〜06）— 撤収ゲートを実機で試す周
+
+3周目で入れた撤収ゲート（#115 → PR #116、フィルタ修正 #118 → PR #119）は
+**一度も実機で動いていなかった**。4周目の合格条件はただひとつ、
+**手順書どおりに撤収して `terraform destroy` が 1 回で成功すること**である
+（3周目は 2 回必要だった）。
+
+### 8.1 結論から — ゲートは動いた。destroy は 1 回で終わった
+
+```
+num_backends sample 1: 2 (from 1 series)
+num_backends sample 2: 2 (from 1 series)
+num_backends sample 3: 1 (from 1 series)
+num_backends sample 4: 1 (from 1 series)
+num_backends sample 5: 1 (from 1 series)
+num_backends sample 6: 1 (from 1 series)
+num_backends sample 7: 1 (from 1 series)
+num_backends sample 8: 0 (from 1 series)   ← ここで break
+→ Destroy complete! Resources: 47 destroyed.   エラー 0 件
+```
+
+`(from 1 series)` が #118 の修正が効いている証拠である。
+`database_id` を `project:instance` にしたので時系列が返っている。
+
+削除順（#103 の `depends_on`）も 4周目も正しかった:
+
+```
+google_sql_database.dsh:           Destruction complete after 1s
+google_sql_user.app:               Destruction complete after 0s   ← database の後
+google_sql_database_instance.main: Destruction complete after 2m33s
+```
+
+残留リソースはゼロ。`tfstate` も削除済み。ローカルの秘密は 3 回上書きして破棄した。
+
+### 8.2 ゲートが、別のバグを釣り上げた
+
+ゲートは最初 `2` を返し続けた。**control-plane はもう消してあるのに接続が残る。**
+理由は、撤収手順の**最初のステップ（Step 8.1）が動いていなかった**からである。
+
+```
+$ gcloud run instances list --location=asia-northeast1
+ERROR: (gcloud.run) Invalid choice: 'instances'.
+```
+
+`gcloud run instances` は**現行の gcloud（SDK 582.0.0）に存在しない**。
+Instance は Terraform state に入っていないので `terraform destroy` でも消えない。
+手順書自身が「step 1 is the only thing that stops their billing」と書いている、
+その step 1 が動かなかった。**Instance は生き残り、課金が続いていた。**
+
+v2 REST で消したところ、接続はすぐ落ちた:
+
+```
+（Instance を DELETE）
+num_backends sample 8: 0    ← 落ちた
+```
+
+**ゲートが無ければ、Instance が残ったまま「撤収完了」と判断していた。**
+`terraform destroy` は成功しただろうし、Terraform 管理下のものは全部消えたので、
+一見きれいに終わったように見えたはずである。
+[#123](https://github.com/mpppk/cloud-run-dsh/issues/123) として起票し、
+[PR #124](https://github.com/mpppk/cloud-run-dsh/pull/124) で v2 REST の
+**列挙 → 全件削除 → 空になるまで確認**に置き換えた。
+
+手順書は `dsh-ws-demo` という**固定名**を消そうとしていたことも分かった。
+実際の名前は `dsh-<workspace-uuid>` なので、**固定名では最初から当たらない**。
+
+### 8.3 stop の直後に open を呼ぶと必ず失敗する（#121）
+
+4周目で初めて **stop と open を連続で実行した**（1〜3周目は間に他の確認を挟んでいて、
+たまたま 60 秒以上空いていた）。結果:
+
+```
+POST /v1/workspaces/{id}/stop  → 200 {"state":"STOPPED"}   1.4 秒
+POST /v1/workspaces/{id}/open  → 500 internal server error  63.6 秒
+```
+
+Instance のログを見ると理由がはっきりしている:
+
+```
+21:37:59  gateway.prepare_stop.prepared  state=STOPPING   ← stop はここで 200 を返す
+21:38:07  "Shutting down user disabled instance"
+   （10 秒おきに繰り返し）
+21:39:07  "Shutting down user disabled instance"          ← 約 60 秒続く
+21:39:47  "Started instance in 8.43s."                    ← ようやく起動
+21:39:52  workspace.restore.completed / agent.host.listening
+```
+
+control-plane 側は 21:38:00 に open を始め、agent-host の `/readyz` を 30 回
+ポーリングして 21:39:03 に諦めた。**その 44 秒後に Instance は普通に起動し、
+復元も成功している。** つまり**実際には何も壊れていないのに失敗扱いになった。**
+
+ポーリング中に返っていた `HTTP 500` は**アプリの応答ではなく
+Google フロントエンドのエラーページ**だった。
+「URL がまだ応答できる状態にない」ことと「agent-host が不健康」を、
+**同じカウンタで数えていた**のが本質である。
+
+### 8.4 そして状態が食い違ったまま固まった（#122）
+
+失敗した後、workspace は**観測できる状態がすべて READY なのに、
+ターンだけが拒否される**状態になった。
+
+```
+GET  /v1/workspaces/{id}          → 200 "runtimeState":"READY"
+GET  agent-host /readyz           → 200 "status":"READY"
+POST /v1/sessions/{sid}/messages  → 409 "agent input refused in state RESTORE_FAILED"
+```
+
+`RESTORE_FAILED` は**どの GET でも観測できない**ので、クライアントには
+何が起きているのか分かりようがない。原因は
+`assertAgentInputAllowed()` が**プロセス内キャッシュ**を読んでいて、
+DB を読み直す `reloadState()` を呼ぶのが `open()` だけだったこと。
+
+```
+21:39:03  control-plane が RESTORE_FAILED を書く（open 失敗）
+21:39:52  agent-host が DB を READY に更新（復元は成功している）
+21:42:09  ターンを投げる → 409 RESTORE_FAILED
+21:47:22  もう一度 POST /open → 0.7 秒で 200 READY
+21:47:22  同じセッションにターン → 201 受理。ファイルも読めた
+```
+
+**`open` を呼び直せば直る。だがそれを知る手段が API に無い。**
+
+### 8.5 データは無事だった
+
+失敗したのは起動の手順であって、復元そのものではない。
+再 open 後、**新しいセッション**から読ませたところ:
+
+```
+tool-call  read  {"file_path": "/workspace/CYCLE4_PROOF.txt"}
+assistant  The exact contents of `/workspace/CYCLE4_PROOF.txt` are:
+           cycle4-marker-20260906
+```
+
+### 8.6 ついでに測ったもの
+
+| 項目 | 結果 |
+|---|---|
+| デプロイ | **revision 00001**（3周連続で一発） |
+| `num_backends` ピーク | **10**（#109 の上限どおり。3周目に続き 2 周連続） |
+| ログ中のトークン | **0 件** |
+| Terraform | 52 適用 / 47 destroy（差の 5 件は Step 8.3 でバケットを先に消したため。バケット本体＋IAM バインド 4 件が destroy の対象外になった） |
+| 手動チェックポイント | dirty なので `skipped: false`（期待どおり） |
+
+> 数字の出どころ: §8.1 の 8 サンプル・`47 destroyed`・`Invalid choice` は
+> `teardown-c4.log`、`stop` 1.4 秒・再 `open` の 500（63.6 秒）・409 は
+> `c4-verify.log`、マーカーの読み取りは `c4-sse-restore3.txt` に残っている。
+> §8.3〜§8.4 の時刻は `gcloud logging read` の値で、ファイルには残していない。
+> 再 `open` の 0.7 秒と手動チェックポイントの応答も実行時の端末出力による
+> （チェックポイント自体は Step 8.3 のバケット削除記録に
+> `manual-checkpoints/2026-09-05T21-51-56-939Z.json` として残っている）。
+> `num_backends` のピーク 10 は §7.1 と同じ手順で Monitoring の保持データから確認した。
+
+### 8.7 4周目で見つかった 3 件
+
+| # | 内容 | どこで落ちたか |
+|---|---|---|
+| [#121](https://github.com/mpppk/cloud-run-dsh/issues/121) | stop 直後の open が構造的に必ず失敗する | stop → open を初めて連続実行したとき |
+| [#122](https://github.com/mpppk/cloud-run-dsh/issues/122) | 復旧後も in-memory 状態が RESTORE_FAILED のまま固まる | #121 の後始末をしようとしたとき |
+| [#123](https://github.com/mpppk/cloud-run-dsh/issues/123) | 撤収 Step 8.1 の gcloud コマンドが存在しない | **撤収ゲートが接続の残存を検知したことで発覚** |
+
+#121 と #122 は [PR #125](https://github.com/mpppk/cloud-run-dsh/pull/125)、
+#123 は [PR #124](https://github.com/mpppk/cloud-run-dsh/pull/124) で修正した。
+
+#125 のレビューでは、レビュアーが
+**「5xx かつ本文に `server error`」という判定が、アプリ自身の catch-all 500
+（`{"error":"internal server error"}`）にもマッチしてしまう**ことを見つけて直した。
+判定を `<html` に絞ることで、本物の障害を shutdown 窓と誤認して
+3 分待つ経路が消えた。
+
+---
+
+## 9. 1周目レポート（open まで）との差分
 
 | | 前回（open まで） | 今回（stop → 復元） |
 |---|---|---|
@@ -587,30 +758,65 @@ Cloud SQL: なし   Cloud Run: なし   バケット: なし   Secret: なし   
 
 ---
 
-## 9. 3 周を通しての総括
+## 10. 4 周を通しての総括
 
-同じ日に環境を 3 回作って壊した。**周を追うごとに新しく見つかるバグが減っている。**
+環境を 4 回作って壊した（1〜3周目は同じ日、4周目は翌日にまたがった）。
 
-| | 1周目 | 2周目 | 3周目 |
-|---|---|---|---|
-| 新しく見つかったバグ | 5 件（#93 / #94 / #95 / #96 / #97 ほか） | 3 件（#107 / #109 / #110） | **1 件（#115）** |
-| デプロイの revision | 00003（2 回失敗） | **00001** | **00001** |
-| `terraform destroy` | 1 回（事前に `DROP OWNED BY`） | 1 回 | **2 回**（#115） |
-| Terraform リソース | 50 | 52 | 52 |
-| 復元 | 39 秒 | 58 秒 | 18 秒 |
+| | 1周目 | 2周目 | 3周目 | 4周目 |
+|---|---|---|---|---|
+| 新しく見つかったバグ | 5 件（#93 / #94 / #95 / #96 / #97 ほか） | 3 件（#107 / #109 / #110） | 1 件（#115） | **3 件（#121 / #122 / #123）** |
+| デプロイの revision | 00003（2 回失敗） | **00001** | **00001** | **00001** |
+| `terraform destroy` | 1 回（事前に `DROP OWNED BY`） | 1 回 | 2 回（#115） | **1 回（ゲートが効いた）** |
+| Terraform リソース | 50 | 52 | 52 | 52 適用 / 47 destroy |
+| `num_backends` ピーク | — | 23 | 10 | **10** |
+| 復元 | 39 秒 | 58 秒 | 18 秒 | 失敗 → 再 open で成功（#121） |
 
-**1周目のバグはローカルでは絶対に出ない種類だった。** `idleTimeout`、
-シークレットの権限、Cloud SQL のソケット形式 — どれも「手元では緑」のまま
-実機の直前で落ちるものである。
+**「周を追うごとにバグが減る」は 3周目までの話だった。** 4周目で 3 件に戻っている。
+減っていたのではなく、**まだ触っていない経路が残っていただけ**である。
 
-**2周目・3周目のバグは種類が変わった。**
-#107 は「ローカルのどのコマンドも Dockerfile の COPY 列挙を実行しない」経路、
-#109 は「1周目の回避策が原因を隠していた」もの、
-#115 は「撤収という、成功したときは誰も見ない経路」である。
-**周回を重ねると、検証されていない経路が奥から順に出てくる。**
+### 何が変わると新しいバグが出るか
+
+4周目の 3 件は、いずれも**それまでの周と操作の順序や環境が違った**ことで出た。
+
+- **#121**（stop 直後の open）は、**stop と open を連続で実行した**から出た。
+  1〜3周目は間に確認作業を挟んでいて、たまたま 60 秒以上空いていた。
+  **バグはコードにずっとあったが、叩き方が足りなかった。**
+- **#122** は #121 の後始末をしようとして初めて見えた。
+  **失敗した後の状態**は、成功し続けている限り誰も見ない。
+- **#123**（`gcloud run instances` が無い）は、**手順書どおりに撤収したから**出た。
+  1〜3周目の撤収は私が REST で Instance を消していて、手順書の Step 8.1 を
+  そのまま実行していなかった。
+
+**「手順書を読んで、書いてあるとおりに実行する」ことそれ自体が検証だった。**
+
+### バグの型は 4 周を通して変わっていない
 
 前回のレポート（open まで）は「バグ 14 件のすべてがテストダブルかコメントと
-実物の乖離だった」と結論した。3 周を通しても、この形は変わっていない。
-**#109 は毛色が違い、「実装そのもの」のバグだった** —
-上限のないプールという、コードを読めば分かるが実機で負荷をかけるまで
-誰も困らない種類の欠陥である。
+実物の乖離だった」と結論した。**4 周を通しても、この形が大半である。**
+
+- 1周目: `idleTimeout`、シークレットの権限、Cloud SQL のソケット形式 —
+  「手元では緑」のまま実機の直前で落ちるもの
+- 2周目: #107（ローカルのどのコマンドも Dockerfile の COPY 列挙を実行しない）
+- 3周目: #115（撤収という、成功したときは誰も見ない経路）
+- 4周目: #123（手順書に書いてあるコマンドが存在しない）、
+  #118（ゲートのフィルタが実物のラベル形式と違う）
+
+**例外は 3 件で、いずれも「実装そのもの」のバグだった。**
+
+- **#109** — 上限のないプール。コードを読めば分かるが、
+  実機で負荷をかけるまで誰も困らない。
+- **#121** — shutdown 窓より短いポーリング予算と、500 の一律カウント。
+  コードの前提（500 = agent-host が不健康）が実物と違った。
+- **#122** — in-memory キャッシュを読む入力ゲート。
+  **正常系では絶対に踏まない**。異常系に落ちた後の回復経路にしかない。
+
+### ゲートが別のバグを釣った
+
+4周目で一番おもしろかったのは、**#115 のために入れた撤収ゲートが
+#123 を釣り上げた**ことである。ゲートが「接続がまだ残っている」と言い続けたので
+調べたら、消えていないはずの Instance が生きていた。
+
+ゲートが無ければ `terraform destroy` は成功し、Terraform 管理下のものは全部消え、
+**一見きれいに終わったように見えたはずである。**
+「まだ終わっていないものを終わっていないと言う」仕組みには、
+**それが直接狙ったバグ以外も捕まえる**価値がある。
