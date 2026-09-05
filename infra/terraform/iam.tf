@@ -192,3 +192,22 @@ resource "google_service_account_iam_member" "control_plane_act_as_agent_host" {
   role               = "roles/iam.serviceAccountUser"
   member             = "serviceAccount:${google_service_account.control_plane.email}"
 }
+
+# --- Artifact Registry: repo-scoped reader for the Instance runtime SA -----
+# The agent-host repository image is pulled at Instance startup by the Cloud
+# Run infrastructure using the runtime execution SA (agent-host). Without this
+# binding, POST /v1/workspaces/:id/open fails with
+# artifactregistry.repositories.downloadArtifacts PERMISSION_DENIED (#58).
+# Scoped to the repository — not the project — via
+# google_artifact_registry_repository_iam_member.
+# The control-plane SA is intentionally NOT granted here: it only passes the
+# image URI string in the create request (containers[].image) and never calls
+# the Artifact Registry API itself.
+
+resource "google_artifact_registry_repository_iam_member" "agent_host_reader" {
+  project    = var.project_id
+  location   = var.region
+  repository = google_artifact_registry_repository.agent_host.repository_id
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.agent_host.email}"
+}
