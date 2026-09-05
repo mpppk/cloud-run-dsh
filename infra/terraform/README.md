@@ -196,7 +196,7 @@ terraform -chdir=infra/terraform validate
 
 Cloud Run Instances (`run.googleapis.com` Instance API: create/start/stop/delete per-instance lifecycle, Pre-GA) are **not** provisioned via Terraform, by decision — not by accident. See [ADR-0001](../../docs/adr/0001-instances-outside-terraform.md) ([#28](https://github.com/mpppk/cloud-run-dsh/issues/28)).
 
-In short: Instances are short-lived, per-workspace resources whose lifecycle belongs to the application (the control plane creates/deletes them at runtime). Managing them declaratively would turn every runtime-created Instance into `terraform plan` drift, while making "open a workspace" an infrastructure change. Terraform owns the static foundation (APIs, Cloud SQL, GCS, Secrets, IAM, service accounts) — nothing more.
+In short: Instances are per-workspace resources whose lifecycle belongs to the application (the control plane creates / starts / stops them at runtime; it intentionally never deletes them — stopped Instances cost nothing, see [#85](https://github.com/mpppk/cloud-run-dsh/issues/85)). Managing them declaratively would turn every runtime-created Instance into `terraform plan` drift, while making "open a workspace" an infrastructure change. Terraform owns the static foundation (APIs, Cloud SQL, GCS, Secrets, IAM, service accounts) — nothing more.
 
 Instance lifecycle is handled at runtime by the control plane's `InstanceRuntime` adapter (see 実装手順書 §5) which calls the Cloud Run REST API directly. Do **not** fake it with `google_cloud_run_v2_service`, and do not add a `run_instances.tf` even if `hashicorp/google`(-beta) ships a `google_cloud_run_instance` resource — revisit ADR-0001 first.
 

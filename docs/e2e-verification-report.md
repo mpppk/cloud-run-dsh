@@ -224,7 +224,7 @@ TypeError: Invalid URL
 
 | Issue | 内容 |
 |---|---|
-| [#72](https://github.com/mpppk/cloud-run-dsh/issues/72) | stop が Instance を delete せず、停止時の tar.gz チェックポイントも保存しない（図との差） |
+| [#72](https://github.com/mpppk/cloud-run-dsh/issues/72) | stop 時に tar.gz チェックポイントが保存されない（当時は「delete しない」も差分として挙げていたが、後日 delete しないほうが正と決着した。[#85](https://github.com/mpppk/cloud-run-dsh/issues/85)） |
 | [#73](https://github.com/mpppk/cloud-run-dsh/issues/73) | マイグレーション後に `terraform destroy` が失敗する |
 
 `POST /checkpoints` が返す `{"checkpointed":true}` は、実際にはマーカーの JSON を

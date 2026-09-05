@@ -55,11 +55,50 @@ terraform -chdir=infra/terraform apply -var-file=profiles/minimal.tfvars
 | Secret Manager (シークレット 3 件 × 1 バージョン) | $0.06/バージョン/月 | $0.18 | [Secret Manager pricing](https://cloud.google.com/secret-manager/pricing) |
 | Artifact Registry (1 イメージ ≈ 0.5 GiB 以下想定) | $0.10/GiB/月 (0.5 GiB 無料枠) | $0〜僅少 | [Artifact Registry pricing](https://cloud.google.com/artifact-registry/pricing) |
 | Cloud Run (コントロールプレーン) | リクエスト時のみ課金 | ほぼ $0 (アイドル時) | [Cloud Run pricing](https://cloud.google.com/run/pricing) |
-| Cloud Run Instance (Pre-GA) | 公開価格表なし | **不明** (Running 中は秒課金。使わない限り $0。検証後は必ず stop/delete) | Pre-GA のため公開価格なし。Cloud Run pricing ページにも記載なし |
+| Cloud Run Instance (Pre-GA) | CPU $0.00000027/vCPU秒 + メモリ $0.00000193/GiB秒 (Tokyo) | **稼働時間のみ**。1 vCPU / 1 GiB を 30 日連続で $5.70。**停止中は $0** | Cloud Billing Catalog API の実 SKU (下記)。pricing ページには記載が無い |
 | ネットワーク egress | 使用量依存 | **不明** | [Network pricing](https://cloud.google.com/vpc/network-pricing) |
 | VPC peering / Private Service Access range | ピアリング自体は無課金 | $0 (内部 IP 保有料の扱いは**不明**) | https://cloud.google.com/vpc/network-pricing |
 
 **合計 (DB 稼働 24h/日): 約 $11〜12/月** (Cloud Run Instance の稼働分と egress は別途)。
+
+#### Cloud Run Instance の単価の根拠 (2026-09-05 実測)
+
+pricing ページに Instances の記載が無いため、Cloud Billing Catalog API から
+Cloud Run (`services/152E-C115-5142`) の SKU を全件取得して確認した。
+**description が `Instances` で始まる SKU は2つしか存在しない。**
+
+```
+asia-northeast1
+  Instances CPU      0.00000027 USD / second          (category: Compute)
+  Instances Memory   0.00000193 USD / gibibyte second (category: Compute)
+```
+
+**storage / disk の SKU は無い** (ディスク系は `Ephemeral Storage` = category
+`EphemeralDisk` のみで、これは停止で消える)。2つとも稼働時間の計測なので、
+**停止した Instance は課金されない。**
+
+> description に `Instance` を含む SKU は他に
+> `Services CPU / Memory (Instance-based billing)` の2件があるが、これは Cloud Run
+> **Services** の課金モードであって Instances 製品のものではない。いずれも時間課金の
+> メーターなので、停止中ゼロという結論は変わらない。
+
+裏取り: `1 vCPU × 30日 = 2,592,000秒 × 0.00000027 = $0.70`、
+`1 GiB × 30日 = 2,592,000秒 × 0.00000193 = $5.00`、合計 **$5.70** は
+[Introducing Cloud Run instances](https://cloud.google.com/blog/products/serverless/introducing-cloud-run-instances)
+の公表額と一致する。全額が CPU とメモリだけで説明できるため、隠れた保有料は無い。
+
+この結果、**停止した Instance は delete せず残す**方針とした
+([#85](https://github.com/mpppk/cloud-run-dsh/issues/85))。
+
+⚠️ **ただし「残す＝速く再開できる」ではない。**
+[公式ドキュメント](https://docs.cloud.google.com/run/docs/instances/create-and-manage-instances)は
+"Stopping an instance terminates the active container runtime, **deleting all in-memory
+files and unpersisted system state.**" と明記しており、**停止した時点でワークスペースの
+中身は消えている。** 残す利点は `create` 1回を省けることだけで、状態は結局 GCS の
+チェックポイントから戻すしかない。
+課金はゼロだが Instance オブジェクトは溜まり続け、
+[quota](https://docs.cloud.google.com/run/quotas) は region あたり 100。
+停止中がこの 100 を消費するかは**未確認**。
 
 さらに、検証合間は `gcloud sql instances patch <name> --activation-policy=NEVER`
 でインスタンスを停止できる。停止中はインスタンス料金が掛からずストレージのみ
@@ -136,7 +175,7 @@ terraform -chdir=infra/terraform destroy
 | Cloud SQL ユーザー `dsh_app` | マイグレーション後は**削除失敗する** (テーブル＋残存権限がロールを参照。テーブルだけ落としても `DROP ROLE` が権限依存で失敗する。オープンな issue [#73](https://github.com/mpppk/cloud-run-dsh/issues/73)。2026-09-05 の撤収で実測、`DROP ROLE` までの全経路を PostgreSQL 16.9 で再実証) | `dsh_app` で `DROP OWNED` 後に `postgres` で `REVOKE` 3件、それから destroy 再実行 (破壊的操作・撤収時のみ。詳細は [deployment-runbook.md Step 8](deployment-runbook.md#step-8--teardown-stop-paying)) |
 | GCS チェックポイントバケット | **空でないと削除失敗** | 上記スクリプト実行後 |
 | Service Networking peering | `deletion_policy = "ABANDON"` で**残る** | runbook Step 8.5 の手動削除 |
-| Cloud Run Instance (Pre-GA) | Terraform 管理外 | 手動 stop/delete (Step 8.1) |
+| Cloud Run Instance (Pre-GA) | Terraform 管理外 | 停止すれば課金は止まる (上記 SKU 参照)。ただし撤収時はオブジェクトも残さないよう手動 delete (Step 8.1) |
 
 ### ABANDON された peering が次回 apply に与える影響
 
