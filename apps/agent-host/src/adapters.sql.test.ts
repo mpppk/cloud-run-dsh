@@ -10,6 +10,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { BunSqlLeaseStore, BunSqlQueryExecutor, SqlTransactionalStateStore } from "./adapters.js";
+import { IllegalTransitionError } from "@cloud-run-dsh/workspace-runtime";
 import type { BunSqlConnectionTarget } from "@cloud-run-dsh/session-persistence-postgres";
 import { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
 import type { LeaseTransaction } from "@cloud-run-dsh/controller-lease";
@@ -454,5 +455,37 @@ describe("SqlTransactionalStateStore.apply persist path (MAJOR-2 fix)", () => {
       }),
     ).rejects.toThrow(/baseCommitSha/);
     expect(executor.checkpoints.length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SqlTransactionalStateStore CAS mismatch shape (issue #63 — must match the
+// InMemoryTransactionalStore shape asserted in
+// packages/workspace-runtime/src/store.test.ts)
+// ---------------------------------------------------------------------------
+
+describe("SqlTransactionalStateStore.apply CAS mismatch shape (issue #63)", () => {
+  test("reports (actual current, intended target), not (stale from, current)", async () => {
+    const executor = new LockingFakeExecutor();
+    // The agent-host already recorded the restore failure while a stale
+    // control-plane writer still expects STARTING (issue #60 shared row).
+    executor.seedWorkspace("ws-1", "RESTORE_FAILED");
+    const store = new SqlTransactionalStateStore(executor);
+
+    const err = await store
+      .apply("ws-1", "STARTING", "RESTORING", "stale-writer")
+      .then(
+        (): IllegalTransitionError | null => null,
+        (e: unknown) => e as IllegalTransitionError,
+      );
+    // The old swapped construction produced
+    // "illegal state transition: STARTING -> RESTORE_FAILED", which reads as
+    // a forbidden table edge and sent issue #63 at a table bug that never
+    // existed. The corrected shape names the real row state and the
+    // attempted target.
+    expect(err).toBeInstanceOf(IllegalTransitionError);
+    expect(err!.from).toBe("RESTORE_FAILED");
+    expect(err!.to).toBe("RESTORING");
+    expect((await store.load("ws-1")) as string).toBe("RESTORE_FAILED");
   });
 });

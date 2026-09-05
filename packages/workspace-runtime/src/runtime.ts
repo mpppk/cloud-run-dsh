@@ -2,7 +2,7 @@ import type { Clock } from "@cloud-run-dsh/workspace-checkpoint";
 import type { InstanceRuntime } from "@cloud-run-dsh/cloud-run-instance-client";
 import type { TransactionalStateStore } from "./store.js";
 import type { WorkspaceRuntimeState } from "./state.js";
-import { isAgentInputAllowed } from "./state.js";
+import { IllegalTransitionError, isAgentInputAllowed } from "./state.js";
 import { WorkspaceStateMachine } from "./machine.js";
 import { IdleManager } from "./idle.js";
 
@@ -255,9 +255,7 @@ export class WorkspaceRuntime {
       return this.machine.getState();
     } catch (e) {
       this.lastError = e;
-      if (this.machine.getState() === "STARTING") {
-        await this.machine.transition("RESTORE_FAILED", "restore-failed");
-      }
+      await this.recordFailureStateBestEffort(e, "RESTORE_FAILED", "restore-failed");
       throw e;
     }
   }
@@ -295,10 +293,48 @@ export class WorkspaceRuntime {
       return this.machine.getState();
     } catch (e) {
       this.lastError = e;
-      if (this.machine.getState() === "STARTING" || this.machine.getState() === "RESTORING") {
-        await this.machine.transition("RESTORE_FAILED", "restore-failed");
-      }
+      await this.recordFailureStateBestEffort(e, "RESTORE_FAILED", "restore-failed");
       throw e;
+    }
+  }
+
+  /**
+   * Best-effort failure-state bookkeeping shared by the open/stop catch
+   * blocks (issue #63). Never throws and never replaces the original error:
+   * the caller always rethrows (or returns after) the original failure.
+   *
+   * Two hazards made the old inline `transition()` calls lose the real cause
+   * on the shared row (issue #60):
+   * - Stale view: this runtime's in-memory state can lag the row (e.g. the
+   *   agent-host already recorded RESTORE_FAILED while the control plane was
+   *   still polling health in STARTING). The row is reloaded first and the
+   *   transition is attempted only while still legal — otherwise there is
+   *   nothing left to record.
+   * - Lost race: the row can move between the reload and the compare-and-set
+   *   apply. A failing bookkeeping transition is then attached as `cause` on
+   *   the original error — but ONLY when it is an IllegalTransitionError,
+   *   which carries nothing but state names. Any other bookkeeping failure
+   *   (e.g. the store read itself failing, which could carry connection
+   *   details) is dropped silently so no secret-adjacent payload is chained
+   *   onto errors that end up in structured logs.
+   */
+  private async recordFailureStateBestEffort(
+    originalError: unknown,
+    to: WorkspaceRuntimeState,
+    reason: string,
+  ): Promise<void> {
+    try {
+      await this.machine.reload();
+      if (!this.machine.canTransition(to)) return;
+      await this.machine.transition(to, reason);
+    } catch (bookkeepingError) {
+      if (
+        originalError instanceof Error &&
+        originalError.cause === undefined &&
+        bookkeepingError instanceof IllegalTransitionError
+      ) {
+        originalError.cause = bookkeepingError;
+      }
     }
   }
 
@@ -425,7 +461,7 @@ export class WorkspaceRuntime {
       // open() (CHECKPOINT_FAILED -> STARTING is a legal transition). The
       // CHECKPOINT_FAILED -> READY table edge exists for future deliberate
       // recovery wiring but is intentionally not exposed on the runtime.
-      await this.machine.transition("CHECKPOINT_FAILED", "lifecycle-checkpoint-failed");
+      await this.recordFailureStateBestEffort(e, "CHECKPOINT_FAILED", "lifecycle-checkpoint-failed");
       return this.machine.getState();
     }
 
@@ -435,7 +471,7 @@ export class WorkspaceRuntime {
       await this.deps.instanceRuntime.stop(this.deps.instanceName);
     } catch (e) {
       this.lastError = e;
-      await this.machine.transition("ERROR", "graceful-stop-failed");
+      await this.recordFailureStateBestEffort(e, "ERROR", "graceful-stop-failed");
       throw e;
     }
 

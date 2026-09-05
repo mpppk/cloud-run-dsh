@@ -327,9 +327,15 @@ export class SqlTransactionalStateStore implements TransactionalStateStore {
       );
       const current = rows.length === 0 ? null : rows[0]!["runtime_state"];
       if (current !== from) {
+        // Issue #63: report (actual current, intended target) — the same
+        // shape as InMemoryTransactionalStore — so the message names the
+        // real row state instead of fabricating a "from -> current" edge
+        // violation that sends the next investigation at the transition
+        // table. `to` is the transition that was attempted; `from` was only
+        // this writer's stale expectation.
         throw new IllegalTransitionError(
-          from,
           current === null ? "STOPPED" : (String(current) as WorkspaceRuntimeState),
+          to,
         );
       }
       await tx.exec(
