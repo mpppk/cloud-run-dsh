@@ -102,8 +102,17 @@ export class WorkspaceRuntimeHandleAdapter implements WorkspaceRuntimeHandle {
     private readonly instanceUrlProvider?: () => Promise<string | null>,
   ) {}
 
-  open(): Promise<string> {
-    return this.runtime.open();
+  /**
+   * Issue #60 案C: the control plane drives ONLY the instance lifecycle and
+   * the health observation (openInstance: STOPPED -> STARTING, start, poll
+   * /healthz). The RESTORING -> READY transitions on the shared row belong
+   * to the agent-host's completeRestore(); running the full open() here is
+   * the state-machine half of the #60 collision. The final reload observes
+   * the state the agent-host persisted — READY once its recovery completes.
+   */
+  async open(): Promise<string> {
+    await this.runtime.openInstance();
+    return this.runtime.reloadState();
   }
 
   stop(): Promise<string> {
@@ -133,25 +142,47 @@ export class WorkspaceRuntimeHandleAdapter implements WorkspaceRuntimeHandle {
 
 /**
  * Lazily creates one handle per workspace. Tests can `set()` fakes directly.
+ *
+ * Issue #60: the factory takes the controllerId the open-established lease
+ * carries, so the Instance env it bakes matches the lease the agent-host
+ * will adopt. A cached handle is rebuilt when a LATER open resolves a
+ * DIFFERENT lease (e.g. expiry + re-acquire): serving the old env would boot
+ * the host with a fenced-off identity. Calls without a controllerId (stop,
+ * message flows) always reuse the cached handle.
  */
 export class RuntimeRegistry {
-  private readonly handles = new Map<string, WorkspaceRuntimeHandle>();
+  private readonly handles = new Map<
+    string,
+    { handle: WorkspaceRuntimeHandle; controllerId: string | undefined; pinned: boolean }
+  >();
 
   constructor(
-    private readonly factory: (workspace: Workspace) => WorkspaceRuntimeHandle,
+    private readonly factory: (
+      workspace: Workspace,
+      controllerId?: string,
+    ) => WorkspaceRuntimeHandle,
   ) {}
 
-  async get(workspace: Workspace): Promise<WorkspaceRuntimeHandle> {
-    let handle = this.handles.get(workspace.id);
-    if (!handle) {
-      handle = this.factory(workspace);
-      this.handles.set(workspace.id, handle);
+  async get(workspace: Workspace, controllerId?: string): Promise<WorkspaceRuntimeHandle> {
+    const cached = this.handles.get(workspace.id);
+    if (
+      cached &&
+      (cached.pinned || controllerId === undefined || cached.controllerId === controllerId)
+    ) {
+      return cached.handle;
     }
+    const handle = this.factory(workspace, controllerId);
+    this.handles.set(workspace.id, { handle, controllerId, pinned: false });
     return handle;
   }
 
+  /**
+   * Injects a handle directly (test seam). A set() handle is pinned: later
+   * get() calls reuse it even when they carry a controllerId, so route tests
+   * with stub handles never hit the production factory.
+   */
   set(workspaceId: string, handle: WorkspaceRuntimeHandle): void {
-    this.handles.set(workspaceId, handle);
+    this.handles.set(workspaceId, { handle, controllerId: undefined, pinned: true });
   }
 
   has(workspaceId: string): boolean {

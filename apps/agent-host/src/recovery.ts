@@ -15,6 +15,7 @@ import type {
 } from "@cloud-run-dsh/workspace-checkpoint";
 import type { InstanceRuntime } from "@cloud-run-dsh/cloud-run-instance-client";
 import type { SandboxManager } from "@cloud-run-dsh/cloud-run-sandbox";
+import { LeaseAlreadyHeldError } from "@cloud-run-dsh/controller-lease";
 import type { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
 import type { Logger, Metrics } from "@cloud-run-dsh/observability";
 import { METRIC_NAMES } from "@cloud-run-dsh/observability";
@@ -129,6 +130,36 @@ export class RestartRecovery {
   constructor(private readonly deps: RestartRecoveryDeps) {}
 
   /**
+   * Adopt the controller lease established by the control-plane open (issue
+   * #60 案B, 仕様書 section 26 item 8).
+   *
+   * CONTROLLER_ID is injected into the Instance env by the control plane from
+   * the lease IT established at open time — this host must adopt THAT lease,
+   * never self-acquire a fresh random id (the old code did, deadlocking
+   * against the user's lease on the same row):
+   * - no active lease (first boot, or the previous holder expired while this
+   *   host was down): acquire it as self — this host becomes the holder.
+   * - active lease with THIS controllerId (normal restart, same generation):
+   *   heartbeat to prove ownership and extend it.
+   * - active lease with ANOTHER controllerId: refuse — this is either a
+   *   second host for the same workspace, or a stale generation fenced off
+   *   by a newer open. Never overwrite it.
+   */
+  async adoptLease(): Promise<void> {
+    const { config } = this.deps;
+    const active = await this.deps.lease.getActive(config.workspaceId);
+    if (!active) {
+      await this.deps.lease.acquire(config.workspaceId, config.controllerId, config.userId);
+      return;
+    }
+    if (active.controllerId === config.controllerId) {
+      await this.deps.lease.heartbeat(config.workspaceId, config.controllerId);
+      return;
+    }
+    throw new LeaseAlreadyHeldError(config.workspaceId, active.controllerId);
+  }
+
+  /**
    * Runs the restart recovery path (実装手順書 section 30). Refuses to run
    * when another controller still holds the lease (仕様書 section 26 item 8).
    */
@@ -140,9 +171,10 @@ export class RestartRecovery {
     try {
       // 1. read WORKSPACE_ID (config) — non-empty is guaranteed by config parsing.
 
-      // 2. controller lease (仕様書 section 26 item 8) — a second host for the
-      //    same workspace is refused here.
-      await this.deps.lease.acquire(config.workspaceId, config.controllerId, config.userId);
+      // 2. controller lease (仕様書 section 26 item 8, issue #60 案B) — adopt
+      //    the open-established lease; a second host for the same workspace
+      //    is refused here.
+      await this.adoptLease();
 
       // 3. DB metadata
       const workspace = await this.deps.repository.getWorkspace(config.workspaceId);
@@ -150,9 +182,13 @@ export class RestartRecovery {
         throw new WorkspaceNotFoundError(config.workspaceId);
       }
 
-      // 4-6. restore workspace / session metadata / create sandbox via the T8
-      //      runtime, then report healthy.
-      const state = await this.deps.runtime.open();
+      // 4-6. restore workspace / session metadata / create sandbox via the
+      //      T8 runtime, then report healthy. completeRestore() — NOT open():
+      //      the control plane already moved STOPPED -> STARTING and started
+      //      this instance (issue #60 案C); calling open() here re-runs the
+      //      instance start and fails with
+      //      "open is not allowed in state STARTING" on the shared row.
+      const state = await this.deps.runtime.completeRestore();
       this.deps.health.setReady();
       this.deps.metrics.recordDuration(
         METRIC_NAMES.workspaceRestoreDuration,

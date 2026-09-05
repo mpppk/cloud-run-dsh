@@ -275,6 +275,7 @@ export function makeConfig(overrides: Partial<AgentHostConfig> = {}): AgentHostC
 
 import { InMemoryCheckpointStorage } from "@cloud-run-dsh/workspace-checkpoint";
 import { InMemoryLeaseStore } from "@cloud-run-dsh/controller-lease/testing";
+import type { TransactionalStateStore } from "@cloud-run-dsh/workspace-runtime";
 import { InMemoryTransactionalStore } from "@cloud-run-dsh/workspace-runtime";
 import { PostgresSessionPersistenceRepository } from "@cloud-run-dsh/session-persistence-postgres";
 import { InMemoryFakeExecutor } from "@cloud-run-dsh/session-persistence-postgres/testing";
@@ -291,6 +292,14 @@ export interface TestHost {
   readonly sandboxRunner: FakeSandboxCliRunner;
   readonly instance: FakeInstanceRuntime;
   readonly leaseStore: InMemoryLeaseStore;
+  /**
+   * The store the composed runtime actually uses. Usually the private
+   * InMemoryTransactionalStore below; shared-store (issue #60) tests inject
+   * any TransactionalStateStore (e.g. a SQL store over a shared executor).
+   */
+  readonly stateStore: TransactionalStateStore;
+  /** The private in-memory store, present only when no store was injected. */
+  readonly inMemoryStateStore: InMemoryTransactionalStore | null;
   readonly executor: InMemoryFakeExecutor;
   readonly repository: PostgresSessionPersistenceRepository;
   readonly clock: FakeClock;
@@ -300,19 +309,42 @@ export interface TestHost {
 
 export async function composeTestHost(
   configOverrides: Partial<AgentHostConfig> = {},
-  extra: { turnStarter?: TurnStarter; logger?: Logger; repository?: PostgresSessionPersistenceRepository } = {},
+  extra: {
+    turnStarter?: TurnStarter;
+    logger?: Logger;
+    repository?: PostgresSessionPersistenceRepository;
+    /**
+     * Shared stores for issue-#60-style tests where the control plane and
+     * the agent-host operate on the SAME rows. Defaults preserve the old
+     * isolated behavior (fresh private stores per host).
+     */
+    leaseStore?: InMemoryLeaseStore;
+    stateStore?: TransactionalStateStore;
+    /**
+     * Shared clock (issue #60): lease "active" must agree across the two
+     * processes, so shared-store tests pass ONE clock to both lease
+     * services. Defaults to a fresh private clock (isolated behavior).
+     */
+    clock?: FakeClock;
+    /** Initial runtime states seeded into a fresh state store. */
+    workspaceStates?: Record<string, "STOPPED" | "STARTING" | "RESTORING" | "READY" | "BUSY" | "CHECKPOINTING" | "STOPPING" | "ERROR" | "RESTORE_FAILED" | "CHECKPOINT_FAILED">;
+  } = {},
 ): Promise<TestHost> {
-  const clock = new FakeClock();
+  const clock = extra.clock ?? new FakeClock();
   const git = new RecordingGitRunner();
   const fs = new InMemoryFs();
   const storage = new InMemoryCheckpointStorage();
   const sandboxRunner = new FakeSandboxCliRunner();
   const instance = new FakeInstanceRuntime();
-  const leaseStore = new InMemoryLeaseStore();
+  const leaseStore = extra.leaseStore ?? new InMemoryLeaseStore();
   const executor = new InMemoryFakeExecutor();
   const repository = extra.repository ?? new PostgresSessionPersistenceRepository(executor);
   const config = makeConfig(configOverrides);
   const scheduler = new FakeIntervalScheduler(clock);
+  const inMemoryStateStore = extra.stateStore
+    ? null
+    : new InMemoryTransactionalStore(extra.workspaceStates ?? {}, clock);
+  const stateStore: TransactionalStateStore = extra.stateStore ?? inMemoryStateStore!;
 
   const host = composeAgentHost({
     config,
@@ -328,16 +360,25 @@ export async function composeTestHost(
       name: config.repositoryName,
     }),
     leaseStore,
-    stateStore: new InMemoryTransactionalStore({}, clock),
+    stateStore,
     clock,
     heartbeatScheduler: scheduler,
     turnStarter: extra.turnStarter,
     logger: extra.logger,
   });
 
-  return { host, git, fs, storage, sandboxRunner, instance, leaseStore, executor, repository, clock, scheduler };
+  return { host, git, fs, storage, sandboxRunner, instance, leaseStore, stateStore, inMemoryStateStore, executor, repository, clock, scheduler };
 }
 
+/**
+ * Seeds the workspace row AND drives the control-plane half of open
+ * (STOPPED -> STARTING, issue #60 案C). Every host test that calls recover()
+ * needs this: the agent-host owns only completeRestore(), so a workspace the
+ * control plane never started (STOPPED) is refused — exactly as in
+ * production, where the Instance (and hence this process) would not exist.
+ * A state the caller pre-seeded explicitly (e.g. RESTORE_FAILED retry
+ * fixtures) is left untouched.
+ */
 export async function seedWorkspace(th: TestHost): Promise<void> {
   const config = th.host.config;
   await th.repository.createWorkspace({
@@ -348,4 +389,8 @@ export async function seedWorkspace(th: TestHost): Promise<void> {
     baseBranch: config.baseBranch,
     instanceName: config.instanceName,
   });
+  const current = await th.stateStore.load(config.workspaceId);
+  if (current === null || current === "STOPPED") {
+    await th.stateStore.apply(config.workspaceId, "STOPPED", "STARTING", "test-seed-control-plane-open");
+  }
 }

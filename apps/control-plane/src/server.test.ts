@@ -1072,7 +1072,22 @@ describe("open/stop composition with the T8 runtime", () => {
       expect(r2.status).toBe(200);
       expect(r3.status).toBe(200);
       const body = await r1.json();
-      expect(body.state).toBe("READY");
+      // Issue #60 案C: the control plane stops at STARTING (one shared
+      // start); the agent-host phase completes the row to READY.
+      expect(body.state).toBe("STARTING");
+      expect(startCalls()).toBe(1);
+      // The opener holds the controller lease, so it can message right away.
+      const lease = await h.leases.getActive(ws.id);
+      expect(lease?.userId).toBe("alice");
+      // Agent-host phase on the same runtime object (same shared store).
+      expect(await runtime.completeRestore()).toBe("READY");
+      const reread = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/open`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(reread.status).toBe(200);
+      expect((await reread.json()).state).toBe("READY");
       expect(startCalls()).toBe(1);
     } finally {
       h.stop();
@@ -1136,9 +1151,10 @@ describe("open/stop composition with the T8 runtime", () => {
 
   test("real system clock: open() reaching nowMs does not throw (MINOR-2 regression)", async () => {
     // A real T8 WorkspaceRuntime + IdleManager constructed with the real
-    // SystemClock must reach clock.nowMs() inside open()'s success path
+    // SystemClock must reach clock.nowMs() inside the open success path
     // (recordActivity -> IdleManager). A T6 one-method clock would throw
-    // "clock.nowMs is not a function" here.
+    // "clock.nowMs is not a function" here. Issue #60: the activity tick
+    // lives in the agent-host restore phase now, so both phases run.
     const h = startHarness();
     try {
       const ws = await h.createWorkspace("alice");
@@ -1152,7 +1168,8 @@ describe("open/stop composition with the T8 runtime", () => {
       });
       expect(res.status).toBe(200);
       const body = await res.json();
-      expect(body.state).toBe("READY");
+      expect(body.state).toBe("STARTING");
+      expect(await runtime.completeRestore()).toBe("READY");
     } finally {
       h.stop();
     }

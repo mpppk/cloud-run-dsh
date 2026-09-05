@@ -535,3 +535,128 @@ describe("WorkspaceRuntime — idle integration (仕様書 section 11)", () => {
     expect(h.runtime.getState()).toBe("STOPPED");
   });
 });
+
+describe("WorkspaceRuntime — split open phases (issue #60 案C/案D)", () => {
+  /** A second runtime over the SAME store: the other process's view of the row. */
+  function makePeer(h: Harness, steps?: FakeSteps): WorkspaceRuntime {
+    return new WorkspaceRuntime({
+      workspaceId: "ws-1",
+      store: h.store,
+      clock: h.clock,
+      instanceRuntime: h.instance,
+      instanceName: "dsh-ws-1",
+      steps: steps ?? h.steps,
+      idle: h.idle,
+    });
+  }
+
+  test("openInstance stops at STARTING without running any restore step", async () => {
+    const h = makeHarness();
+    const state = await h.runtime.openInstance();
+    expect(state).toBe("STARTING");
+    expect(h.instance.calls).toEqual(["start"]);
+    expect(h.steps.calls).toEqual(["waitForInstanceHealth"]);
+    expect(h.store.getHistory().map((r) => `${r.from}->${r.to}`)).toEqual([
+      "STOPPED->STARTING",
+    ]);
+  });
+
+  test("openInstance is idempotent from READY and illegal from BUSY", async () => {
+    const h = makeHarness();
+    await h.runtime.open();
+    expect(await h.runtime.openInstance()).toBe("READY");
+    expect(h.instance.calls.filter((c) => c === "start")).toHaveLength(1);
+
+    await h.runtime.beginAgentTurn();
+    await expect(h.runtime.openInstance()).rejects.toThrow(InvalidOperationError);
+  });
+
+  test("completeRestore refuses STOPPED (no control-plane open happened)", async () => {
+    const h = makeHarness();
+    await expect(h.runtime.completeRestore()).rejects.toThrow(InvalidOperationError);
+    await expect(h.runtime.completeRestore()).rejects.toThrow(
+      "open is not allowed in state STOPPED",
+    );
+    expect(h.steps.calls).toEqual([]);
+  });
+
+  test("two processes, one row: control plane starts, agent-host restores", async () => {
+    const h = makeHarness();
+    const agent = makePeer(h);
+
+    // Control-plane phase: instance lifecycle + health observation only.
+    expect(await h.runtime.openInstance()).toBe("STARTING");
+
+    // The agent-host must NOT run the full open() on the shared row — this
+    // is the exact issue-#60 production crash.
+    await expect(agent.open()).rejects.toThrow("open is not allowed in state STARTING");
+    // ... while the narrow restore operation proceeds to READY.
+    expect(await agent.completeRestore()).toBe("READY");
+
+    // The control plane observes the agent-persisted state via reload.
+    expect(await h.runtime.reloadState()).toBe("READY");
+    expect(h.store.getHistory().map((r) => `${r.from}->${r.to}`)).toEqual([
+      "STOPPED->STARTING",
+      "STARTING->RESTORING",
+      "RESTORING->READY",
+    ]);
+  });
+
+  test("completeRestore resumes from RESTORING, and the lost attempt is fenced (host crashed mid-restore)", async () => {
+    const h = makeHarness();
+    await h.runtime.openInstance();
+    // First host attempt blocks inside the restore steps with RESTORING
+    // already persisted — then its container is lost.
+    const gate = deferred<void>();
+    h.steps.gates.set("cloneRepository", gate as unknown as ReturnType<typeof deferred<void>>);
+    const lostAttempt = h.runtime.completeRestore();
+    await new Promise((r) => setTimeout(r, 5));
+    expect(h.runtime.getState()).toBe("RESTORING");
+
+    // Rebooted host: a fresh in-memory view over the same row resumes the
+    // steps and completes the restore.
+    const rebooted = makePeer(h, new FakeSteps());
+    expect(await rebooted.completeRestore()).toBe("READY");
+
+    // The lost attempt wakes up afterwards: its final write is rejected by
+    // the store CAS (the row moved on without it) — a stale host can never
+    // silently rewrite the state machine.
+    gate.resolve();
+    await expect(lostAttempt).rejects.toThrow();
+    expect(await rebooted.reloadState()).toBe("READY");
+  });
+
+  test("completeRestore retries from RESTORE_FAILED through STARTING", async () => {
+    const h = makeHarness();
+    await h.runtime.openInstance();
+    const agent = makePeer(h);
+    h.steps.failures.set("createSandbox", () => new Error("sandbox create failed"));
+    await expect(agent.completeRestore()).rejects.toThrow("sandbox create failed");
+    expect(await agent.reloadState()).toBe("RESTORE_FAILED");
+
+    h.steps.failures.clear();
+    expect(await agent.completeRestore()).toBe("READY");
+    expect(h.store.getHistory().map((r) => r.to)).toEqual([
+      "STARTING",
+      "RESTORING",
+      "RESTORE_FAILED",
+      "STARTING",
+      "RESTORING",
+      "READY",
+    ]);
+  });
+
+  test("two concurrent openInstance calls coalesce into a single start", async () => {
+    const h = makeHarness();
+    const gate = deferred<void>();
+    h.steps.gates.set("waitForInstanceHealth", gate as unknown as ReturnType<typeof deferred<void>>);
+
+    const both = Promise.all([h.runtime.openInstance(), h.runtime.openInstance()]);
+    gate.resolve();
+    const [a, b] = await both;
+
+    expect(a).toBe("STARTING");
+    expect(b).toBe("STARTING");
+    expect(h.instance.calls.filter((c) => c === "start")).toHaveLength(1);
+  });
+});
