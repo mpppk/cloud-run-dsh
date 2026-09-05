@@ -26,7 +26,7 @@
 ## 全体構成
 
 control-plane は常駐かつ全ユーザー共有の Cloud Run Service。
-agent-host は、開かれているワークスペース1つにつき1つの短命な Cloud Run Instance。
+agent-host は、ワークスペース1つにつき1つの Cloud Run Instance。停止しても delete せず残す（#85）。
 
 ```mermaid
 flowchart TB

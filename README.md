@@ -41,9 +41,12 @@ Durable state: GitHub (canonical), Cloud SQL (metadata/sessions/checkpoints), GC
 > bugs that only appear in production; see
 > [`docs/e2e-verification-report.md`](docs/e2e-verification-report.md).
 >
-> Known gaps: `stop` does not delete the Instance and writes no workspace tarball
+> Known gaps: `stop` writes no workspace tarball
 > ([#72](https://github.com/mpppk/cloud-run-dsh/issues/72)), and `terraform destroy` fails
 > after migrations have run ([#73](https://github.com/mpppk/cloud-run-dsh/issues/73)).
+> `stop` deliberately does **not** delete the Instance — stopped Instances are not billed
+> (verified against the Cloud Billing Catalog SKUs); that they accumulate is
+> [#85](https://github.com/mpppk/cloud-run-dsh/issues/85).
 
 ## Monorepo
 

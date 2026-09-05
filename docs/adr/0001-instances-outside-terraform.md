@@ -71,3 +71,59 @@ Terraform が持つのは**静的な土台**（API 有効化、Cloud SQL、GCS�
 - **停止した Instance の GC（いつ誰が消すか）とコスト影響は未決。** #72 で決める。
   1:1 対応が崩れる常駐プール化などに至れば、本 ADR の見直し条件に該当するため
   新しい ADR を切る。
+
+## 追記（2026-09-05）— 上記の残件2点は決着した
+
+**本文と「§ 実証」節の記述は本節が supersede する。** ADR 本体は当時の記録として
+書き換えず残す。
+
+### delete は「未実施」ではなく「しない」が正である
+
+`stop` 後に Instance を delete するかどうかを、**停止中の課金の有無を実測して**決めた。
+結論は **delete しない**。
+
+Cloud Billing Catalog API で Cloud Run（`services/152E-C115-5142`）の SKU を確認したところ、
+description が `Instances` で始まる SKU は2つしか無い。
+
+```
+asia-northeast1
+  Instances CPU      0.00000027 USD / second          (category: Compute)
+  Instances Memory   0.00000193 USD / gibibyte second (category: Compute)
+```
+
+**storage / disk の SKU は無い**（ディスク系は `Ephemeral Storage` = category
+`EphemeralDisk` のみで、これは停止で消える）。どちらも稼働時間の計測なので、
+**停止すれば課金はゼロになる。** 裏取りとして、この2つだけで
+[公式ブログ](https://cloud.google.com/blog/products/serverless/introducing-cloud-run-instances)
+の公表額 $5.70（1 vCPU / 1 GiB / 30日）が再現できる。全額が CPU とメモリで
+説明しきれるため、隠れた保有料は無い。
+
+（`Services CPU/Memory (Instance-based billing)` という description に Instance を含む
+SKU が別に2つあるが、これは Cloud Run **Services** の課金モードであって Instances 製品の
+ものではない。いずれにせよ時間課金メーターなので結論は変わらない。）
+
+したがって **本文 §1 の「明示の stop で stop / delete する」は「stop する」が正。**
+`docs/architecture.md` のシーケンス図も `stop → delete` から `stop` に修正した。
+
+### 「残す＝速く再開できる」ではない
+
+[公式ドキュメント](https://docs.cloud.google.com/run/docs/instances/create-and-manage-instances):
+
+> Stopping an instance terminates the active container runtime,
+> **deleting all in-memory files and unpersisted system state.**
+
+**停止した時点でワークスペースの中身は消えている。** Instance を残す利点は
+`create` 1回を省けることだけで、状態は結局 GCS のチェックポイントから戻すしかない。
+本 ADR の「短命リソース」という性格づけは、ライフサイクルの主体がアプリケーションで
+あるという意味では有効だが、**オブジェクトが短命だという意味ではない。**
+
+### GC は #85 に分離した
+
+停止した Instance の GC（いつ誰が消すか）は
+[#85](https://github.com/mpppk/cloud-run-dsh/issues/85) に切り出した。
+課金はゼロだが Instance オブジェクトは workspace 数だけ増え続け、
+[quota](https://docs.cloud.google.com/run/quotas) は region あたり 100 である
+（停止中がこの 100 を消費するかは未確認）。
+
+常駐プール化など 1:1 対応が崩れる方向に進む場合に新しい ADR を切る、という
+見直し条件は変わらない。

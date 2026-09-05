@@ -245,7 +245,8 @@ reviewer には「worker の『テストが通りました』を信用するな�
   OpenRouter 経由の LLM 呼び出し・ツール実行・SSE 配信まで実機で動いた。
 - 残作業 [#31](https://github.com/mpppk/cloud-run-dsh/issues/31)（`#23` → `#22` → `#21`）は
   2026-09-05 に CLOSED。残件は
-  [#72](https://github.com/mpppk/cloud-run-dsh/issues/72)（`stop` の delete / tar.gz 未保存）と
+  [#72](https://github.com/mpppk/cloud-run-dsh/issues/72)（`stop` 時の tar.gz 未保存。delete しない件は
+  [#85](https://github.com/mpppk/cloud-run-dsh/issues/85) で「しない」が正と決着）と
   [#73](https://github.com/mpppk/cloud-run-dsh/issues/73)（マイグレーション後の `terraform destroy` 失敗）。
 - G2 / G3（`/cloudsql` ボリュームは動き、公開 IPv4 が要る）は 2026-09-05 に再実証された。
   G8（`/tmp` への書き込み）は仕様書 §6.2 とアダプタのコメントが訂正済み

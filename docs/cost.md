@@ -65,7 +65,7 @@ terraform -chdir=infra/terraform apply -var-file=profiles/minimal.tfvars
 
 pricing ページに Instances の記載が無いため、Cloud Billing Catalog API から
 Cloud Run (`services/152E-C115-5142`) の SKU を全件取得して確認した。
-**Instances に紐づく課金メーターは2つしか存在しない。**
+**description が `Instances` で始まる SKU は2つしか存在しない。**
 
 ```
 asia-northeast1
@@ -77,6 +77,11 @@ asia-northeast1
 `EphemeralDisk` のみで、これは停止で消える)。2つとも稼働時間の計測なので、
 **停止した Instance は課金されない。**
 
+> description に `Instance` を含む SKU は他に
+> `Services CPU / Memory (Instance-based billing)` の2件があるが、これは Cloud Run
+> **Services** の課金モードであって Instances 製品のものではない。いずれも時間課金の
+> メーターなので、停止中ゼロという結論は変わらない。
+
 裏取り: `1 vCPU × 30日 = 2,592,000秒 × 0.00000027 = $0.70`、
 `1 GiB × 30日 = 2,592,000秒 × 0.00000193 = $5.00`、合計 **$5.70** は
 [Introducing Cloud Run instances](https://cloud.google.com/blog/products/serverless/introducing-cloud-run-instances)
@@ -84,6 +89,13 @@ asia-northeast1
 
 この結果、**停止した Instance は delete せず残す**方針とした
 ([#85](https://github.com/mpppk/cloud-run-dsh/issues/85))。
+
+⚠️ **ただし「残す＝速く再開できる」ではない。**
+[公式ドキュメント](https://docs.cloud.google.com/run/docs/instances/create-and-manage-instances)は
+"Stopping an instance terminates the active container runtime, **deleting all in-memory
+files and unpersisted system state.**" と明記しており、**停止した時点でワークスペースの
+中身は消えている。** 残す利点は `create` 1回を省けることだけで、状態は結局 GCS の
+チェックポイントから戻すしかない。
 課金はゼロだが Instance オブジェクトは溜まり続け、
 [quota](https://docs.cloud.google.com/run/quotas) は region あたり 100。
 停止中がこの 100 を消費するかは**未確認**。
