@@ -11,6 +11,7 @@ import * as handlers from "./handlers.js";
 import { handleSessionEvents } from "./sse.js";
 import {
   AgentInputRefusedError,
+  IllegalTransitionError,
   InvalidOperationError,
 } from "@cloud-run-dsh/workspace-runtime";
 
@@ -125,7 +126,19 @@ export function toErrorResponse(e: unknown, opts: ToErrorResponseOptions = {}): 
     return errorResponse(e.status, e.code, e.message);
   }
   // T8 runtime state conflicts -> 409 (wrong state for open/stop/message/etc).
-  if (e instanceof AgentInputRefusedError || e instanceof InvalidOperationError) {
+  // IllegalTransitionError is listed explicitly rather than made a subclass
+  // of InvalidOperationError (issue #88): it lives in the dependency-free
+  // state.ts while InvalidOperationError lives in runtime.ts, and the two
+  // are deliberately distinct (recordFailureStateBestEffort chains ONLY
+  // IllegalTransitionError as `cause` because it carries nothing but state
+  // names). Every escape to this layer is a lost compare-and-set race on
+  // the shared row — the caller's view of the state conflicts with another
+  // writer's — so 409, never 500.
+  if (
+    e instanceof AgentInputRefusedError ||
+    e instanceof InvalidOperationError ||
+    e instanceof IllegalTransitionError
+  ) {
     return errorResponse(409, "conflict", e.message);
   }
   // Unexpected errors -> generic 500 with no internals (仕様書 §26; see the

@@ -5,7 +5,7 @@
 // heartbeats and health checks never reset the idle timer (仕様書 section 11).
 
 import type { WorkspaceRuntime } from "@cloud-run-dsh/workspace-runtime";
-import { AgentInputRefusedError, InvalidOperationError } from "@cloud-run-dsh/workspace-runtime";
+import { AgentInputRefusedError, IllegalTransitionError, InvalidOperationError } from "@cloud-run-dsh/workspace-runtime";
 import { AGENT_HOST_HEALTH_PATH } from "@cloud-run-dsh/workspace-runtime";
 import type { LifecycleResult } from "@cloud-run-dsh/workspace-checkpoint";
 import type { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
@@ -279,7 +279,14 @@ export class AgentGateway {
     try {
       state = await this.deps.runtime.prepareStop();
     } catch (e) {
-      if (e instanceof InvalidOperationError) {
+      // Issue #88: a lost compare-and-set race on the shared row surfaces
+      // as IllegalTransitionError (another stop won the transition while
+      // this one was in flight). That is a caller-visible state conflict,
+      // not an internal failure, so it joins InvalidOperationError at 409 —
+      // matching this route's contract ("wrong state/generation, operator
+      // action needed"). Anything else still throws through to the generic
+      // 500 path in handle().
+      if (e instanceof InvalidOperationError || e instanceof IllegalTransitionError) {
         return this.json(409, {
           prepared: false,
           state: this.deps.runtime.getState(),
