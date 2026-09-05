@@ -3,16 +3,22 @@
 ユーザーごとに隔離されたワークスペースを Cloud Run Instance 上で1つずつ動かすコーディングエージェント。
 ファイルシステムのサンドボックスは DeepSeek Harness が担う。
 
-> **現状は土台と閉じ込めまでで、エージェント本体（LLM 呼び出し）と 2 つのサービスを繋ぐ経路は未実装。**
-> 残作業の全体像は [#31](https://github.com/mpppk/cloud-run-dsh/issues/31) を参照。
+> **2026-09-05、下記「ワークスペースを開く流れ」の全経路が実プロジェクト上で動いた。**
+> ユーザーのメッセージから LLM がハーネスのツールを呼び、clone 済みリポジトリのファイルを読み、
+> イベントが SSE で返るまでを確認した。残る差分は
+> [#72](https://github.com/mpppk/cloud-run-dsh/issues/72)（`stop` が Instance を delete せず、
+> 停止時の tar.gz を保存しない）と
+> [#73](https://github.com/mpppk/cloud-run-dsh/issues/73)（撤収時の `terraform destroy`）。
 
-本書は 2026-09-03 に実プロジェクト `cloud-run-dsh` へ構築し、動作を確認したうえで撤収した内容に基づく。
-確認の経過・実測ログ・途中で判明した制約の詳細は [立ち上げ作業報告](./bringup-report.md) にまとめてある。
+本書は 2026-09-03 の構築と 2026-09-05 の端から端までの動作確認に基づく。
+経過・実測ログ・途中で判明した制約は
+[立ち上げ作業報告](./bringup-report.md) と
+[動作確認レポート](./e2e-verification-report.md) にまとめてある。
 
 | | |
 |---|---|
 | デプロイ単位 | 2 |
-| Terraform リソース | 52 |
+| Terraform リソース | 48（2026-09-05 の apply 実測。VPC コネクタ廃止で 52 から減） |
 | リージョン | asia-northeast1 |
 | DB | PostgreSQL 16 |
 
@@ -89,7 +95,7 @@ flowchart TB
 ## ワークスペースを開く流れ
 
 関係する主体が多く、往復の順序そのものが仕様になっている。
-**ただしこの図は設計であり、全段階が実装済みではない。**
+**2026-09-05 に全経路が実機で動いた。** 停止段の一部だけ実装が図に追いついていない（[#72](https://github.com/mpppk/cloud-run-dsh/issues/72)）。
 
 ```mermaid
 sequenceDiagram
@@ -123,8 +129,6 @@ sequenceDiagram
   AH->>DB: セッションとイベントを復元
   CP-->>U: 201 ワークスペース状態
 
-  rect rgba(138,101,22,0.10)
-  Note over U,GCS: ここから下は未実装（設計のみ）
   loop エージェントのターン
     U->>CP: POST /v1/sessions/:id/messages
     CP->>AH: 入力を転送
@@ -132,13 +136,14 @@ sequenceDiagram
     AH->>DB: イベントを追記（連番付き）
     CP-->>U: SSE でイベント配信（seq カーソル）
   end
-  end
 
   alt アイドル検知 または POST /stop
     CP->>AH: 停止を要求
     AH->>GCS: ワークスペースを tar.gz で保存
-    CP->>RUN: stop → delete
-    Note over DB,GCS: Instance は消えるが、<br/>Cloud SQL の行と GCS のチェックポイントは残る
+    Note over AH,GCS: 設計。実装では保存されない（#72）
+    CP->>RUN: stop
+    Note over CP,RUN: 設計では delete まで行う想定だが、<br/>実装は stop のみ（#72）
+    Note over DB,GCS: Cloud SQL の行と GCS のチェックポイントは残る
   end
 ```
 
@@ -146,19 +151,22 @@ sequenceDiagram
 
 | 段階 | 実装 | GCP で実行 | 補足 |
 |---|---|---|---|
-| 認可（IAP + メンバーシップ） | あり | 未 | control-plane は本番デプロイしていない。 |
-| コントローラリース | あり | 未 | ローカルでは検証済み。 |
-| Instance の作成 | あり | API は実行 | control-plane の `RuntimeRegistry` 本番ファクトリが結線済み（[#23](https://github.com/mpppk/cloud-run-dsh/issues/23)）。GCP 上での実作成は未実行。 |
-| clone・checkout・チェックポイント復元 | あり | 未 | `bootstrap.ts` / `recovery.ts`。ENTRYPOINT を上書きしたため GCP では動いていない（[#24](https://github.com/mpppk/cloud-run-dsh/issues/24)）。 |
-| Harness の構成 | あり | **実行** | `createHarnessComposition()` を Instance 内で直接呼び、拒否の挙動まで確認した。 |
-| **入力の転送（control-plane → agent-host）** | **なし** | 未 | **両者を結ぶコードが存在しない**（[#22](https://github.com/mpppk/cloud-run-dsh/issues/22)）。control-plane は DB にイベントを書くだけ、agent-host は自分のゲートウェイで 202 を返すだけで、互いに通信しない。 |
-| **エージェントのターン（LLM 呼び出し）** | **なし** | 未 | **リポジトリ内に LLM クライアントが1つも無い**（[#21](https://github.com/mpppk/cloud-run-dsh/issues/21)）。 |
-| SSE 配信 | あり | 未 | 両サービスに実装があるが、流すイベントを作る側が無い。 |
-| チェックポイントして停止 | あり | 未 | Instance の停止・削除 API のみ実行した。tar の保存は未実行（[#26](https://github.com/mpppk/cloud-run-dsh/issues/26)）。 |
+| 認可（IAP identity + メンバーシップ） | あり | **実行** | 2026-09-05 に実機で `POST /v1/workspaces` が 201。 |
+| コントローラリース | あり | **実行** | `acquire` 200。agent-host が同じ ID を引き継ぐ形に変更（[#60](https://github.com/mpppk/cloud-run-dsh/issues/60)）。 |
+| Instance の作成・起動 | あり | **実行** | control-plane が実際に create → start した。`launchStage: BETA` と `cloudSqlInstance` ボリュームが必須（[#53](https://github.com/mpppk/cloud-run-dsh/issues/53) / [#56](https://github.com/mpppk/cloud-run-dsh/issues/56)）。 |
+| clone・checkout・チェックポイント復元 | あり | **実行** | ENTRYPOINT を上書きせず `index.ts` が起動し `workspace.restore.completed` に到達（[#24](https://github.com/mpppk/cloud-run-dsh/issues/24)）。git 認証は `Basic x-access-token`（[#62](https://github.com/mpppk/cloud-run-dsh/issues/62)）。 |
+| Harness の構成 | あり | **実行** | 復元完了に含まれる。ツールの拒否挙動も確認済み。 |
+| 入力の転送（control-plane → agent-host） | あり | **実行** | [#22](https://github.com/mpppk/cloud-run-dsh/issues/22)。停止中は 409、転送失敗は 502。 |
+| **エージェントのターン（LLM 呼び出し）** | あり | **実行** | [#21](https://github.com/mpppk/cloud-run-dsh/issues/21)。OpenRouter 経由で LLM がツールを呼び、`/workspace` の実ファイルを読んで応答した。 |
+| SSE 配信 | あり | **実行** | `turn/start` から `turn/end` までのイベント列を実機で受信した。 |
+| チェックポイントして停止 | 一部 | **一部** | `stop` は成功して `STOPPED`。**Instance の delete と停止時の tar.gz 保存は行われない**（[#72](https://github.com/mpppk/cloud-run-dsh/issues/72)）。 |
 
-> **現状は「土台と閉じ込めができていて、その上で動くエージェントがまだ無い」段階である。**
-> インフラ、サンドボックス、永続化、状態機械は揃っているが、ユーザーの入力を受けて LLM を呼び
-> ツールを使う中心部分と、2 つのサービスを繋ぐ経路が存在しない。
+> **2026-09-05、この図の全経路が GCP 実機で動いた。** ユーザーのメッセージが
+> control-plane から agent-host に届き、LLM がハーネスのツールで clone 済みリポジトリの
+> ファイルを読み、イベントが Cloud SQL に積まれ、SSE で配信されるところまでを確認した。
+> 到達までに **本番でしか出ない 14 件のバグ**を修正した。詳細と証跡は
+> [`e2e-verification-report.md`](e2e-verification-report.md) を参照。
+
 
 ### 図に載らない規則
 
@@ -180,8 +188,8 @@ sequenceDiagram
 | `POST /v1/workspaces` | ワークスペースを作成する。id はサーバが採番する。 |
 | `GET /v1/workspaces/:id` | 状態を取得する。 |
 | `POST /v1/workspaces/:id/open` | Instance を起動する（同時実行は合流）。 |
-| `POST /v1/workspaces/:id/stop` | チェックポイントを取って停止する。 |
-| `POST /v1/workspaces/:id/checkpoints` | 手動チェックポイント。 |
+| `POST /v1/workspaces/:id/stop` | 停止する（設計ではチェックポイントを取ってから停止するが、実装では tar.gz は保存されない。#72）。 |
+| `POST /v1/workspaces/:id/checkpoints` | 手動チェックポイント。**現状はマーカーの JSON を置くだけで、ワークスペースの中身は含まない**のに `checkpointed: true` を返す（#72）。 |
 | `POST /v1/workspaces/:id/controller/{acquire,heartbeat,release}` | コントローラリースの取得・延長・解放。 |
 | `GET` / `POST /v1/workspaces/:id/sessions` | セッションの一覧と作成。 |
 | `POST /v1/sessions/:id/messages` | エージェントへの入力。フィールド名は `content`。 |
@@ -397,10 +405,10 @@ Cloud SQL の作成に10〜15分かかる。ここを越えると、何も動か
 cd infra/terraform
 terraform init -input=false
 terraform plan  -input=false -var-file=~/.dsh.tfvars
-# → Plan: 52 to add, 0 to change, 0 to destroy.
+# → Plan: 48 to add, 0 to change, 0 to destroy.（2026-09-05 実測）
 
 terraform apply -input=false -var-file=~/.dsh.tfvars
-# → Apply complete! Resources: 52 added.
+# → Apply complete! Resources: 48 added.（2026-09-05 実測）
 ```
 
 既にサービスアカウントが手動で作られている場合は、先に state へ取り込まないと 409 で衝突する
@@ -509,14 +517,27 @@ gcloud logging read \
 **順序が重要。** Instance を先に消し、バケットを空にしてから destroy する。バケットにオブジェクトが
 残っていると `force_destroy = false` のため destroy が失敗し、**課金が止まらない。**
 
+**さらに、マイグレーションを流したあとは DB ユーザーの罠がある**
+（[#73](https://github.com/mpppk/cloud-run-dsh/issues/73)）。`0001_init.sql` が作る6テーブルが
+`dsh_app` ロールを参照するため、user の削除が
+`role "dsh_app" cannot be dropped because some objects depend on it` で 400 になる。
+2026-09-05 の撤収では実際にこれで一度失敗した（database が先に消えていたため2回目は通ったが、
+削除順に依存する）。**destroy の前にオブジェクトを落としておくのが確実。**
+
 ```bash
 curl -sS -X DELETE -H "Authorization: Bearer $TOK" "$BASE/instances/dsh-verify"
 curl -sS -H "Authorization: Bearer $TOK" "$BASE/instances"
 # → {} になるまで待つ
 
+gcloud run services delete control-plane --region "$REGION" --quiet   # デプロイしていれば
 bun run teardown:empty-bucket -- --yes
+
+# マイグレーション済みなら、DB のオブジェクトを先に落とす（#73）
+#   psql "$DATABASE_URL" -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
+
 terraform destroy -input=false -var-file=~/.dsh.tfvars
-# → Destroy complete! Resources: 49 destroyed.
+# → Destroy complete!（2026-09-05 の実測は 2回目で 18 destroyed。
+#    1回目で大半が消えたあとの残りなので、総数は状態による）
 ```
 
 ### 10. 残っていないことを確かめる（無料）
@@ -540,23 +561,21 @@ gcloud 呼び出しが失敗するので解除する。
 
 ## 未完成の箇所
 
-現時点で結線されていない、あるいは動作を確認していない部分。
-いずれも Issue として登録済み。全体像と進める順序は
-[#31](https://github.com/mpppk/cloud-run-dsh/issues/31) を参照。
+**2026-09-05 の実機検証で、シーケンス図の全経路が動いた。** ここに残るのはその後の残件。
+経緯と証跡は [`e2e-verification-report.md`](e2e-verification-report.md)。
 
 | 箇所 | 状態 | Issue |
 |---|---|---|
-| **エージェントのターン（LLM 呼び出し）** | **未実装。** リポジトリ内に LLM クライアントが存在しない。 | [#21](https://github.com/mpppk/cloud-run-dsh/issues/21) |
-| **control-plane と agent-host の連携** | **未実装。** 両者を繋ぐコードが無く、同じ DB を共有する別々のサービスとして並んでいる。 | [#22](https://github.com/mpppk/cloud-run-dsh/issues/22) |
-| control-plane の `RuntimeRegistry` 本番ファクトリ | 結線済み。`open`/`stop` が Cloud Run Instance を駆動し、`/readyz` は 200 を返す。GCP 上での実作成は未実行（コーディネータが検証）。 | [#23](https://github.com/mpppk/cloud-run-dsh/issues/23) |
-| agent-host 本体の GCP 上での起動 | 未実行（ENTRYPOINT を上書きしていたため）。 | [#24](https://github.com/mpppk/cloud-run-dsh/issues/24) |
-| Cloud SQL へのマイグレーション実行 | 実 runner を通していない。 | [#25](https://github.com/mpppk/cloud-run-dsh/issues/25) |
-| 実 GCS でのチェックポイント保存・復元 | 未実行。 | [#26](https://github.com/mpppk/cloud-run-dsh/issues/26) |
-| GitHub App | 未登録。ユーザー側の作業。 | [#31](https://github.com/mpppk/cloud-run-dsh/issues/31) |
-| IAP ブランド / ロードバランサ | 未作成。一度作ると削除できないため見送っている。`iap_support_email` を与えたときのみ作られる。 | — |
+| `stop` が Instance を delete しない | 図は `stop → delete` だが実装は `stop` のみ。停止した Instance が残る。 | [#72](https://github.com/mpppk/cloud-run-dsh/issues/72) |
+| 停止時の tar.gz チェックポイント | 保存されない。`POST /checkpoints` はマーカーの JSON を置くだけで、中身を含まないのに `checkpointed: true` を返す。 | [#72](https://github.com/mpppk/cloud-run-dsh/issues/72) |
+| マイグレーション後の `terraform destroy` | テーブルが `dsh_app` ロールを参照するため一度失敗する。撤収が失敗する＝課金が止まらない。 | [#73](https://github.com/mpppk/cloud-run-dsh/issues/73) |
+| cancel / approval の実機動作 | ローカルでは実キーで確認済み。GCP 上では未確認。 | [#39](https://github.com/mpppk/cloud-run-dsh/issues/39)（実装はマージ済み） |
+| IAP ブランド / ロードバランサ | 未作成。一度作ると削除できないため見送っている。`iap_support_email` を与えたときのみ作られる。現在 Instance を守っているのは invoker IAM のみ。 | — |
 
 > control-plane は自分の未完成さについて意図的に正直に振る舞う。仕事ができないデプロイが自分を
-> ready と称するべきではないため、ランタイムレジストリが未結線の間 `/readyz` は 503 を返し続ける。
+> ready と称するべきではないため、依存が揃わない間 `/readyz` は 503 を返す。
+> 同じ姿勢が随所にある: `turnStarter` が無ければゲートウェイは 202 ではなく 503 を返し、
+> health が確認できなければ control-plane は「盲目的に READY にしない」と言って失敗する。
 
 ---
 
@@ -569,6 +588,8 @@ gcloud 呼び出しが失敗するので解除する。
 - **撤収の順序が重要。** チェックポイントバケットはバージョニング有効かつ `force_destroy = false` なので、
   オブジェクトが残っていると `terraform destroy` が失敗する。撤収が失敗するとは、課金が止まらないということ。
   先に空にする（`--yes` ガード付きのスクリプトがある）。
+  **マイグレーションを流したあとは、さらに DB ユーザーの罠がある**（テーブルが `dsh_app` ロールを
+  参照するため user の削除が 400 になる。[#73](https://github.com/mpppk/cloud-run-dsh/issues/73)）。
 - **ピアリングは `deletion_policy = "ABANDON"`。** destroy 後も残り、次回の apply に影響する。
 - **シークレットのバージョンは destroy で消える。** 作り直すたびに DB パスワードを入れ直す。
 
