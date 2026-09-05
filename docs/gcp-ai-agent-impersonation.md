@@ -111,8 +111,14 @@ Terraform stateは現在ローカル管理で、stateファイルはリポジト
 
 ## 注意事項
 
-- 今回の設定ではCloud RunとArtifact RegistryのAPIはまだ有効化していません。
-- Cloud Run、Cloud SQL、バケットなどの実リソースは、AI-agent用SAの設定だけでは作成されません。
+- (2026-09-05 時点では解消済み: 下記の API は有効化され、Cloud Run・Cloud SQL・
+  バケット等の実リソースが存在する。手順は
+  [`docs/deployment-runbook.md`](deployment-runbook.md) が正典)
+- AI-agent 用 SA (`ai-agent`) は Terraform 管理 (`infra/terraform/iam.tf`) のため、
+  2026-09-05 の撤収検証で destroy により一度削除された後、apply で作り直されている。
+  手動で作られた SA が残っていると 409 で衝突する場合は、先に state へ取り込む
+  (`terraform import google_service_account.ai_agent …`) こと。
+  ([`docs/architecture.md`](architecture.md) §03 も参照)
 - ベースライン全体の構築は [`infra/terraform/README.md`](../infra/terraform/README.md) と
   [`docs/deployment-runbook.md`](deployment-runbook.md) を参照してください。
 - サービスアカウントキーを作成して認証を回避しないでください。

@@ -37,6 +37,10 @@ terraform -chdir=infra/terraform apply -var-file=profiles/minimal.tfvars
 - 注意: 0.6 GiB RAM ではワークスペース実負荷は持たない想定。立ち上げ確認
   (apply, マイグレーション, /livez) 専用。OOM した場合は `db-g1-small`
   (約 3 倍の単価) に上げて再確認すること。
+- 注意 (2026-09-05 実測): `db-f1-micro` では**接続スロットが枯渇しやすい**。
+  control-plane のコネクションプールだけで枠が埋まり、`psql` が繋がらなく
+  なった。検証中に素の `psql` で直接確認したい場合は、control-plane を止めた
+  状態で行うか、一時的に上位 tier への上げを検討すること。
 
 ## 月額概算 (asia-northeast1)
 
@@ -129,6 +133,7 @@ terraform -chdir=infra/terraform destroy
 | リソース | destroy 挙動 | 課金が止まる条件 |
 |---|---|---|
 | Cloud SQL (最大コスト) | 削除される (`deletion_protection = false`) | destroy 成功時 |
+| Cloud SQL ユーザー `dsh_app` | マイグレーション後は**削除失敗する** (テーブルがロールを参照。オープンな issue [#73](https://github.com/mpppk/cloud-run-dsh/issues/73)。2026-09-05 の撤収で実測) | 先に `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` してから destroy 再実行 (詳細は [deployment-runbook.md Step 8](deployment-runbook.md#step-8--teardown-stop-paying)) |
 | GCS チェックポイントバケット | **空でないと削除失敗** | 上記スクリプト実行後 |
 | Service Networking peering | `deletion_policy = "ABANDON"` で**残る** | runbook Step 8.5 の手動削除 |
 | Cloud Run Instance (Pre-GA) | Terraform 管理外 | 手動 stop/delete (Step 8.1) |

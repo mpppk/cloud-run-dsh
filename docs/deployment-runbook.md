@@ -18,8 +18,8 @@ This runbook takes an operator from an **empty Google Cloud project** to a **dep
 
 Scope of the Terraform baseline (what you are about to create):
 
-- 11 APIs enabled (`cloudresourcemanager`, `iam`, `run`, `sqladmin`, `secretmanager`, `artifactregistry`, `storage`, `iap`, `logging`, `monitoring`, `servicenetworking`) — `apis.tf`
-- Artifact Registry Docker repository `agent-host` — `artifact_registry.tf`
+- 12 APIs enabled (`cloudresourcemanager`, `compute`, `iam`, `run`, `sqladmin`, `secretmanager`, `artifactregistry`, `storage`, `iap`, `logging`, `monitoring`, `servicenetworking`) — `apis.tf` (`compute` is required by `google_compute_network.sql`; without it the first apply fails with "Compute Engine API has not been used")
+- Artifact Registry Docker repository `agent-host` — `artifact_registry.tf`. Both the agent-host AND the control-plane service accounts hold repo-scoped `roles/artifactregistry.reader` on it (`iam.tf`): the Instance pulls the image as agent-host, but Cloud Run verifies image access with the **caller's** permission at create time, so with agent-host only the create fails with `downloadArtifacts` 403 (issues #58 / #64 — verified on live infra). Do NOT drop the control-plane binding as "unused"
 - Cloud SQL PostgreSQL 16 with a private IP (own VPC + Service Networking peering) **plus a public IPv4** — Cloud Run Instances have no VPC connectivity, so the native `cloudSqlInstance` volume path dials the public address (see Step 5); `authorized_networks` stays empty (IAM + short-lived client certificate do the authorization), database `dsh`, user `dsh_app` — `cloudsql.tf`. The public IPv4 is **not** a provider default (`variables.tf` keeps `db_enable_public_ip = false` as a safety valve) — you enable it in Step 2.1 via `TF_VAR_db_enable_public_ip=true`, or by using the minimal profile (`profiles/minimal.tfvars`, Appendix), which sets `db_enable_public_ip = true`.
 - GCS checkpoint bucket (uniform access, versioning, ARCHIVED-object 30-day lifecycle) — `storage.tf`
 - Three service accounts (agent-host, control-plane, and the `ai-agent` operator identity) with least-privilege bindings — `iam.tf`. The `ai-agent` operator identity and its gcloud impersonation setup are documented separately in [`gcp-ai-agent-impersonation.md`](gcp-ai-agent-impersonation.md).
@@ -134,7 +134,7 @@ terraform -chdir=infra/terraform plan
 > ⚠️ **Bootstrap APIs must exist before the FIRST apply.** The google provider itself depends on `cloudresourcemanager.googleapis.com` (it resolves project numbers / IAM during plan and apply). On a brand-new project the first apply would otherwise fail *while trying to enable that same API*. Enable the two bootstrap APIs **out-of-band, before the first `terraform apply`**:
 >
 > ```bash
-> gcloud services enable cloudresourcemanager.googleapis.com run.googleapis.com
+> gcloud services enable cloudresourcemanager.googleapis.com compute.googleapis.com run.googleapis.com
 > ```
 >
 > `run.googleapis.com` is in the same boat in practice: the Cloud Run Instances Preview surface used in Step 5 was verified against a project where `run.googleapis.com` had been enabled manually before any Terraform ran. Terraform (`apis.tf`) declares both APIs, but the provider's *own* bootstrap dependency on `cloudresourcemanager` cannot be satisfied by Terraform itself — hence the manual pre-step.
@@ -250,7 +250,7 @@ Baseline configuration (仕様書 §22 / 実装手順書 §6): `cpu: 4`, `memory
 
 ### 5.1 Agent-host environment — all 13 required keys
 
-`apps/agent-host/src/config.ts` defines `REQUIRED_ENV_KEYS`; if ANY of the following is missing or blank, the container crashes at startup with `MissingRequiredEnvError` (the composition root refuses to boot). The list below mirrors `config.ts:12-26` — **if you add an env key to `config.ts`, update this table in the same PR** so this runbook cannot silently drift.
+`apps/agent-host/src/config.ts` defines `REQUIRED_ENV_KEYS`; if ANY of the following is missing or blank, the container crashes at startup with `MissingRequiredEnvError` (the composition root refuses to boot). The list below mirrors `REQUIRED_ENV_KEYS` in `config.ts` — **if you add an env key to `config.ts`, update this table in the same PR** so this runbook cannot silently drift.
 
 | # | Key | Where the value comes from |
 |---|---|---|
@@ -456,12 +456,14 @@ export CP_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-host/control-plane
 #   cross-architecture host — type safety is enforced by CI and
 #   `bunx tsc --build` instead.)
 #  (the production entrypoint is apps/control-plane/src/main.ts; it requires
-#   the 11 env keys in the table below, respects PORT, and serves /livez +
+#   the 11 env keys below — 8 plain keys via --env-vars-file plus 3 secrets
+#   via --set-secrets — respects PORT, and serves /livez +
 #   /readyz — see apps/control-plane/README.md. The RuntimeRegistry is wired:
 #   POST /v1/workspaces/:id/open creates-or-starts the workspace Instance.)
 #
-# Control-plane environment — mirrors apps/control-plane/src/config.ts.
-# If you add an env key to config.ts, update this table in the same PR.
+# Control-plane environment — mirrors the 11 `REQUIRED_ENV_KEYS` in apps/control-plane/src/config.ts
+# (8 plain keys via this file + 3 secrets via --set-secrets below = 11).
+# If you add an env key to config.ts, update this step in the same PR.
 # Secret hygiene: the DB password, the PEM, AND the LLM key never appear in
 # argv or shell history — secrets travel via Secret Manager (--set-secrets)
 # and stdin redirection (herestrings use temp files, not argv). The
@@ -647,12 +649,23 @@ Teardown gotchas (all verified against `infra/terraform`):
 - **Versioned bucket**: `google_storage_bucket.checkpoints` has versioning enabled; `terraform destroy` fails on a non-empty versioned bucket. That is why step 3 empties it first with `gcloud storage rm --all-versions -r` — the only way the destroy succeeds. Checkpoints and sessions are unrecoverable after it; export the bucket (`gcloud storage cp -r ...`) before step 3 if you want the data instead of the savings.
 - **Service Networking peering is ABANDONED, not destroyed**: `cloudsql.tf` sets `deletion_policy = "ABANDON"` on `google_service_networking_connection.private_vpc_connection`, so `terraform destroy` intentionally leaves the VPC peering (and the peered Private Service Access range) in place — deleting it would break any other SQL instance sharing the peering. Remove it manually with step 5 above (`gcloud services vpc-peerings delete`), which deletes the peering; the reserved global address itself is Terraform-managed and is destroyed normally. (Note: after `terraform destroy` the VPC network is also gone; if destroy already removed it, the peering went with it — verify with `gcloud compute networks peerings list --network=...` and skip step 5 if nothing is listed.)
 - **Cloud SQL instance**: `google_sql_database_instance.main` has no ABANDON override, so destroy DOES delete it — the largest cost line disappears at step 4.
+- **DB user after migrations (open issue [#73](https://github.com/mpppk/cloud-run-dsh/issues/73), measured 2026-09-05):** once the migration runner has applied `0001_init.sql`, its tables reference the `dsh_app` role, so deleting the `google_sql_user.app` user fails with `role "dsh_app" cannot be dropped because some objects depend on it` (400) and the destroy fails with it. If `terraform destroy` fails on the user, drop the migrated objects first from a privileged connection (`DROP SCHEMA public CASCADE; CREATE SCHEMA public;` via the proxy as in Step 4 but as the superuser) and re-run destroy. A failed destroy keeps billing — do not leave it.
 - **Secret Manager secrets** are destroyed with their versions — you will need to re-add them if you redeploy.
 - **Cloud Run Instances**: never in Terraform state; step 1 is the only thing that stops their billing.
 
 ---
 
 ## What cannot be verified without a real project
+
+> **2026-09-05 update:** the per-step table below predates the end-to-end run
+> on the real project (`cloud-run-dsh`), where Steps 4–7 were all executed for
+> real — migrations via the proxy, manual Instance create/start/stop over v2
+> REST, control-plane `gcloud run deploy`, and the full workspace → open →
+> LLM turn → SSE path (see [architecture.md](architecture.md) and
+> [e2e-verification-report.md](e2e-verification-report.md)). The table is kept
+> as the pre-verification record; treat rows for Steps 4–7 as superseded by
+> that report, except the still-open items: IAP brand/LB wiring (Step 6) and
+> `terraform destroy` after migrations (Step 8, open issue #73).
 
 This runbook was authored against a machine with **no gcloud credentials and no configured project**; nothing here was executed against real GCP. Unexecuted and therefore unproven:
 
@@ -664,7 +677,7 @@ This runbook was authored against a machine with **no gcloud credentials and no 
 | Step 3 | `docker build` of the agent-host image was not run here; the Dockerfile's `bun run typecheck` stage depends on the workspace installing cleanly in-container. |
 | Step 4 | Migration runner against real Cloud SQL (proxy, private-IP path, `DATABASE_URL` with the Cloud SQL connection name) — untested against a live instance; the runner itself is covered by unit tests. |
 | Step 5 | **Highest risk.** The create body shape, `validateOnly` dry-run, and the v2 REST paths were verified against the live discovery document and read-only probes on 2026-09-03 (see PR verification: v1 paths return HTML 404, v2 list returns 200). Still unproven: an actual create/start/stop against a live instance (billable), and the `gcloud run instances` Preview command-group availability. |
-| Step 6 | `gcloud run deploy` + IAP frontend wiring — unexecuted (needs a real project). The image itself now builds (see the control-plane Dockerfile) and was verified locally: `docker build` + container start + `/healthz` curl (see the P3 PR verification). The RuntimeRegistry is wired (#23): `open` creates-or-starts the workspace Instance, so Step 7.3 exercises it for real. |
+| Step 6 | `gcloud run deploy` + IAP frontend wiring — the deploy itself was proven on the real project on 2026-09-05 (see the update note above); the IAP frontend wiring is still unexecuted. The image builds (see the control-plane Dockerfile) and was verified locally: `docker build` + container start + `/livez` curl (see the P3 PR verification). The RuntimeRegistry is wired (#23): `open` creates-or-starts the workspace Instance, proven live on 2026-09-05. |
 | Step 7 | Smoke checks — depend on Steps 4–6. |
 | Step 8 | `terraform destroy` behavior with real state; Instance stop/delete endpoint names under the Preview API. |
 
