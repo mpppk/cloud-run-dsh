@@ -20,8 +20,8 @@ import {
   ExecGitRunner,
   FetchGcsClient,
   createCheckpointStorage,
-  createGcsTokenProvider,
 } from "./src/adapters.js";
+import { createGcsTokenProvider } from "@cloud-run-dsh/gcp-token-provider";
 import {
   createCheckpointBundle,
   serializeBundle,

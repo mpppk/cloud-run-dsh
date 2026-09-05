@@ -4,6 +4,7 @@
 
 import { CloudRunInstanceClient, buildInstancesBasePath } from "@cloud-run-dsh/cloud-run-instance-client";
 import { createLogger } from "@cloud-run-dsh/observability";
+import { createGcsTokenProvider } from "@cloud-run-dsh/gcp-token-provider";
 import { composeAgentHost } from "./composition.js";
 import type { AgentHostDependencies } from "./composition.js";
 import { readAgentHostConfig } from "./config.js";
@@ -19,7 +20,6 @@ import {
   SqlTransactionalStateStore,
   createCheckpointStorage,
   createEnvSecretProvider,
-  createGcsTokenProvider,
   createSessionRepository,
   fetchHttpTransport,
   instanceHttpTransport,

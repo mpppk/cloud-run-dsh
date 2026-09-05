@@ -17,6 +17,7 @@ import {
 import type { BunSqlConnectionTarget } from "@cloud-run-dsh/session-persistence-postgres";
 import type { QueryExecutor } from "@cloud-run-dsh/session-persistence-postgres";
 import type { ControllerLeaseRecord } from "@cloud-run-dsh/controller-lease";
+import { InMemoryLogger } from "@cloud-run-dsh/observability";
 
 // ---------------------------------------------------------------------------
 // config
@@ -427,53 +428,139 @@ describe("BunSqlLeaseStore", () => {
 });
 
 // ---------------------------------------------------------------------------
-// GCP token provider (Instances API + GCS auth)
+// GCP token provider (Instances API + GCS auth — issue #76)
+//
+// The provider is the shared @cloud-run-dsh/gcp-token-provider chain
+// (metadata server → ADC → GCP_ACCESS_TOKEN, cached). These tests pin the
+// control-plane wiring: the chain order, the cache, the ADC fallback, and
+// that token material never reaches logs or error messages. The chain's
+// own edge cases (margins, stampedes, service-account minting) are covered
+// in the package's suite.
 // ---------------------------------------------------------------------------
 
 describe("createGcpAccessTokenProvider", () => {
-  test("GCP_ACCESS_TOKEN env wins without touching the network", async () => {
-    let fetched = false;
+  type StubResponse = { ok: boolean; status: number; json(): Promise<unknown> };
+  const jsonStub = (
+    onCall: (url: string) => StubResponse | Promise<StubResponse>,
+  ): { fetchFn: (url: string) => Promise<StubResponse>; calls: string[] } => {
+    const calls: string[] = [];
+    const fetchFn = async (url: string): Promise<StubResponse> => {
+      calls.push(url);
+      return onCall(url);
+    };
+    return { fetchFn, calls };
+  };
+  const tokenJson = (token: string, expiresIn = 3600): StubResponse => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ access_token: token, expires_in: expiresIn }),
+  });
+  const noAdc = async (): Promise<string> => {
+    throw new Error("ENOENT: no adc file");
+  };
+
+  test("metadata server token is served, then cached without re-fetching", async () => {
+    const { fetchFn, calls } = jsonStub(() => tokenJson("meta-token"));
+    const provider = createGcpAccessTokenProvider({}, fetchFn, { readFile: noAdc });
+
+    await expect(provider()).resolves.toBe("meta-token");
+    await expect(provider()).resolves.toBe("meta-token");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("metadata.google.internal");
+  });
+
+  test("falls back to ADC authorized_user when the metadata server is down", async () => {
+    const logger = new InMemoryLogger();
+    const { fetchFn } = jsonStub((url) => {
+      if (url.includes("metadata.google.internal")) return { ok: false, status: 404, json: async () => ({}) };
+      return tokenJson("ya29.adc-token");
+    });
     const provider = createGcpAccessTokenProvider(
-      { GCP_ACCESS_TOKEN: "  token-abc  " },
-      async () => {
-        fetched = true;
-        return { ok: true, status: 200, json: async () => ({}) };
+      { GOOGLE_APPLICATION_CREDENTIALS: "/adc/creds.json" },
+      fetchFn,
+      {
+        logger,
+        readFile: async () =>
+          JSON.stringify({
+            type: "authorized_user",
+            client_id: "id",
+            client_secret: "secret",
+            refresh_token: "rt",
+          }),
       },
     );
-    await expect(provider()).resolves.toBe("token-abc");
-    expect(fetched).toBe(false);
+
+    await expect(provider()).resolves.toBe("ya29.adc-token");
+    const event = logger.parsed.find((e) => e["event"] === "gcs.auth.token_source");
+    expect(event?.["source"]).toBe("adc-authorized-user");
+    for (const line of logger.lines) {
+      expect(line.includes("ya29.adc-token")).toBe(false);
+      expect(line.includes("rt")).toBe(false);
+    }
   });
 
-  test("falls back to the metadata server when no env token exists", async () => {
-    let url = "";
-    const provider = createGcpAccessTokenProvider({}, async (u: string) => {
-      url = u;
-      return { ok: true, status: 200, json: async () => ({ access_token: "meta-token" }) };
-    });
-    await expect(provider()).resolves.toBe("meta-token");
-    expect(url).toContain("metadata.google.internal");
-  });
-
-  test("unreachable metadata server -> actionable error, not a hang", async () => {
-    const provider = createGcpAccessTokenProvider({}, async () => {
+  test("GCP_ACCESS_TOKEN is the last resort after metadata and ADC fail", async () => {
+    const { fetchFn, calls } = jsonStub(() => {
       throw new Error("fetch failed");
     });
-    await expect(provider()).rejects.toThrow(/no GCP credentials/);
+    const provider = createGcpAccessTokenProvider(
+      { GCP_ACCESS_TOKEN: "  env-token-abc  " },
+      fetchFn,
+      { readFile: noAdc },
+    );
+
+    // The metadata server IS consulted first (shared chain order) — the env
+    // token wins only because nothing earlier produced one.
+    await expect(provider()).resolves.toBe("env-token-abc");
+    expect(calls.length).toBeGreaterThan(0);
   });
 
-  test("metadata non-200 / missing access_token -> actionable error", async () => {
-    const badStatus = createGcpAccessTokenProvider({}, async () => ({
-      ok: false,
-      status: 403,
-      json: async () => ({}),
-    }));
-    await expect(badStatus()).rejects.toThrow(/metadata server answered 403/);
-    const noToken = createGcpAccessTokenProvider({}, async () => ({
-      ok: true,
-      status: 200,
-      json: async () => ({}),
-    }));
-    await expect(noToken()).rejects.toThrow(/no access_token/);
+  test("unreachable metadata server with no ADC and no env token -> actionable error", async () => {
+    const { fetchFn } = jsonStub(() => {
+      throw new Error("fetch failed");
+    });
+    const provider = createGcpAccessTokenProvider({}, fetchFn, { readFile: noAdc });
+    await expect(provider()).rejects.toThrow(/no GCS credential source/);
+    await expect(provider()).rejects.toThrow(/GCP_ACCESS_TOKEN/);
+  });
+
+  test("metadata non-200 / missing access_token falls through to the next source", async () => {
+    const badStatus = createGcpAccessTokenProvider(
+      { GCP_ACCESS_TOKEN: "env-after-403" },
+      jsonStub(() => ({ ok: false, status: 403, json: async () => ({}) })).fetchFn,
+      { readFile: noAdc },
+    );
+    await expect(badStatus()).resolves.toBe("env-after-403");
+
+    const noToken = createGcpAccessTokenProvider(
+      { GCP_ACCESS_TOKEN: "env-after-empty" },
+      jsonStub(() => tokenJson("")).fetchFn,
+      { readFile: noAdc },
+    );
+    await expect(noToken()).resolves.toBe("env-after-empty");
+  });
+
+  test("tokens never appear in logs or error messages", async () => {
+    const logger = new InMemoryLogger();
+    const secret = "ya29.secret-0123456789abcdef";
+    const { fetchFn } = jsonStub(() => tokenJson(secret));
+    const provider = createGcpAccessTokenProvider({}, fetchFn, { logger, readFile: noAdc });
+
+    await expect(provider()).resolves.toBe(secret);
+    expect(logger.lines.join("\n")).not.toContain(secret);
+
+    // The no-source error carries reason codes, never token material.
+    const empty = createGcpAccessTokenProvider(
+      {},
+      jsonStub(() => ({ ok: false, status: 500, json: async () => ({}) })).fetchFn,
+      { readFile: noAdc },
+    );
+    const err = await empty().then(
+      () => null,
+      (e: unknown) => (e instanceof Error ? e.message : String(e)),
+    );
+    expect(err).toContain("no GCS credential source");
+    expect(err).not.toContain(secret);
   });
 });
 

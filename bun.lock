@@ -17,6 +17,7 @@
         "@cloud-run-dsh/cloud-run-sandbox": "workspace:*",
         "@cloud-run-dsh/controller-lease": "workspace:*",
         "@cloud-run-dsh/dsh-subprocess-cloud-run": "workspace:*",
+        "@cloud-run-dsh/gcp-token-provider": "workspace:*",
         "@cloud-run-dsh/github-credential-broker": "workspace:*",
         "@cloud-run-dsh/observability": "workspace:*",
         "@cloud-run-dsh/session-persistence-postgres": "workspace:*",
@@ -51,6 +52,7 @@
       "dependencies": {
         "@cloud-run-dsh/cloud-run-instance-client": "workspace:*",
         "@cloud-run-dsh/controller-lease": "workspace:*",
+        "@cloud-run-dsh/gcp-token-provider": "workspace:*",
         "@cloud-run-dsh/observability": "workspace:*",
         "@cloud-run-dsh/session-persistence-postgres": "workspace:*",
         "@cloud-run-dsh/workspace-checkpoint": "workspace:*",
@@ -74,6 +76,14 @@
       "version": "0.0.0",
       "dependencies": {
         "@cloud-run-dsh/cloud-run-sandbox": "workspace:*",
+      },
+    },
+    "packages/gcp-token-provider": {
+      "name": "@cloud-run-dsh/gcp-token-provider",
+      "version": "0.0.0",
+      "dependencies": {
+        "@cloud-run-dsh/observability": "workspace:*",
+        "@cloud-run-dsh/workspace-checkpoint": "workspace:*",
       },
     },
     "packages/github-credential-broker": {
@@ -113,6 +123,8 @@
     "@cloud-run-dsh/controller-lease": ["@cloud-run-dsh/controller-lease@workspace:packages/controller-lease"],
 
     "@cloud-run-dsh/dsh-subprocess-cloud-run": ["@cloud-run-dsh/dsh-subprocess-cloud-run@workspace:packages/dsh-subprocess-cloud-run"],
+
+    "@cloud-run-dsh/gcp-token-provider": ["@cloud-run-dsh/gcp-token-provider@workspace:packages/gcp-token-provider"],
 
     "@cloud-run-dsh/github-credential-broker": ["@cloud-run-dsh/github-credential-broker@workspace:packages/github-credential-broker"],
 

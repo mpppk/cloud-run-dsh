@@ -34,6 +34,10 @@ import type {
   HttpResponse as InstanceHttpResponse,
 } from "@cloud-run-dsh/cloud-run-instance-client";
 import type { GcsClient } from "@cloud-run-dsh/workspace-checkpoint";
+import {
+  RefreshingGcsTokenProvider,
+  type ChainedGcsTokenProviderDeps,
+} from "@cloud-run-dsh/gcp-token-provider";
 
 // ---------------------------------------------------------------------------
 // Cloud SQL (Postgres) QueryExecutor via Bun's built-in SQL client
@@ -468,52 +472,37 @@ export type FetchFn = (
 ) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 
 /**
- * Resolves the token from `GCP_ACCESS_TOKEN` when set (local runs, short-lived
- * operator tokens), otherwise from the GCP metadata server (Cloud Run / GCE —
- * the production path; no secret to rotate). The metadata lookup has a short
- * timeout so a non-GCP environment fails fast with a clear error instead of
- * hanging the first Instance operation.
+ * Resolves the token through the shared `@cloud-run-dsh/gcp-token-provider`
+ * chain (issue #76): metadata server → ADC → `GCP_ACCESS_TOKEN`, cached
+ * until 60s before expiry with one shared in-flight refresh.
  *
- * NOTE (#27 closed, #76): #27 landed production-grade token handling
- * (caching, refresh, ADC fallback) on the agent-host side only
- * (RefreshingGcsTokenProvider, PR #33). This control-plane provider is still
- * the minimal stopgap — no cache, no ADC fallback — and stays shippable
- * because Instance API / GCS calls are infrequent. Parity is tracked in #76;
- * see also the agent-host's envGcsTokenProvider precedent.
+ * Why caching: the metadata server reports ~1799s lifetimes on real GCP, so
+ * minting a fresh token per Instances API / GCS call is pure waste.
+ * Why ADC fallback: local runs have no metadata server — after
+ * `gcloud auth application-default login` the chain works off-GCP exactly
+ * like the agent-host's (same class, same order).
+ *
+ * Only the source name is ever logged (info); the token itself never is —
+ * see the shared package. Error messages likewise carry reason codes, never
+ * token material.
  */
 export function createGcpAccessTokenProvider(
   env: Readonly<Record<string, string | undefined>> = process.env,
-  fetchFn: FetchFn = fetch as unknown as FetchFn,
+  fetchFn: FetchFn = fetch,
+  deps: Pick<
+    ChainedGcsTokenProviderDeps,
+    "logger" | "clock" | "readFile" | "metadataTimeoutMs" | "adcCredentialsPath"
+  > = {},
 ): GcpTokenProvider {
-  return async () => {
-    const fromEnv = env["GCP_ACCESS_TOKEN"]?.trim();
-    if (fromEnv) return fromEnv;
-    let res: { ok: boolean; status: number; json(): Promise<unknown> };
-    try {
-      res = await fetchFn(
-        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-        {
-          headers: { "Metadata-Flavor": "Google" },
-          signal: AbortSignal.timeout(2000),
-        },
-      );
-    } catch (e) {
-      throw new Error(
-        "no GCP credentials: GCP_ACCESS_TOKEN is not set and the metadata server is unreachable " +
-          `(are you running outside GCP without a token? ${e instanceof Error ? e.message : String(e)})`,
-      );
-    }
-    if (!res.ok) {
-      throw new Error(
-        `no GCP credentials: GCP_ACCESS_TOKEN is not set and the metadata server answered ${res.status}`,
-      );
-    }
-    const body = (await res.json()) as { access_token?: unknown };
-    if (typeof body.access_token !== "string" || body.access_token === "") {
-      throw new Error("no GCP credentials: metadata server returned no access_token");
-    }
-    return body.access_token;
-  };
+  const provider = new RefreshingGcsTokenProvider(env, {
+    clock: deps.clock,
+    logger: deps.logger,
+    fetchImpl: fetchFn,
+    readFile: deps.readFile,
+    adcCredentialsPath: deps.adcCredentialsPath,
+    metadataTimeoutMs: deps.metadataTimeoutMs ?? 2000,
+  });
+  return () => provider.getToken();
 }
 
 // ---------------------------------------------------------------------------

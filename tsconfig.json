@@ -17,6 +17,7 @@
     { "path": "packages/session-persistence-postgres" },
     { "path": "packages/github-credential-broker" },
     { "path": "packages/controller-lease" },
+    { "path": "packages/gcp-token-provider" },
     { "path": "packages/observability" }
   ]
 }

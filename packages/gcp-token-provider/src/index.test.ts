@@ -1,4 +1,4 @@
-// GCS token provider chain tests (issue #27).
+// Token chain tests (issue #27; shared by both apps since issue #76).
 //
 // Conventions: time is driven by the injected FakeClock (never wall time),
 // fetch and ADC file reads are stubbed, and the InMemoryLogger proves which
@@ -7,11 +7,28 @@
 import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
 import { InMemoryLogger } from "@cloud-run-dsh/observability";
+import type { Clock } from "@cloud-run-dsh/workspace-checkpoint";
 import {
   GCS_TOKEN_REFRESH_MARGIN_MS,
   RefreshingGcsTokenProvider,
-} from "./adapters.js";
-import { FakeClock } from "./fakes.js";
+} from "./index.js";
+
+/** Minimal wall-free clock: the provider only ever reads nowMs(). */
+class FakeClock implements Clock {
+  private currentMs: number;
+  constructor(initialMs = 1_000_000_000_000) {
+    this.currentMs = initialMs;
+  }
+  now(): Date {
+    return new Date(this.currentMs);
+  }
+  nowMs(): number {
+    return this.currentMs;
+  }
+  advance(ms: number): void {
+    this.currentMs += ms;
+  }
+}
 
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
@@ -349,5 +366,36 @@ describe("RefreshingGcsTokenProvider", () => {
 
     expect(await provider.getToken()).toBe("ya29.well-known-WWW123");
     expect(readPaths).toEqual(["/home/dev/.config/gcloud/application_default_credentials.json"]);
+  });
+
+  test("adcCredentialsPath dep overrides the env/well-known ADC lookup (issue #76)", async () => {
+    const clock = new FakeClock();
+    const readPaths: string[] = [];
+    const { fetchImpl } = createFetchStub((call) => {
+      if (call.url.includes("metadata.google.internal")) {
+        throw new TypeError("fetch failed");
+      }
+      return jsonResponse({ access_token: "ya29.override-OOO456", expires_in: 3600 });
+    });
+    const provider = new RefreshingGcsTokenProvider(
+      { HOME: "/home/dev", GOOGLE_APPLICATION_CREDENTIALS: "/env/creds.json" },
+      {
+        clock,
+        fetchImpl,
+        adcCredentialsPath: "/dep/creds.json",
+        readFile: async (path) => {
+          readPaths.push(path);
+          return JSON.stringify({
+            type: "authorized_user",
+            client_id: "id",
+            client_secret: "secret",
+            refresh_token: "rt",
+          });
+        },
+      },
+    );
+
+    expect(await provider.getToken()).toBe("ya29.override-OOO456");
+    expect(readPaths).toEqual(["/dep/creds.json"]);
   });
 });
