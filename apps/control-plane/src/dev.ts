@@ -62,7 +62,7 @@ export class LoggingWorkspaceRuntimeHandle implements WorkspaceRuntimeHandle {
     console.log(`[dev] workspace ${this.workspaceId}: activity ${kind}`);
   }
 
-  assertAgentInputAllowed(): void {
+  async assertAgentInputAllowed(): Promise<void> {
     // Local dev: always allowed when the workspace is open.
   }
 

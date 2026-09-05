@@ -294,7 +294,9 @@ export const postMessage: RouteHandler = async (ctx) => {
   const workspace = await loadWorkspace(ctx.deps, session.workspaceId);
   const handle = await ctx.deps.runtimes.get(workspace);
   // The workspace state must accept agent input (仕様書 section 8).
-  handle.assertAgentInputAllowed();
+  // Issue #122: awaited — the gate reloads the persisted row, so a
+  // late agent-host recovery (DB READY) unblocks turns without re-open.
+  await handle.assertAgentInputAllowed();
   // A user message is meaningful activity (仕様書 section 11).
   handle.recordActivity("user_message");
   // Resolve the forward target BEFORE appending: when the Instance is not
@@ -367,7 +369,8 @@ export const postApproval: RouteHandler = async (ctx) => {
   const workspace = await loadWorkspace(ctx.deps, session.workspaceId);
   const handle = await ctx.deps.runtimes.get(workspace);
   // The workspace state must accept agent input (仕様書 section 8).
-  handle.assertAgentInputAllowed();
+  // Issue #122: awaited — see postMessage.
+  await handle.assertAgentInputAllowed();
   // An approval operation is meaningful activity (仕様書 section 11).
   handle.recordActivity("approval");
   // Resolve the forward target BEFORE appending (issue #39, same rule as
@@ -437,7 +440,8 @@ export const postCancel: RouteHandler = async (ctx) => {
   const workspace = await loadWorkspace(ctx.deps, session.workspaceId);
   const handle = await ctx.deps.runtimes.get(workspace);
   // The workspace state must accept agent input (仕様書 section 8).
-  handle.assertAgentInputAllowed();
+  // Issue #122: awaited — see postMessage.
+  await handle.assertAgentInputAllowed();
   // An explicit workspace operation is meaningful activity (仕様書 section 11).
   handle.recordActivity("workspace_operation");
   // Resolve the forward target BEFORE appending (issue #39, same rule as

@@ -383,7 +383,9 @@ export class AgentGateway {
       return this.json(400, { error: "sessionId required" });
     }
     try {
-      this.deps.runtime.assertAgentInputAllowed();
+      // Issue #122: awaited — the gate reloads the persisted row, so it
+      // agrees with what the control plane's GET serves from the same row.
+      await this.deps.runtime.assertAgentInputAllowed();
     } catch (e) {
       if (e instanceof AgentInputRefusedError) {
         return this.json(409, { error: `agent input refused in state ${e.state}` });

@@ -121,6 +121,16 @@ export interface PollConfig {
 export const DEFAULT_INSTANCE_POLL: PollConfig = { maxAttempts: 60, intervalMs: 2000 };
 /** ~1 minute: agent-host recovery (clone + restore + sandbox) budget once READY. */
 export const DEFAULT_AGENT_HEALTH_POLL: PollConfig = { maxAttempts: 30, intervalMs: 2000 };
+/**
+ * ~3 minutes: Google-frontend shutdown-window allowance (issue #121).
+ * After `stop`, Cloud Run keeps serving the frontend HTML error page on the
+ * Instance URL for ~60s while the old generation shuts down; those answers
+ * are "the URL is not serving yet", not "the app is unhealthy", so they are
+ * counted against THIS budget, never against DEFAULT_AGENT_HEALTH_POLL.
+ * Genuinely broken hosts therefore still fail fast (~1 min) while a
+ * stop-then-open still succeeds once the new generation answers.
+ */
+export const DEFAULT_AGENT_SHUTDOWN_GRACE: PollConfig = { maxAttempts: 90, intervalMs: 2000 };
 
 export interface ProductionRuntimeOptions {
   readonly config: ControlPlaneConfig;
@@ -146,6 +156,13 @@ export interface ProductionRuntimeOptions {
   readonly fetchImpl?: typeof fetch;
   readonly instancePoll?: PollConfig;
   readonly agentHealthPoll?: PollConfig;
+  /**
+   * Issue #121: separate budget for Google-frontend shutdown-window pages
+   * (HTML 5xx while the old generation shuts down). Defaults to
+   * DEFAULT_AGENT_SHUTDOWN_GRACE (~3 min — covers the observed ~60s window
+   * plus margin). Finite by design: an endless frontend page still rejects.
+   */
+  readonly shutdownGracePoll?: PollConfig;
   readonly sleep?: (ms: number) => Promise<void>;
   /**
    * Test override for the injected CONTROLLER_ID. Production callers pass the
@@ -373,6 +390,30 @@ class EnsureCreatedInstanceRuntime implements InstanceRuntime {
 }
 
 /**
+ * Issue #121 案B: tells "the URL is not serving yet" apart from "the app
+ * answered unhealthy". While Cloud Run shuts the old generation down, the
+ * Instance URL serves the Google-frontend HTML error page (observed:
+ * `HTTP 500: <html>...<title>500 Server Error</title>...`). The agent-host
+ * itself ALWAYS answers JSON (`{"status": ...}` — healthy 200 or 503 while
+ * restoring), so a 5xx with an HTML body cannot be the host reporting on
+ * itself; it is the frontend saying no generation is behind the URL yet.
+ * Such answers must not consume the agent-health budget — they are the
+ * shutdown window, not evidence of unhealth.
+ *
+ * The match is deliberately `<html` ONLY (no `server error` alternative):
+ * the agent-host's own catch-all is `500 {"error":"internal server error",
+ * ...}` (gateway handle()), which contains that phrase — matching on it
+ * would misclassify a genuinely broken host as "still shutting down" and
+ * burn the 3-minute shutdown budget instead of failing fast on the health
+ * budget. Google-frontend error pages are always HTML, so nothing real is
+ * lost by requiring the tag.
+ */
+export function isFrontendShutdownResponse(status: number, bodyText: string): boolean {
+  if (status < 500 || status > 599) return false;
+  return bodyText.toLowerCase().includes("<html");
+}
+
+/**
  * Summarizes one failed health attempt for the timeout error (issue #68,
  * cause 3): status + a truncated, redactor-scrubbed body snippet. The body
  * is NEVER embedded raw — an error page could echo request details — so it
@@ -411,6 +452,8 @@ async function waitForInstanceHealth(args: {
   healthFetch: HealthFetch;
   instancePoll: PollConfig;
   agentHealthPoll: PollConfig;
+  /** Issue #121: separate budget for frontend shutdown-window pages. */
+  shutdownGrace: PollConfig;
   sleep: (ms: number) => Promise<void>;
 }): Promise<void> {
   const { client, instanceName, repo, workspaceId, healthFetch, sleep } = args;
@@ -434,32 +477,74 @@ async function waitForInstanceHealth(args: {
   // constant is shared with the agent-host gateway; the equality is pinned
   // by tests on both sides.
   const healthUrl = `${instanceUrl.replace(/\/$/, "")}${AGENT_HOST_HEALTH_PATH}`;
-  // Issue #68, cause 3: the old `catch {}` swallowed every attempt, so the
-  // timeout error could not say whether the host was unreachable, refused
-  // auth, or answered unhealthy. The last attempt's reason now travels with
-  // the timeout error (summarized + redacted, never raw).
+  // Issue #121: frontend shutdown-window pages (isFrontendShutdownResponse)
+  // are counted against the SEPARATE shutdownGrace budget, never against
+  // agentHealthPoll — they mean "no generation is serving this URL yet",
+  // not "the app is unhealthy". Both budgets are finite, so neither a
+  // broken host nor a never-appearing URL can poll forever.
+  //
+  // Loop shape: the fetch lives in its own try/catch so budget-exhaustion
+  // throws below never pass through a catch that could misclassify them.
+  const healthNote = (skipped: number): string =>
+    skipped > 0
+      ? ` (${skipped} frontend shutdown-window pages were skipped under a separate budget and are not counted above)`
+      : ``;
   let lastFailure = "no health attempts completed";
-  for (let attempt = 1; attempt <= args.agentHealthPoll.maxAttempts; attempt++) {
+  let healthAttempts = 0;
+  let shutdownSkipped = 0;
+  for (;;) {
+    let res: HealthCheckResponse;
     try {
-      const res = await healthFetch(healthUrl);
-      if (res.ok) {
-        await repo.updateWorkspace(workspaceId, { instanceUrl });
-        return;
-      }
-      lastFailure = summarizeHealthFailure(res.status, await safeHealthBody(res));
+      res = await healthFetch(healthUrl);
     } catch (e) {
       // Unreachable host, aborted request, or a failing ID-token mint —
       // keep polling within budget, but remember WHY for the final error.
       const reason = e instanceof Error ? e.message : String(e);
       lastFailure = `fetch failed: ${String(redactValue(reason))}`;
+      healthAttempts++;
+      if (healthAttempts >= args.agentHealthPoll.maxAttempts) {
+        throw new Error(
+          `instance ${instanceName} is READY but its agent-host never became healthy ` +
+            `(${args.agentHealthPoll.maxAttempts} polls of ${healthUrl}). ` +
+            `Last failure: ${lastFailure} — not marking READY blindly` +
+            healthNote(shutdownSkipped),
+        );
+      }
+      await sleep(args.agentHealthPoll.intervalMs);
+      continue;
     }
-    if (attempt < args.agentHealthPoll.maxAttempts) await sleep(args.agentHealthPoll.intervalMs);
+    if (res.ok) {
+      await repo.updateWorkspace(workspaceId, { instanceUrl });
+      return;
+    }
+    const body = await safeHealthBody(res);
+    if (isFrontendShutdownResponse(res.status, body)) {
+      shutdownSkipped++;
+      lastFailure =
+        `frontend shutdown-window page (NOT the agent-host — the instance URL is not serving yet): ` +
+        summarizeHealthFailure(res.status, body);
+      if (shutdownSkipped > args.shutdownGrace.maxAttempts) {
+        throw new Error(
+          `instance ${instanceName} URL kept serving the Google frontend error page ` +
+            `(${shutdownSkipped} attempts over ~${Math.round((shutdownSkipped * args.shutdownGrace.intervalMs) / 1000)}s) — ` +
+            `the instance may still be shutting down or never became reachable. ` +
+            `Last: ${lastFailure} — not marking READY blindly`,
+        );
+      }
+    } else {
+      healthAttempts++;
+      lastFailure = summarizeHealthFailure(res.status, body);
+      if (healthAttempts >= args.agentHealthPoll.maxAttempts) {
+        throw new Error(
+          `instance ${instanceName} is READY but its agent-host never became healthy ` +
+            `(${args.agentHealthPoll.maxAttempts} polls of ${healthUrl}). ` +
+            `Last failure: ${lastFailure} — not marking READY blindly` +
+            healthNote(shutdownSkipped),
+        );
+      }
+    }
+    await sleep(args.agentHealthPoll.intervalMs);
   }
-  throw new Error(
-    `instance ${instanceName} is READY but its agent-host never became healthy ` +
-      `(${args.agentHealthPoll.maxAttempts} polls of ${healthUrl}). ` +
-      `Last failure: ${lastFailure} — not marking READY blindly`,
-  );
 }
 
 /**
@@ -547,6 +632,7 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
     });
   const instancePoll = opts.instancePoll ?? DEFAULT_INSTANCE_POLL;
   const agentHealthPoll = opts.agentHealthPoll ?? DEFAULT_AGENT_HEALTH_POLL;
+  const shutdownGrace = opts.shutdownGracePoll ?? DEFAULT_AGENT_SHUTDOWN_GRACE;
 
   // Issue #60 案B: the controllerId comes from the open-established lease
   // (handlers.openWorkspace resolves it via the lease service and passes it
@@ -652,6 +738,7 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
           healthFetch,
           instancePoll,
           agentHealthPoll,
+          shutdownGrace,
           sleep,
         }),
       // Executed inside the Instance by agent-host restart recovery
