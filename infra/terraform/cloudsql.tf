@@ -150,6 +150,19 @@ resource "google_sql_database" "dsh" {
   # the subsequent DROP ROLE is expected to succeed — but if a privilege
   # residue ever blocks it again, the two-connection DROP OWNED + REVOKE
   # fallback in docs/deployment-runbook.md Step 8 still applies.
+  # Issue #115: NO Terraform-side drain gate is possible here — verified
+  # 2026-09-06 against the provider registry docs and upstream issue
+  # hashicorp/terraform-provider-google#27492 (open `force_delete` request).
+  # `google_sql_database` exposes only `deletion_policy`
+  # (DELETE/ABANDON/PREVENT); there is no pre-delete hook, no connection
+  # drain, and no DROP DATABASE ... WITH (FORCE) path, and the Cloud SQL
+  # Admin API DELETE databases issues a plain DROP DATABASE that fails with
+  # 400 "database is being accessed by other users" while idle backends
+  # remain (Bun.SQL never reaps them — #109). A destroy-time provisioner was
+  # rejected: it would need a live proxy + credentials during destroy and
+  # could not be verified in this environment. The fix is operator-side:
+  # docs/deployment-runbook.md Step 8 step 3b gates destroy on the
+  # num_backends gauge, with re-run as fallback (measured 2026-09-05).
   depends_on = [google_sql_user.app]
 }
 
