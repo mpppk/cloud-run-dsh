@@ -127,7 +127,8 @@ and watch it appear.
   member automatically).
 - **409** — a member without the controller lease tries message / approval /
   cancel / manual checkpoint ("observer"), or a second controller tries to
-  acquire while the lease is active.
+  acquire while the lease is active. A concurrent `stop` that loses the
+  shared-row race also answers 409 (`conflict`) — just retry the stop.
 - **400** — malformed path segments, invalid JSON, missing fields.
 - Console logs from the dev server show every `open`/`stop` and activity kind
   (`user_message`, `approval`, `checkpoint`, `workspace_operation`).
