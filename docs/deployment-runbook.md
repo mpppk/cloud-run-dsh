@@ -723,7 +723,7 @@ done
 if [ "$N" = "0" ]; then
   :
 elif [ -z "$N" ]; then
-  echo "no num_backends series observed - metrics unavailable (filter may be wrong). This does NOT mean connections remain - NOT destroying; see Appendix failure mode #3 (d)"; exit 1
+  echo "no num_backends reading observed - metrics unavailable (filter may be wrong, or the window has no points). This does NOT mean connections remain - NOT destroying; see Appendix failure mode #3 (d)"; exit 1
 else
   echo "num_backends never drained to 0 (last max: $N) - NOT destroying"; exit 1
 fi
