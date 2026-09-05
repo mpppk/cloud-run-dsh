@@ -115,6 +115,11 @@ describe("RestartRecovery (実装手順書 section 30)", () => {
     await seedWorkspace(th);
     // Make the workspace dirty so the lifecycle checkpoint actually runs.
     th.git.responses.set("status", { exitCode: 0, stdout: "?? dirty.txt\0", stderr: "" });
+    th.git.responses.set("rev-parse", {
+      exitCode: 0,
+      stdout: "2c6fe42d68f1638b2d4059f0fa8c9901df9effb8\n",
+      stderr: "",
+    });
     await th.host.recover();
 
     const state = await th.host.runtime.stop();
@@ -122,6 +127,13 @@ describe("RestartRecovery (実装手順書 section 30)", () => {
 
     // Lifecycle checkpoint uploaded a bundle.
     expect(th.storage.keys()).toContain("workspaces/ws-1/checkpoint.bin");
+    // Issue #95 案A: the same checkpoint appended one index row carrying
+    // the manifest base commit and the GCS object key — the row the
+    // production incident proved was never written before this fix.
+    const generations = await th.repository.listCheckpoints("ws-1");
+    expect(generations.length).toBe(1);
+    expect(generations[0]!.baseCommitSha).toBe("2c6fe42d68f1638b2d4059f0fa8c9901df9effb8");
+    expect(generations[0]!.gcsObject).toBe("workspaces/ws-1/checkpoint.bin");
     // Sandbox deleted.
     const deleteArgv = th.sandboxRunner.recorded.find((argv) => argv[1] === "delete");
     expect(deleteArgv).toBeDefined();

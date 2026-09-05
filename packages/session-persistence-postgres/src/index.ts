@@ -1,5 +1,5 @@
 // Session persistence via Cloud SQL PostgreSQL — append-only Harness provider
-export type { Workspace, Session, SessionEvent, NewSessionEvent, CreateWorkspaceInput, CreateSessionInput, UpdateWorkspacePatch, WorkspaceRuntimeState } from "./types.js";
+export type { Workspace, Session, SessionEvent, NewSessionEvent, CreateWorkspaceInput, CreateSessionInput, UpdateWorkspacePatch, WorkspaceRuntimeState, WorkspaceCheckpoint, RecordCheckpointInput } from "./types.js";
 export type { QueryExecutor, ClosableExecutor } from "./executor.js";
 export {
   BUN_SQL_ENV_URL_KEYS,

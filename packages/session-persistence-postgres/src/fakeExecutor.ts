@@ -12,11 +12,20 @@ import type { SessionEvent, Workspace, Session } from "./types.js";
 type WorkspaceRow = Workspace;
 type SessionRow = Session;
 
+/** Stored shape mirrors the workspace_checkpoints row (snake_case columns). */
+export interface FakeCheckpointRow {
+  id: string;
+  workspace_id: string;
+  base_commit_sha: string;
+  gcs_object: string;
+  created_at: string;
+}
+
 interface FakeTables {
   workspaces: Map<string, WorkspaceRow>;
   sessions: Map<string, SessionRow>;
   sessionEvents: Map<string, SessionEvent[]>; // key: sessionId -> sorted by seq
-  workspaceCheckpoints: Map<string, unknown[]>;
+  workspaceCheckpoints: Map<string, FakeCheckpointRow>; // key: checkpoint id
   controllerLeases: Map<string, unknown>;
   schemaMigrations: Set<string>;
 }
@@ -32,7 +41,9 @@ function cloneTables(t: FakeTables): FakeTables {
     sessionEvents: new Map(
       Array.from(t.sessionEvents.entries()).map(([k, v]) => [k, v.map(deepClone)]),
     ),
-    workspaceCheckpoints: new Map(t.workspaceCheckpoints),
+    workspaceCheckpoints: new Map(
+      Array.from(t.workspaceCheckpoints.entries()).map(([k, v]) => [k, deepClone(v)]),
+    ),
     controllerLeases: new Map(t.controllerLeases),
     schemaMigrations: new Set(t.schemaMigrations),
   };
@@ -307,9 +318,32 @@ export class InMemoryFakeExecutor implements QueryExecutor {
       return [] as T[];
     }
 
-    // workspace_checkpoints etc. — no-op for this task but accept
-    if (lower.startsWith("insert into workspace_checkpoints") || lower.startsWith("select") && lower.includes("from workspace_checkpoints")) {
+    // workspace_checkpoints — real storage (issue #95): every GCS
+    // checkpoint write appends one row; the (workspace_id, created_at)
+    // index is the generation history. Accepts both the repository
+    // recordCheckpoint shape (gen_random_uuid() id) and the
+    // transition-atomic persist shape from the SQL state stores.
+    if (lower.startsWith("insert into workspace_checkpoints")) {
+      const row: FakeCheckpointRow = {
+        id: `00000000-0000-4000-8000-${String(this.tables.workspaceCheckpoints.size + 1).padStart(12, "0")}`,
+        workspace_id: params?.[0] as string,
+        base_commit_sha: params?.[1] as string,
+        gcs_object: params?.[2] as string,
+        created_at: new Date().toISOString(),
+      };
+      this.tables.workspaceCheckpoints.set(row.id, row);
+      if (/\breturning\b/i.test(normalized)) {
+        return [{ ...row }] as unknown as T[];
+      }
       return [] as T[];
+    }
+    if (lower.startsWith("select") && lower.includes("from workspace_checkpoints")) {
+      const workspaceId = params?.[0] as string | undefined;
+      const rows = Array.from(this.tables.workspaceCheckpoints.values())
+        .filter((r) => workspaceId === undefined || r.workspace_id === workspaceId)
+        .sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0))
+        .map((r) => ({ ...r }));
+      return rows as unknown as T[];
     }
     if (lower.startsWith("insert into controller_leases") || lower.includes("controller_leases")) {
       return [] as T[];
