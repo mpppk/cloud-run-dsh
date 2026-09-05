@@ -522,7 +522,8 @@ gcloud logging read \
 `dsh_app` ロールを参照するため、user の削除が
 `role "dsh_app" cannot be dropped because some objects depend on it` で 400 になる。
 2026-09-05 の撤収では実際にこれで一度失敗した（database が先に消えていたため2回目は通ったが、
-削除順に依存する）。**destroy の前にオブジェクトを落としておくのが確実。**
+削除順に依存する）。**destroy の前にオブジェクトと残存権限を落としておくのが確実**
+（テーブルだけ落としても `DROP ROLE` が `privileges for schema public / database` で失敗する）。
 
 ```bash
 curl -sS -X DELETE -H "Authorization: Bearer $TOK" "$BASE/instances/dsh-verify"
@@ -532,9 +533,16 @@ curl -sS -H "Authorization: Bearer $TOK" "$BASE/instances"
 gcloud run services delete control-plane --region "$REGION" --quiet   # デプロイしていれば
 bun run teardown:empty-bucket -- --yes
 
-# マイグレーション済みなら、dsh_app が所有するオブジェクトを先に落とす（#73）。
+# マイグレーション済みなら、dsh_app の所有オブジェクトと残存権限を先に落とす（#73）。
 # 破壊的操作につき撤収時のみ実行すること（dsh_app 所有の全テーブル＝全マイグレーション済みデータが消える）。
-#   psql "$DATABASE_URL" -c 'DROP OWNED BY dsh_app;'
+# 完全な手順は deployment-runbook.md Step 8。以下は要点のみ。
+#   psql "$DATABASE_URL" -c 'DROP OWNED BY dsh_app;'   # as dsh_app: 6 テーブルを落とす
+#   # as postgres（Terraform 管理外。初回は gcloud sql users set-password postgres で要パスワード設定）:
+#   psql "postgresql://postgres@127.0.0.1:5433/dsh" \
+#     -c 'REVOKE CREATE ON SCHEMA public FROM dsh_app;' \
+#     -c 'REVOKE USAGE ON SCHEMA public FROM dsh_app;' \
+#     -c 'REVOKE CONNECT ON DATABASE dsh FROM dsh_app;'
+# その後に terraform destroy を再実行する。
 
 terraform destroy -input=false -var-file=~/.dsh.tfvars
 # → Destroy complete!（2026-09-05 の実測は 2回目で 18 destroyed。
