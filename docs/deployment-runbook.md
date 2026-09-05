@@ -685,28 +685,48 @@ gcloud storage rm --all-versions -r \
 #    Cloud Monitoring gauge `num_backends` for database `dsh`.
 #    NOTE the metric lags real time (sampled every 60s, visible after up to
 #    ~3 min): seeing 0 means "was 0 minutes ago" — the safe direction.
+#    NOTE `database_id` is `project:instance` (e.g. `cloud-run-dsh:dev-dsh-pg`),
+#    NOT the bare instance name (`dev-dsh-pg`) and NOT `sql_connection_name`
+#    (`project:region:instance` — the region segment makes it a different
+#    string; see `sql_connection_name` in `infra/terraform/outputs.tf`).
+#    Filtering with the bare name returns ZERO time series, so this gate
+#    would never pass (issue #118).
 INSTANCE="$(terraform -chdir=infra/terraform output -raw sql_instance_name)"
+DATABASE_ID="${PROJECT_ID}:${INSTANCE}"
 END="$(bun -e 'console.log(new Date().toISOString())')"
 START="$(bun -e 'console.log(new Date(Date.now()-10*60*1000).toISOString())')"
 for i in $(seq 1 20); do
-  N="$(curl -s -G "https://monitoring.googleapis.com/v3/projects/${PROJECT_ID}/timeSeries" \
+  RESP="$(curl -s -G "https://monitoring.googleapis.com/v3/projects/${PROJECT_ID}/timeSeries" \
     -H "Authorization: Bearer $(gcloud auth print-access-token)" \
-    --data-urlencode "filter=metric.type=\"cloudsql.googleapis.com/database/postgresql/num_backends\" AND resource.labels.database_id=\"${INSTANCE}\" AND metric.labels.database=\"dsh\"" \
+    --data-urlencode "filter=metric.type=\"cloudsql.googleapis.com/database/postgresql/num_backends\" AND resource.labels.database_id=\"${DATABASE_ID}\" AND metric.labels.database=\"dsh\"" \
     --data-urlencode "interval.startTime=${START}" \
     --data-urlencode "interval.endTime=${END}" \
-    --data-urlencode "view=FULL" \
-    | jq -r '[(.timeSeries // [])[].points[0].value.int64Value | tonumber] | max // empty')"
-  echo "num_backends sample $i: ${N:-unknown}"
-  [ "$N" = "0" ] && break
+    --data-urlencode "view=FULL")"
+  SERIES_COUNT="$(echo "$RESP" | jq -r '(.timeSeries // []) | length')"
+  if [ "$SERIES_COUNT" = "0" ]; then
+    echo "num_backends sample $i: NO time series returned - metrics unavailable (filter may be wrong). This does NOT mean connections remain; do NOT destroy yet, verify DATABASE_ID first."
+    N=""
+  else
+    N="$(echo "$RESP" | jq -r '[(.timeSeries // [])[].points[0].value.int64Value | tonumber] | max // empty')"
+    echo "num_backends sample $i: ${N:-unknown} (from ${SERIES_COUNT} series)"
+    [ "$N" = "0" ] && break
+  fi
   sleep 60
   END="$(bun -e 'console.log(new Date().toISOString())')"
   START="$(bun -e 'console.log(new Date(Date.now()-10*60*1000).toISOString())')"
 done
 # The loop MUST have seen 0 — otherwise STOP here and do NOT run step 4 yet.
 # (Without this guard a copy-pasted run would destroy despite the timeout.)
-# See the Appendix failure mode #3 (wait longer, or emergency
-# pg_terminate_backend), then re-run from this step 3b.
-[ "$N" = "0" ] || { echo "num_backends never drained to 0 — NOT destroying"; exit 1; }
+# See the Appendix failure mode #3 (wait longer, emergency
+# pg_terminate_backend, or the (d) escape hatch when the gate itself cannot
+# be passed), then re-run from this step 3b.
+if [ "$N" = "0" ]; then
+  :
+elif [ -z "$N" ]; then
+  echo "no num_backends reading observed - metrics unavailable (filter may be wrong, or the window has no points). This does NOT mean connections remain - NOT destroying; see Appendix failure mode #3 (d)"; exit 1
+else
+  echo "num_backends never drained to 0 (last max: $N) - NOT destroying"; exit 1
+fi
 
 # 4. Destroy Terraform-managed resources (SQL, bucket, AR, IAM, secrets, IAP):
 terraform -chdir=infra/terraform destroy
@@ -789,7 +809,7 @@ This runbook was authored against a machine with **no gcloud credentials and no 
 | Step 5 | **(Superseded 2026-09-05 — see note above.)** **Highest risk.** The create body shape, `validateOnly` dry-run, and the v2 REST paths were verified against the live discovery document and read-only probes on 2026-09-03 (see PR verification: v1 paths return HTML 404, v2 list returns 200). Originally unproven: an actual create/start/stop against a live instance (billable), and the `gcloud run instances` Preview command-group availability — since executed for real on 2026-09-05. |
 | Step 6 | `gcloud run deploy` + IAP frontend wiring — the deploy itself was proven on the real project on 2026-09-05 (see the update note above); the IAP frontend wiring is still unexecuted. The image builds (see the control-plane Dockerfile) and was verified locally: `docker build` + container start + `/livez` curl (see the P3 PR verification). The RuntimeRegistry is wired (#23): `open` creates-or-starts the workspace Instance, proven live on 2026-09-05. |
 | Step 7 | **(Superseded 2026-09-05 — see note above.)** Smoke checks — depended on Steps 4–6; since executed for real on 2026-09-05. |
-| Step 8 | `terraform destroy` behavior with real state; Instance stop/delete endpoint names under the Preview API. The step 3b `num_backends` drain gate + retry fallback (issue #115) and the Monitoring-API curl/jq polling loop are authored but unexecuted against live GCP — the coordinator verifies them at the next bring-up teardown. |
+| Step 8 | `terraform destroy` behavior with real state; Instance stop/delete endpoint names under the Preview API. The step 3b `num_backends` drain gate + retry fallback (issue #115) and the Monitoring-API curl/jq polling loop are authored but unexecuted against live GCP — the coordinator verifies them at the next bring-up teardown. The step 3b `project:instance` filter fix (issue #118) is likewise shell/jq-verified only, not live-verified. |
 
 The preflight script (`bun run preflight:gcp`) is likewise only proven in its "unauthenticated / cannot-check" code paths plus the local tool + Terraform validation paths.
 
@@ -818,6 +838,7 @@ The preflight script (`bun run preflight:gcp`) is likewise only proven in its "u
 >    - **(a) Gate (non-destructive, default):** Step 8 step 3b polls the `num_backends` Monitoring gauge to 0 before destroying. It opens no DB connection itself.
 >    - **(b) Retry (fallback):** if the destroy still fails, wait a few minutes and re-run the same `terraform destroy`. Measured 2026-09-05: the second run destroyed 19 resources with 0 errors. Never leave a failed destroy unattended — failed = still billing.
 >    - **(c) Emergency `pg_terminate_backend` (last resort, destructive-adjacent):** only if (b) keeps failing. Connect via the proxy as in Step 4 and run `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'dsh' AND pid <> pg_backend_pid();`. Caveats: the terminating connection itself occupies 1 of the `db-f1-micro` 25 slots (`max_connections` measured), and new backends can reappear between terminate and destroy — run the destroy immediately after.
+>    - **(d) Gate cannot be passed (escape hatch — never leave a teardown billing):** step 3b ends with `exit 1` when the gauge never reaches 0, but **a teardown that never destroys keeps billing forever, while a destroy attempted too early fails with the retryable 400 above and bills no extra**. So the gate must never be a dead end. If step 3b prints `NO time series returned` for all 20 rounds, first re-verify the filter: `echo "$DATABASE_ID"` must be `project:instance` (e.g. `cloud-run-dsh:dev-dsh-pg` — issue #118), not the bare instance name and not `sql_connection_name` (which carries `project:region:instance`). If the filter is correct and series are still absent, or the gauge stays > 0 past the timeout, record the reason and run `terraform -chdir=infra/terraform destroy` directly — accepting the #115 risk — then follow (b), then (c). A failed destroy is recoverable; an unattempted one is not.
 >
 >    Terraform cannot gate this for you: `google_sql_database` exposes only `deletion_policy` (`DELETE`/`ABANDON`/`PREVENT`) — no drain, no force flag — and the Cloud SQL Admin API `DELETE databases` issues a plain `DROP DATABASE` that fails on active backends (upstream `force_delete` request is still open). See the note on `google_sql_database.dsh` in `cloudsql.tf`. The runbook gate above is the fix.
 
