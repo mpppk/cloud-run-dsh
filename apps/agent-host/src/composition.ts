@@ -158,6 +158,19 @@ export function composeAgentHost(deps: AgentHostDependencies): AgentHost {
     git: deps.git,
     fs: deps.fs,
     clock,
+    // Issue #95 案A: every durable GCS write appends one
+    // workspace_checkpoints row (base commit + object key) so the SQL
+    // index the spec requires actually reflects production. A failing
+    // record fails the checkpoint itself (loud, retried) rather than
+    // silently diverging again.
+    onCheckpointCreated: ({ baseCommitSha, gcsObject }) =>
+      deps.repository
+        .recordCheckpoint({
+          workspaceId: config.workspaceId,
+          baseCommitSha,
+          gcsObject,
+        })
+        .then(() => undefined),
   });
   const checkpointScheduler = new CheckpointScheduler({
     clock,

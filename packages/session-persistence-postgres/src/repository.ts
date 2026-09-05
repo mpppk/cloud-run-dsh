@@ -7,6 +7,8 @@ import type {
   CreateSessionInput,
   SessionEvent,
   NewSessionEvent,
+  WorkspaceCheckpoint,
+  RecordCheckpointInput,
 } from "./types.js";
 
 /**
@@ -49,6 +51,16 @@ function rowToSession(row: Record<string, unknown>): Session {
   };
 }
 
+function rowToCheckpoint(row: Record<string, unknown>): WorkspaceCheckpoint {
+  return {
+    id: row["id"] as string,
+    workspaceId: row["workspace_id"] as string,
+    baseCommitSha: row["base_commit_sha"] as string,
+    gcsObject: row["gcs_object"] as string,
+    createdAt: toIsoString(row["created_at"]),
+  };
+}
+
 function rowToEvent(row: Record<string, unknown>): SessionEvent {
   return {
     sessionId: row["session_id"] as string,
@@ -77,6 +89,16 @@ export interface SessionPersistenceRepository {
   // Event log (append-only)
   append(sessionId: string, events: NewSessionEvent[]): Promise<SessionEvent[]>;
   readEvents(sessionId: string, fromSeq?: number): Promise<SessionEvent[]>;
+
+  // Checkpoint index (workspace_checkpoints). Issue #95: every GCS
+  // checkpoint write must leave one row here — the table existed with an
+  // INSERT implementation and tests, yet production never wrote a row
+  // because no checkpoint path reached it. The GCS object is the durable
+  // snapshot; this index answers "which workspace holds a checkpoint at
+  // which base commit" over SQL and is the basis for future generation
+  // management. Restore keeps using the GCS key convention directly.
+  recordCheckpoint(input: RecordCheckpointInput): Promise<WorkspaceCheckpoint>;
+  listCheckpoints(workspaceId: string): Promise<WorkspaceCheckpoint[]>;
 
   // Utilities
   assertContiguous(sessionId: string): Promise<void>;
@@ -341,5 +363,33 @@ export class PostgresSessionPersistenceRepository implements SessionPersistenceR
         throw new Error(`gap detected in session ${sessionId}: expected seq ${i} but got ${events[i]!.seq}`);
       }
     }
+  }
+
+  /**
+   * Records one checkpoint generation in the index (issue #95 案A).
+   * The id is database-generated (gen_random_uuid, same convention as the
+   * transition-atomic persist path in the SQL state stores) so concurrent
+   * writers never collide; every successful GCS write appends exactly one
+   * row, which is what makes the (workspace_id, created_at) index a usable
+   * generation history.
+   */
+  async recordCheckpoint(input: RecordCheckpointInput): Promise<WorkspaceCheckpoint> {
+    const rows = await this.executor.query<Record<string, unknown>>(
+      `INSERT INTO workspace_checkpoints(id, workspace_id, base_commit_sha, gcs_object)
+       VALUES (gen_random_uuid(),$1,$2,$3)
+       RETURNING id, workspace_id, base_commit_sha, gcs_object, created_at`,
+      [input.workspaceId, input.baseCommitSha, input.gcsObject],
+    );
+    if (rows.length === 0) throw new Error(`failed to record checkpoint for workspace ${input.workspaceId}`);
+    return rowToCheckpoint(rows[0]!);
+  }
+
+  async listCheckpoints(workspaceId: string): Promise<WorkspaceCheckpoint[]> {
+    const rows = await this.executor.query<Record<string, unknown>>(
+      `SELECT id, workspace_id, base_commit_sha, gcs_object, created_at
+       FROM workspace_checkpoints WHERE workspace_id = $1 ORDER BY created_at ASC`,
+      [workspaceId],
+    );
+    return rows.map(rowToCheckpoint);
   }
 }

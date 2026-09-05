@@ -7,8 +7,10 @@ import {
 import type { CheckpointBundle } from "@cloud-run-dsh/workspace-checkpoint";
 import { createGitHubCredentialBroker } from "@cloud-run-dsh/github-credential-broker";
 import { WorkspaceBootstrapper } from "./bootstrap.js";
+import { CheckpointCoordinator } from "./bootstrap.js";
 import {
   FAKE_INSTALLATION_TOKEN,
+  FakeClock,
   InMemoryFs,
   RecordingGitRunner,
   fakeBrokerTransport,
@@ -146,8 +148,7 @@ describe("WorkspaceBootstrapper", () => {
     }
   });
 
-  test("failed restore still discards the token", async () => {
-    const storage = new InMemoryCheckpointStorage();
+  test("failed restore still discards the token", async () => {    const storage = new InMemoryCheckpointStorage();
     // A checkpoint exists but git checkout fails.
     await storage.put(
       "workspaces/ws-1/checkpoint.bin",
@@ -172,5 +173,77 @@ describe("WorkspaceBootstrapper", () => {
     await expect(bootstrapper.checkoutBase()).rejects.toThrow(/git checkout failed/);
     await expect(bootstrapper.restoreCheckpoint()).rejects.toThrow(/git checkout failed/);
     expect(bootstrapper.isTokenDiscarded).toBe(true);
+  });
+});
+
+describe("CheckpointCoordinator checkpoint index hook (issue #95)", () => {
+  function makeCoordinator(options?: {
+    storage?: InMemoryCheckpointStorage;
+    git?: RecordingGitRunner;
+    fs?: InMemoryFs;
+    onCheckpointCreated?: (info: {
+      readonly baseCommitSha: string;
+      readonly gcsObject: string;
+    }) => Promise<void>;
+  }): {
+    coordinator: CheckpointCoordinator;
+    storage: InMemoryCheckpointStorage;
+  } {
+    const storage = options?.storage ?? new InMemoryCheckpointStorage();
+    const git = options?.git ?? new RecordingGitRunner();
+    git.responses.set("rev-parse", {
+      exitCode: 0,
+      stdout: "2c6fe42d68f1638b2d4059f0fa8c9901df9effb8\n",
+      stderr: "",
+    });
+    const coordinator = new CheckpointCoordinator({
+      workspaceDir: "/workspace",
+      checkpointKey: "workspaces/ws-1/checkpoint.bin",
+      storage,
+      git,
+      fs: options?.fs ?? new InMemoryFs(),
+      clock: new FakeClock(),
+      onCheckpointCreated: options?.onCheckpointCreated,
+    });
+    return { coordinator, storage };
+  }
+
+  test("create() uploads the bundle and reports the generation to the index hook", async () => {
+    const seen: { baseCommitSha: string; gcsObject: string }[] = [];
+    const { coordinator, storage } = makeCoordinator({
+      onCheckpointCreated: async (info) => {
+        seen.push({ ...info });
+      },
+    });
+
+    const { baseCommit } = await coordinator.create();
+
+    expect(baseCommit).toBe("2c6fe42d68f1638b2d4059f0fa8c9901df9effb8");
+    expect(await storage.get("workspaces/ws-1/checkpoint.bin")).not.toBeNull();
+    // The hook carries exactly what the workspace_checkpoints row needs.
+    expect(seen).toEqual([
+      {
+        baseCommitSha: "2c6fe42d68f1638b2d4059f0fa8c9901df9effb8",
+        gcsObject: "workspaces/ws-1/checkpoint.bin",
+      },
+    ]);
+  });
+
+  test("create() works without the hook (no index wired)", async () => {
+    const { coordinator, storage } = makeCoordinator();
+    await coordinator.create();
+    expect(await storage.get("workspaces/ws-1/checkpoint.bin")).not.toBeNull();
+  });
+
+  test("a failing index hook fails create() — the gap stays loud, never silent", async () => {
+    const { coordinator, storage } = makeCoordinator({
+      onCheckpointCreated: async () => {
+        throw new Error("index write failed: connection refused");
+      },
+    });
+
+    await expect(coordinator.create()).rejects.toThrow(/index write failed/);
+    // GCS-first ordering: the snapshot is durable even though indexing failed.
+    expect(await storage.get("workspaces/ws-1/checkpoint.bin")).not.toBeNull();
   });
 });

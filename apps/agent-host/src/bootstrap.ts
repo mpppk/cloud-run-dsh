@@ -140,6 +140,18 @@ export interface CheckpointCoordinatorOptions {
   readonly fs: FileSystem;
   readonly clock: Clock;
   readonly dirtyThresholdMs?: number;
+  /**
+   * Called after a checkpoint bundle is durably stored (issue #95 案A).
+   * The production composition records the generation in the
+   * `workspace_checkpoints` index (base commit + GCS object key) here.
+   * A throwing callback fails create(): the snapshot exists in GCS but is
+   * not indexed, which must stay loud — the lifecycle path turns it into
+   * CHECKPOINT_FAILED (stop aborts) and the periodic path retries.
+   */
+  readonly onCheckpointCreated?: (info: {
+    readonly baseCommitSha: string;
+    readonly gcsObject: string;
+  }) => Promise<void>;
 }
 
 /**
@@ -153,7 +165,15 @@ export class CheckpointCoordinator {
     this.dirtyThresholdMs = options.dirtyThresholdMs ?? 120_000;
   }
 
-  /** Creates a checkpoint bundle of the current workspace and uploads it. */
+  /**
+   * Creates a checkpoint bundle of the current workspace and uploads it,
+   * then records the generation in the checkpoint index (issue #95).
+   *
+   * Ordering is deliberate: GCS first, index second. A crash between the
+   * two leaves an unindexed object that restore still finds via the
+   * `workspaces/<id>/checkpoint.bin` key convention; the reverse order
+   * would leave an index row pointing at an object that was never written.
+   */
   async create(): Promise<{ baseCommit: string }> {
     const { createCheckpointBundle, serializeBundle } = await import(
       "@cloud-run-dsh/workspace-checkpoint"
@@ -176,6 +196,10 @@ export class CheckpointCoordinator {
       this.options.checkpointKey,
       serializeBundle(bundle),
     );
+    await this.options.onCheckpointCreated?.({
+      baseCommitSha: baseCommit,
+      gcsObject: this.options.checkpointKey,
+    });
     return { baseCommit };
   }
 }

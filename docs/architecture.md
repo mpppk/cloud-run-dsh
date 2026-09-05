@@ -79,7 +79,7 @@ flowchart TB
 | パッケージ | 動く場所 | 担当する図の要素 | 責務 |
 |---|---|---|---|
 | `cloud-run-instance-client` | 両方 | control-plane → Cloud Run v2 API → agent-host | Instances API の型付きクライアント。create / get / start / stop / delete と `validateOnly`。 |
-| `session-persistence-postgres` | 両方 | → Cloud SQL（両方から出る矢印） | 追記専用のワークスペース・セッション・イベントストア。 |
+| `session-persistence-postgres` | 両方 | → Cloud SQL（両方から出る矢印） | 追記専用のワークスペース・セッション・イベントストア。`workspace_checkpoints` 世代索引の記録・参照もここ（#95）。 |
 | `workspace-checkpoint` | 両方 | agent-host → GCS | ベースコミット + 差分 + 未追跡ファイルの tar を1つの JSON にまとめて保存・復元（丸ごとのアーカイブではない。実形式は下記）。復元時のパストラバーサル防御。 |
 | `workspace-runtime` | 両方 | （状態機械。図には現れない） | 状態遷移、アイドル検知、open の合流。 |
 | `controller-lease` | 両方 | （Cloud SQL 上のリース。図には現れない） | ワークスペースあたりコントローラ1つを保証。 |
@@ -144,6 +144,8 @@ sequenceDiagram
     Note over CP,AH: ターンをドレインし、停止中の新規入力を拒否
     AH->>GCS: チェックポイントを保存
     Note over AH,GCS: clean tree のときは何も書かず成功（仕様）
+    AH->>DB: 世代を workspace_checkpoints に1行追記（#95）
+    Note over AH,DB: GCS 保存の直後。失敗したらチェックポイント自体が失敗扱い
     AH-->>CP: 200 prepared（失敗時は 502。CP は止めない）
     CP->>RUN: stop
     Note over CP,RUN: delete はしない。停止中は無課金と確認済み。<br/>溜まり続ける点は #85

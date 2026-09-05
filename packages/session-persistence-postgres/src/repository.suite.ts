@@ -236,5 +236,37 @@ export function defineRepositorySuite(
       const events = await repo.readEvents("00000000-0000-0000-0000-000000000002");
       expect(events.length).toBe(0);
     });
+
+    test("checkpoint index: every record appends one generation row (issue #95)", async () => {
+      const { repo, ws } = await setupWorkspaceAndSession(await makeExecutor());
+      expect(await repo.listCheckpoints(ws.id)).toEqual([]);
+
+      const first = await repo.recordCheckpoint({
+        workspaceId: ws.id,
+        baseCommitSha: "2c6fe42d68f1638b2d4059f0fa8c9901df9effb8",
+        gcsObject: `workspaces/${ws.id}/checkpoint.bin`,
+      });
+      expect(first.workspaceId).toBe(ws.id);
+      expect(first.baseCommitSha).toBe("2c6fe42d68f1638b2d4059f0fa8c9901df9effb8");
+      expect(first.gcsObject).toBe(`workspaces/${ws.id}/checkpoint.bin`);
+      expect(typeof first.id).toBe("string");
+
+      // A second GCS overwrite appends a second row — the index is the
+      // generation history, not a mirror of the single current object.
+      await repo.recordCheckpoint({
+        workspaceId: ws.id,
+        baseCommitSha: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b",
+        gcsObject: `workspaces/${ws.id}/checkpoint.bin`,
+      });
+
+      const generations = await repo.listCheckpoints(ws.id);
+      expect(generations.length).toBe(2);
+      expect(generations.map((g) => g.baseCommitSha)).toEqual([
+        "2c6fe42d68f1638b2d4059f0fa8c9901df9effb8",
+        "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b",
+      ]);
+      // Scoped per workspace.
+      expect(await repo.listCheckpoints("00000000-0000-0000-0000-000000000099")).toEqual([]);
+    });
   });
 }

@@ -73,3 +73,25 @@ export interface NewSessionEvent {
   readonly sourceEventSeqs?: unknown;
   readonly surfaceOp?: unknown;
 }
+
+/**
+ * One row of `workspace_checkpoints` (infra/migrations/0001_init.sql,
+ * 実装手順書 section 3): the durable index of GCS checkpoint generations.
+ *
+ * `gcsObject` is the object KEY within the checkpoint bucket
+ * (e.g. `workspaces/<id>/checkpoint.bin`), not a URL — the bucket is
+ * deployment config, and restore joins bucket + key (issue #95).
+ */
+export interface WorkspaceCheckpoint {
+  readonly id: string;
+  readonly workspaceId: string;
+  readonly baseCommitSha: string;
+  readonly gcsObject: string;
+  readonly createdAt: string;
+}
+
+export interface RecordCheckpointInput {
+  readonly workspaceId: string;
+  readonly baseCommitSha: string;
+  readonly gcsObject: string;
+}
