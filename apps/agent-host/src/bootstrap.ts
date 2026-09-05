@@ -141,11 +141,11 @@ export interface CheckpointCoordinatorOptions {
   readonly clock: Clock;
   readonly dirtyThresholdMs?: number;
   /**
-   * Called after a checkpoint bundle is durably stored (issue #95 案A).
-   * The production composition records the generation in the
-   * `workspace_checkpoints` index (base commit + GCS object key) here.
-   * A throwing callback fails create(): the snapshot exists in GCS but is
-   * not indexed, which must stay loud — the lifecycle path turns it into
+   * Called after a checkpoint bundle is durably stored (issue #95 案A,
+   * clarified by #110). The production composition appends one
+   * `workspace_checkpoints` write-audit row (base commit + GCS object key)
+   * here. A throwing callback fails create(): the snapshot exists in GCS but is
+   * not audited, which must stay loud — the lifecycle path turns it into
    * CHECKPOINT_FAILED (stop aborts) and the periodic path retries.
    */
   readonly onCheckpointCreated?: (info: {
@@ -167,12 +167,13 @@ export class CheckpointCoordinator {
 
   /**
    * Creates a checkpoint bundle of the current workspace and uploads it,
-   * then records the generation in the checkpoint index (issue #95).
+   * then appends the write-audit row (issue #95, clarified by #110).
    *
-   * Ordering is deliberate: GCS first, index second. A crash between the
-   * two leaves an unindexed object that restore still finds via the
+   * Ordering is deliberate: GCS first, audit row second. A crash between the
+   * two leaves an unaudited object that restore still finds via the
    * `workspaces/<id>/checkpoint.bin` key convention; the reverse order
-   * would leave an index row pointing at an object that was never written.
+   * would leave an audit row pointing at an object that was never written.
+   * Restore reads the live key directly and never consults the audit rows.
    */
   async create(): Promise<{ baseCommit: string }> {
     const { createCheckpointBundle, serializeBundle } = await import(

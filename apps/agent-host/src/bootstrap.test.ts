@@ -208,7 +208,7 @@ describe("CheckpointCoordinator checkpoint index hook (issue #95)", () => {
     return { coordinator, storage };
   }
 
-  test("create() uploads the bundle and reports the generation to the index hook", async () => {
+  test("create() uploads the bundle and reports the write to the audit hook (issue #110)", async () => {
     const seen: { baseCommitSha: string; gcsObject: string }[] = [];
     const { coordinator, storage } = makeCoordinator({
       onCheckpointCreated: async (info) => {
@@ -229,21 +229,54 @@ describe("CheckpointCoordinator checkpoint index hook (issue #95)", () => {
     ]);
   });
 
-  test("create() works without the hook (no index wired)", async () => {
+  test("create() works without the hook (no audit wired)", async () => {
     const { coordinator, storage } = makeCoordinator();
     await coordinator.create();
     expect(await storage.get("workspaces/ws-1/checkpoint.bin")).not.toBeNull();
   });
 
-  test("a failing index hook fails create() — the gap stays loud, never silent", async () => {
+  test("a failing audit hook fails create() — the gap stays loud, never silent", async () => {
     const { coordinator, storage } = makeCoordinator({
       onCheckpointCreated: async () => {
-        throw new Error("index write failed: connection refused");
+        throw new Error("audit write failed: connection refused");
       },
     });
 
-    await expect(coordinator.create()).rejects.toThrow(/index write failed/);
-    // GCS-first ordering: the snapshot is durable even though indexing failed.
+    await expect(coordinator.create()).rejects.toThrow(/audit write failed/);
+    // GCS-first ordering: the snapshot is durable even though auditing failed.
     expect(await storage.get("workspaces/ws-1/checkpoint.bin")).not.toBeNull();
+  });
+
+  test("restore reads the live GCS key, never the audit rows (issue #110)", async () => {
+    // The audit table is write-only for the restore path: a durable bundle
+    // with ZERO rows still restores. (WorkspaceBootstrapper takes no
+    // repository at all — there is nothing to consult even if rows existed.)
+    const storage = new InMemoryCheckpointStorage();
+    const bundle: CheckpointBundle = {
+      manifest: {
+        version: 1,
+        baseCommit: "abc1234",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        patch: "untracked",
+        untracked: "notes.txt",
+      },
+      patchDiff: "",
+      untrackedFiles: ["notes.txt"],
+      untrackedTar: createUntrackedTar([
+        { path: "notes.txt", content: encoder.encode("hello from checkpoint") },
+      ]),
+    };
+    await storage.put("workspaces/ws-1/checkpoint.bin", serializeBundle(bundle));
+
+    const git = new RecordingGitRunner();
+    git.responses.set("status", { exitCode: 0, stdout: "?? notes.txt\0", stderr: "" });
+
+    const { bootstrapper, fs } = makeBootstrapper({ storage, git });
+    await bootstrapper.cloneRepository();
+    await bootstrapper.checkoutBase();
+    await bootstrapper.restoreCheckpoint();
+
+    const restored = await fs.readFile("/workspace/notes.txt");
+    expect(new TextDecoder().decode(restored)).toBe("hello from checkpoint");
   });
 });

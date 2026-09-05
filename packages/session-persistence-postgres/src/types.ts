@@ -76,11 +76,17 @@ export interface NewSessionEvent {
 
 /**
  * One row of `workspace_checkpoints` (infra/migrations/0001_init.sql,
- * 実装手順書 section 3): the durable index of GCS checkpoint generations.
+ * 実装手順書 section 3): the WRITE-AUDIT of GCS checkpoint uploads, not a
+ * generation index (issue #110). Every durable upload appends one row
+ * recording when it happened, at which base commit, and under which key —
+ * but restores never read this table: they fetch the live
+ * `workspaces/<id>/checkpoint.bin` key directly, which IS the latest by
+ * construction. Past generations survive only as GCS noncurrent versions
+ * (bucket versioning on; deleted 30 days after supersede).
  *
  * `gcsObject` is the object KEY within the checkpoint bucket
  * (e.g. `workspaces/<id>/checkpoint.bin`), not a URL — the bucket is
- * deployment config, and restore joins bucket + key (issue #95).
+ * deployment config.
  */
 export interface WorkspaceCheckpoint {
   readonly id: string;

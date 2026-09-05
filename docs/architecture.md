@@ -79,7 +79,7 @@ flowchart TB
 | パッケージ | 動く場所 | 担当する図の要素 | 責務 |
 |---|---|---|---|
 | `cloud-run-instance-client` | 両方 | control-plane → Cloud Run v2 API → agent-host | Instances API の型付きクライアント。create / get / start / stop / delete と `validateOnly`。 |
-| `session-persistence-postgres` | 両方 | → Cloud SQL（両方から出る矢印） | 追記専用のワークスペース・セッション・イベントストア。`workspace_checkpoints` 世代索引の記録・参照もここ（#95）。 |
+| `session-persistence-postgres` | 両方 | → Cloud SQL（両方から出る矢印） | 追記専用のワークスペース・セッション・イベントストア。`workspace_checkpoints` へのチェックポイント書き込み監査記録の追記もここ（#95、#110 で「世代索引」から改称 — 世代の実体は GCS バージョニング）。 |
 | `workspace-checkpoint` | 両方 | agent-host → GCS | ベースコミット + 差分 + 未追跡ファイルの tar を1つの JSON にまとめて保存・復元（丸ごとのアーカイブではない。実形式は下記）。復元時のパストラバーサル防御。 |
 | `workspace-runtime` | 両方 | （状態機械。図には現れない） | 状態遷移、アイドル検知、open の合流。 |
 | `controller-lease` | 両方 | （Cloud SQL 上のリース。図には現れない） | ワークスペースあたりコントローラ1つを保証。 |
@@ -144,7 +144,7 @@ sequenceDiagram
     Note over CP,AH: ターンをドレインし、停止中の新規入力を拒否
     AH->>GCS: チェックポイントを保存
     Note over AH,GCS: clean tree のときは何も書かず成功（仕様）
-    AH->>DB: 世代を workspace_checkpoints に1行追記（#95）
+    AH->>DB: チェックポイント書き込みを workspace_checkpoints に1行追記（監査記録 #110。世代の実体は GCS の非現行バージョン）
     Note over AH,DB: GCS 保存の直後。失敗したらチェックポイント自体が失敗扱い
     AH-->>CP: 200 prepared（失敗時は 502。CP は止めない）
     CP->>RUN: stop
@@ -230,6 +230,17 @@ SSE のハートビートは意図的に「活動」として数えない（数�
 clone で戻せる部分は持たず差分だけを運ぶ。** 復元時にパストラバーサルを防ぐ。
 バケットはバージョニング有効で、非現行バージョンは30日で削除される。
 実測例は [stop→復元レポート](./stop-restore-verification-report.md) §1.3。
+
+**チェックポイントの行と世代の対応（#110 案A：監査記録）**
+`workspace_checkpoints` は「世代索引」ではない。各アップロードは同じ live キーを
+上書きするため、行は全て同じ `gcs_object` を指す — テーブルは「いつ・どの base commit が
+ durable に書かれたか」の**書き込み監査記録**である。世代の実体は GCS の非現行
+バージョンであり、30日経つと古い世代は GCS から消える（行は残るが、行はそもそも
+復元の索引ではないため問題ない）。**復元は live キーを直接読むだけで、
+テーブルを参照しない** — 復元に必要なのは「最新」であり、live キーが定義上それだからである。
+行が指すのは常に live オブジェクトなので「行が残っているのに実体が消えている」
+状態にはならない（ワークスペース削除時は行ごと消え、GCS 実体は orphan として残る。
+既知の残件は API 表の DELETE 行を参照）。
 
 **永続性の境界**
 Instance は使い捨て。ワークスペースの中身はチェックポイント、会話とイベントは Cloud SQL に残る。
