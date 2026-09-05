@@ -667,7 +667,7 @@ gcloud run instances delete dsh-ws-demo --location="$REGION" 2>/dev/null || true
 # 2. Delete the control-plane service:
 gcloud run services delete control-plane --region="$REGION" --quiet
 
-# 3. EMPTY the versioned checkpoint bucket — `terraform destroy` CANNOT delete
+# 3b. EMPTY the versioned checkpoint bucket — `terraform destroy` CANNOT delete
 #    a non-empty versioned GCS bucket (lifecycle rules only age out ARCHIVED
 #    versions), so a destroy without this step FAILS and you keep paying.
 #    ⚠️ THIS PERMANENTLY DELETES ALL CHECKPOINTS (live objects + every version).
@@ -675,10 +675,46 @@ gcloud run services delete control-plane --region="$REGION" --quiet
 gcloud storage rm --all-versions -r \
   "gs://$(terraform -chdir=infra/terraform output -raw checkpoint_bucket_name)"
 
+# 3b. Wait for leaked DB connections to drain — THEN destroy (issue #115).
+#    Bun.SQL never reaps idle connections (`idleTimeout` default 0 — #109),
+#    so even after steps 1–2 the server can still report `num_backends > 0`,
+#    and the destroy then fails at `google_sql_database.dsh` with
+#    400 `database "dsh" is being accessed by other users` (measured
+#    2026-09-05: backends stuck at 2 with no proxy and no instances left).
+#    This check is READ-ONLY (no DB connection of its own): it reads the
+#    Cloud Monitoring gauge `num_backends` for database `dsh`.
+#    NOTE the metric lags real time (sampled every 60s, visible after up to
+#    ~3 min): seeing 0 means "was 0 minutes ago" — the safe direction.
+INSTANCE="$(terraform -chdir=infra/terraform output -raw sql_instance_name)"
+END="$(bun -e 'console.log(new Date().toISOString())')"
+START="$(bun -e 'console.log(new Date(Date.now()-10*60*1000).toISOString())')"
+for i in $(seq 1 20); do
+  N="$(curl -s -G "https://monitoring.googleapis.com/v3/projects/${PROJECT_ID}/timeSeries" \
+    -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+    --data-urlencode "filter=metric.type=\"cloudsql.googleapis.com/database/postgresql/num_backends\" AND resource.labels.database_id=\"${INSTANCE}\" AND metric.labels.database=\"dsh\"" \
+    --data-urlencode "interval.startTime=${START}" \
+    --data-urlencode "interval.endTime=${END}" \
+    --data-urlencode "view=FULL" \
+    | jq -r '[.timeSeries[].points[0].value.int64Value | tonumber] | max // empty')"
+  echo "num_backends sample $i: ${N:-unknown}"
+  [ "$N" = "0" ] && break
+  sleep 60
+  END="$(bun -e 'console.log(new Date().toISOString())')"
+  START="$(bun -e 'console.log(new Date(Date.now()-10*60*1000).toISOString())')"
+done
+# If the loop never saw 0, DO NOT destroy yet — see the Appendix failure
+# mode #3 (retry destroy later, or emergency pg_terminate_backend).
+
 # 4. Destroy Terraform-managed resources (SQL, bucket, AR, IAM, secrets, IAP):
 terraform -chdir=infra/terraform destroy
 # If the db-password data source fails on destroy (secret version deleted manually), re-run
 # with TF_VAR_db_password set — same escape hatch as the first apply.
+# If destroy fails at google_sql_database.dsh with 400 "database is being
+# accessed by other users" (issue #115 — a leftover idle connection survived
+# step 3b's gate), DO NOT leave it: a failed destroy keeps billing. Wait a few
+# minutes for the backend to close, then simply re-run the same destroy — the
+# second run passed with 0 errors when measured on 2026-09-05. Details and the
+# emergency pg_terminate_backend fallback are in the Appendix failure mode #3.
 
 # 5. Remove the abandoned Service Networking peering (see note below).
 #    The VPC name follows cloudsql.tf: "${var.environment}-dsh-sql-vpc" (default env: dev).
@@ -722,6 +758,7 @@ Teardown gotchas (all verified against `infra/terraform`):
     ```
 - **Secret Manager secrets** are destroyed with their versions — you will need to re-add them if you redeploy.
 - **Cloud Run Instances**: never in Terraform state; step 1 is the only thing that stops their billing.
+- **Idle DB connections block `DROP DATABASE` (open issue [#115](https://github.com/mpppk/cloud-run-dsh/issues/115), measured 2026-09-05 — a DIFFERENT failure from #73): even with no Instances, no service, and no proxy left, `num_backends` can stay > 0 (Bun.SQL never reaps idle connections — #109) and the destroy fails at `google_sql_database.dsh` with 400 `database "dsh" is being accessed by other users`. Step 3b gates the destroy on the `num_backends` gauge; if the destroy still fails, re-run it after a few minutes (the measured recovery). Full mode description in the Appendix failure mode #3.
 
 ---
 
@@ -749,7 +786,7 @@ This runbook was authored against a machine with **no gcloud credentials and no 
 | Step 5 | **(Superseded 2026-09-05 — see note above.)** **Highest risk.** The create body shape, `validateOnly` dry-run, and the v2 REST paths were verified against the live discovery document and read-only probes on 2026-09-03 (see PR verification: v1 paths return HTML 404, v2 list returns 200). Originally unproven: an actual create/start/stop against a live instance (billable), and the `gcloud run instances` Preview command-group availability — since executed for real on 2026-09-05. |
 | Step 6 | `gcloud run deploy` + IAP frontend wiring — the deploy itself was proven on the real project on 2026-09-05 (see the update note above); the IAP frontend wiring is still unexecuted. The image builds (see the control-plane Dockerfile) and was verified locally: `docker build` + container start + `/livez` curl (see the P3 PR verification). The RuntimeRegistry is wired (#23): `open` creates-or-starts the workspace Instance, proven live on 2026-09-05. |
 | Step 7 | **(Superseded 2026-09-05 — see note above.)** Smoke checks — depended on Steps 4–6; since executed for real on 2026-09-05. |
-| Step 8 | `terraform destroy` behavior with real state; Instance stop/delete endpoint names under the Preview API. |
+| Step 8 | `terraform destroy` behavior with real state; Instance stop/delete endpoint names under the Preview API. The step 3b `num_backends` drain gate + retry fallback (issue #115) and the Monitoring-API curl/jq polling loop are authored but unexecuted against live GCP — the coordinator verifies them at the next bring-up teardown. |
 
 The preflight script (`bun run preflight:gcp`) is likewise only proven in its "unauthenticated / cannot-check" code paths plus the local tool + Terraform validation paths.
 
@@ -758,6 +795,28 @@ The preflight script (`bun run preflight:gcp`) is likewise only proven in its "u
 ## Appendix — Minimal cost profile (verification-only) & guaranteed teardown
 
 > **🚨 DESTROY FAILURE = BILLING CONTINUES.** If `terraform destroy` fails — most commonly because the versioned checkpoint bucket still contains objects — Cloud SQL and the bucket KEEP BILLING until you fix it. Empty the bucket first (step 3 below, or the guarded script), then re-run destroy, and verify every resource is gone in the Cloud Console billing report.
+>
+> Known destroy failure modes (all measured, all keep billing until fixed):
+>
+> 1. **Non-empty versioned bucket** — destroy cannot delete it; empty it first (Step 8 step 3).
+> 2. **`DROP ROLE dsh_app` blocked by table/grants references** — issue [#73](https://github.com/mpppk/cloud-run-dsh/issues/73), solved in Terraform by the `depends_on` in `cloudsql.tf`, with the two-connection `DROP OWNED` + `REVOKE` fallback in Step 8.
+> 3. **`DROP DATABASE dsh` blocked by leftover connections** — issue [#115](https://github.com/mpppk/cloud-run-dsh/issues/115), measured 2026-09-05, a DIFFERENT failure from #73:
+>
+>    ```
+>    Error: Error when reading or editing Database: googleapi: Error 400:
+>    Invalid request: failed to delete database dsh.
+>    Detail: pq: database "dsh" is being accessed by other users., invalid
+>    ```
+>
+>    Cause: Bun.SQL never reaps idle connections (`idleTimeout` default 0 — #109), so server-side backends outlive the control-plane service, the agent-host Instances, and the proxy. At 3周目 teardown `num_backends` stayed at 2 with nothing left to kill, and the destroy failed with Cloud SQL still billing. Whether it fires is pure timing (検証→destroy の間隔): 1–2周目 passed only because enough idle time elapsed. Assume it can fire every time.
+>
+>    Procedure (in priority order):
+>
+>    - **(a) Gate (non-destructive, default):** Step 8 step 3b polls the `num_backends` Monitoring gauge to 0 before destroying. It opens no DB connection itself.
+>    - **(b) Retry (fallback):** if the destroy still fails, wait a few minutes and re-run the same `terraform destroy`. Measured 2026-09-05: the second run destroyed 19 resources with 0 errors. Never leave a failed destroy unattended — failed = still billing.
+>    - **(c) Emergency `pg_terminate_backend` (last resort, destructive-adjacent):** only if (b) keeps failing. Connect via the proxy as in Step 4 and run `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'dsh' AND pid <> pg_backend_pid();`. Caveats: the terminating connection itself occupies 1 of the `db-f1-micro` 25 slots (`max_connections` measured), and new backends can reappear between terminate and destroy — run the destroy immediately after.
+>
+>    Terraform cannot gate this for you: `google_sql_database` exposes only `deletion_policy` (`DELETE`/`ABANDON`/`PREVENT`) — no drain, no force flag — and the Cloud SQL Admin API `DELETE databases` issues a plain `DROP DATABASE` that fails on active backends (upstream `force_delete` request is still open). See the note on `google_sql_database.dsh` in `cloudsql.tf`. The runbook gate above is the fix.
 
 For the billing-approval gate (P6) you normally want the **minimal verification profile**, not the production-ish defaults:
 
