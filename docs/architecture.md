@@ -405,10 +405,10 @@ Cloud SQL の作成に10〜15分かかる。ここを越えると、何も動か
 cd infra/terraform
 terraform init -input=false
 terraform plan  -input=false -var-file=~/.dsh.tfvars
-# → Plan: 52 to add, 0 to change, 0 to destroy.
+# → Plan: 48 to add, 0 to change, 0 to destroy.（2026-09-05 実測）
 
 terraform apply -input=false -var-file=~/.dsh.tfvars
-# → Apply complete! Resources: 52 added.
+# → Apply complete! Resources: 48 added.（2026-09-05 実測）
 ```
 
 既にサービスアカウントが手動で作られている場合は、先に state へ取り込まないと 409 で衝突する
@@ -517,14 +517,27 @@ gcloud logging read \
 **順序が重要。** Instance を先に消し、バケットを空にしてから destroy する。バケットにオブジェクトが
 残っていると `force_destroy = false` のため destroy が失敗し、**課金が止まらない。**
 
+**さらに、マイグレーションを流したあとは DB ユーザーの罠がある**
+（[#73](https://github.com/mpppk/cloud-run-dsh/issues/73)）。`0001_init.sql` が作る6テーブルが
+`dsh_app` ロールを参照するため、user の削除が
+`role "dsh_app" cannot be dropped because some objects depend on it` で 400 になる。
+2026-09-05 の撤収では実際にこれで一度失敗した（database が先に消えていたため2回目は通ったが、
+削除順に依存する）。**destroy の前にオブジェクトを落としておくのが確実。**
+
 ```bash
 curl -sS -X DELETE -H "Authorization: Bearer $TOK" "$BASE/instances/dsh-verify"
 curl -sS -H "Authorization: Bearer $TOK" "$BASE/instances"
 # → {} になるまで待つ
 
+gcloud run services delete control-plane --region "$REGION" --quiet   # デプロイしていれば
 bun run teardown:empty-bucket -- --yes
+
+# マイグレーション済みなら、DB のオブジェクトを先に落とす（#73）
+#   psql "$DATABASE_URL" -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
+
 terraform destroy -input=false -var-file=~/.dsh.tfvars
-# → Destroy complete! Resources: 49 destroyed.
+# → Destroy complete!（2026-09-05 の実測は 2回目で 18 destroyed。
+#    1回目で大半が消えたあとの残りなので、総数は状態による）
 ```
 
 ### 10. 残っていないことを確かめる（無料）
