@@ -232,3 +232,56 @@ In short: locally you can validate everything that touches Postgres
 (schema, repository, leases, state machine) plus the gateway HTTP surface in
 unit tests; you cannot exercise sandbox exec, GCS checkpoints, or GitHub App
 auth — those require a real Cloud Run deployment.
+
+---
+
+## Upgrading Bun
+
+Bun's version is pinned in **three places that must stay in sync**
+(issue #83 — a floating container tag once broke production with 503s;
+see `docs/stop-restore-verification-report.md` §3.1):
+
+1. `.bun-version` at the repository root — the canonical source.
+   CI installs exactly this (`bun-version-file: .bun-version` in
+   `.github/workflows/ci.yml`), and local development should use it too
+   (`bun upgrade` / your version manager, then `bun --version` to confirm).
+2. `apps/agent-host/Dockerfile` — `ARG BUN_VERSION=<x.y.z>` default.
+3. `apps/control-plane/Dockerfile` — same `ARG BUN_VERSION=<x.y.z>` default.
+
+The Dockerfiles intentionally use an `ARG` with a default rather than a
+hardcoded tag so a one-off build can override it
+(`--build-arg BUN_VERSION=<x.y.z>`) without editing files, while the
+default keeps plain `docker build` reproducible. `FROM` cannot read
+`.bun-version` directly (the file is not available until after the first
+`FROM`), so the sync is enforced by
+`tests/bun-version-consistency.test.ts`, which fails `bun test` if the
+`ARG` defaults drift from `.bun-version`.
+
+Upgrade steps (example: 1.4.0 → 1.4.1):
+
+```sh
+# 1. Confirm the exact tags exist (both the full and -slim variants):
+#    https://hub.docker.com/r/oven/bun/tags?name=1.4.1
+#    oven/bun:1.4.1 and oven/bun:1.4.1-slim must both be present.
+# 2. Bump all three places to 1.4.1.
+echo '1.4.1' > .bun-version
+#    then update ARG BUN_VERSION in both Dockerfiles.
+# 3. Switch your local toolchain and re-verify everything:
+bun upgrade  # or your version manager; confirm with: bun --version
+bun install
+bunx tsc --build && bun test
+# 4. Rebuild both images for the Cloud Run architecture and check the
+#    version actually inside the image (never trust the tag alone):
+DOCKER=/Applications/Docker.app/Contents/Resources/bin/docker
+$DOCKER build --platform linux/amd64 -f apps/agent-host/Dockerfile -t agent-host:bun-check .
+$DOCKER run --rm --platform linux/amd64 --entrypoint bun agent-host:bun-check --version
+$DOCKER build --platform linux/amd64 -f apps/control-plane/Dockerfile -t control-plane:bun-check .
+$DOCKER run --rm --platform linux/amd64 --entrypoint bun control-plane:bun-check --version
+# NOTE: `--entrypoint bun` is required — without it your args are appended
+# to the image ENTRYPOINT (`bun run apps/…`) and the app itself starts
+# instead of `bun --version`.
+```
+
+Also consider `@types/bun` in the root `package.json`, which tracks the
+runtime minor version. Never use floating tags (`oven/bun:1`,
+`oven/bun:latest`) in Dockerfiles.

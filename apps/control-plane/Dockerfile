@@ -11,6 +11,16 @@
 # Cloud Run executes linux/amd64 only, and a native build on Apple Silicon
 # produces a linux/arm64 image that Cloud Run cannot run.
 #
+# Bun version policy (issue #83): the image MUST pin an exact Bun release,
+# never a floating tag like `oven/bun:1`. A floating tag silently pulled a
+# newer Bun into the container and broke `POST /v1/workspaces/:id/open`
+# with 503s on GCP (see docs/stop-restore-verification-report.md §3.1).
+# The canonical version lives in `.bun-version` at the repository root
+# (CI installs it via `bun-version-file`); the `BUN_VERSION` default below
+# MUST match it. `tests/bun-version-consistency.test.ts` fails the suite
+# if they drift. To upgrade Bun, see docs/local-development.md
+# ("Upgrading Bun") and change `.bun-version` + both Dockerfiles together.
+#
 # Runtime configuration (injected via environment by Cloud Run — no secrets
 # are baked into the image):
 #   PORT                        — listen port (Cloud Run injects 8080; default below)
@@ -27,7 +37,8 @@
 # See apps/control-plane/README.md for the full contract.
 
 # --- deps: install workspace dependencies -----------------------------------
-FROM oven/bun:1 AS deps
+ARG BUN_VERSION=1.4.0
+FROM oven/bun:${BUN_VERSION} AS deps
 WORKDIR /app
 COPY package.json bun.lock ./
 COPY apps/agent-host/package.json apps/agent-host/package.json
@@ -62,7 +73,9 @@ COPY apps ./apps
 COPY packages ./packages
 
 # --- runtime -----------------------------------------------------------------
-FROM oven/bun:1-slim AS runtime
+# Pinned via $BUN_VERSION (see header comment); `-slim` keeps the runtime
+# small while deps/build use the full image.
+FROM oven/bun:${BUN_VERSION}-slim AS runtime
 # ca-certificates: TLS to Cloud SQL / GCP APIs. Run as non-root; the control
 # plane needs no writable volume and no subprocess tooling.
 RUN apt-get update \
