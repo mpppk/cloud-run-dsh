@@ -127,6 +127,30 @@ resource "google_sql_database" "dsh" {
   name     = var.db_name
   instance = google_sql_database_instance.main.name
   project  = var.project_id
+
+  # Issue #73: force destroy order database -> user.
+  #
+  # Terraform destroys in the inverse of creation order
+  # (https://github.com/hashicorp/terraform/blob/main/docs/destroying.md#simple-resource-destruction:
+  # "The order for destroying resource is exactly the inverse used to create
+  # them"), so the resource carrying `depends_on` is destroyed FIRST.
+  #
+  # `DROP ROLE dsh_app` fails while the 6 migrated tables (and the
+  # CONNECT/USAGE/CREATE grants inside `dsh`) still reference the role, so the
+  # database must go first and the user second. That means the DATABASE must
+  # depend on the USER — the opposite of the direction first suggested in #73
+  # (`google_sql_user` depending on the database would destroy the user first
+  # and reproduce the 400). Create order becomes user -> database, which is
+  # safe: Cloud SQL users and databases are both instance-level objects with no
+  # create-time dependency on each other.
+  #
+  # Best-effort, NOT verified against live GCP (no apply/destroy in this
+  # environment): DROP DATABASE removes the owned tables plus the in-DB
+  # privilege grants, and nothing outside `dsh` is ever owned by `dsh_app`, so
+  # the subsequent DROP ROLE is expected to succeed — but if a privilege
+  # residue ever blocks it again, the two-connection DROP OWNED + REVOKE
+  # fallback in docs/deployment-runbook.md Step 8 still applies.
+  depends_on = [google_sql_user.app]
 }
 
 resource "google_sql_user" "app" {
