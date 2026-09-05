@@ -134,6 +134,46 @@ export class InMemoryFakeExecutor implements QueryExecutor {
       return [] as T[];
     }
 
+    // Issue #85 (deleteWorkspace): workspace-scoped cascade deletes. The
+    // session_events cascade is allowlisted here — it is the ONLY permitted
+    // DELETE on that table. The append-only guard below still rejects every
+    // other UPDATE/DELETE on session_events (see the suite's rejection test).
+    if (
+      lower.startsWith(
+        "delete from session_events where session_id in (select id from sessions where workspace_id",
+      )
+    ) {
+      const workspaceId = params?.[0] as string;
+      const sessionIds = new Set(
+        Array.from(this.tables.sessions.values())
+          .filter((s) => s.workspaceId === workspaceId)
+          .map((s) => s.id),
+      );
+      for (const sessionId of sessionIds) {
+        this.tables.sessionEvents.delete(sessionId);
+      }
+      return [] as T[];
+    }
+    if (lower.startsWith("delete from sessions where workspace_id")) {
+      const workspaceId = params?.[0] as string;
+      for (const [id, s] of Array.from(this.tables.sessions)) {
+        if (s.workspaceId === workspaceId) {
+          this.tables.sessions.delete(id);
+          this.tables.sessionEvents.delete(id);
+        }
+      }
+      return [] as T[];
+    }
+    if (lower.startsWith("delete from workspace_checkpoints where workspace_id")) {
+      // Checkpoints are a no-op in this fake (inserts are accepted and
+      // dropped) — nothing to remove.
+      return [] as T[];
+    }
+    if (lower.startsWith("delete from workspaces where id")) {
+      this.tables.workspaces.delete(params?.[0] as string);
+      return [] as T[];
+    }
+
     // Workspaces
     if (lower.startsWith("insert into workspaces")) {
       // INSERT INTO workspaces(id, owner_id, repository_owner, repository_name, base_branch, ...) VALUES ($1,...)
@@ -404,6 +444,16 @@ class InMemoryFakeTransactionExecutor implements QueryExecutor {
   async exec(sql: string, params?: unknown[]): Promise<void> {
     const s = sql.trim().toLowerCase();
     if (s.startsWith("update session_events") || s.startsWith("delete from session_events")) {
+      // Issue #85: the deleteWorkspace cascade is the only permitted DELETE
+      // on this table (same allowlist as query() below).
+      if (
+        s.replace(/\s+/g, " ").startsWith(
+          "delete from session_events where session_id in (select id from sessions where workspace_id",
+        )
+      ) {
+        await this.query(sql, params);
+        return;
+      }
       throw new Error("session_events is append-only: UPDATE/DELETE is rejected");
     }
     await this.query(sql, params);

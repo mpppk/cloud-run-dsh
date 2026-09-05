@@ -82,6 +82,14 @@ export interface WorkspaceRuntimeHandle {
    */
   runManualCheckpoint(identity?: ForwardIdentity): Promise<{ skipped: boolean }>;
   /**
+   * Deletes the workspace's Cloud Run Instance (issue #85 GC path: the
+   * time-based reaper and DELETE /v1/workspaces/:id). Idempotent: a missing
+   * Instance resolves successfully (the desired end state — no Instance —
+   * already holds, same rationale as EnsureCreatedInstanceRuntime.stop).
+   * Never deletes anything but this workspace's own Instance.
+   */
+  deleteInstance(): Promise<void>;
+  /**
    * Returns the reachable URL of the workspace's Cloud Run Instance, or null
    * when the workspace has never been opened (or the Instance is unknown).
    *
@@ -130,6 +138,13 @@ export class WorkspaceRuntimeHandleAdapter implements WorkspaceRuntimeHandle {
      * second caller joining the coalesced stop() changes nothing material.
      */
     private readonly identitySink?: (identity: ForwardIdentity | undefined) => void,
+    /**
+     * Deletes the workspace's Cloud Run Instance (issue #85). Optional so
+     * existing call sites (route tests with stub handles, the dev server)
+     * keep working without wiring a deleter; the production factory always
+     * supplies it. Defaults to a no-op.
+     */
+    private readonly deleteInstanceFn?: () => Promise<void>,
   ) {}
 
   /**
@@ -166,6 +181,10 @@ export class WorkspaceRuntimeHandleAdapter implements WorkspaceRuntimeHandle {
   runManualCheckpoint(identity?: ForwardIdentity): Promise<{ skipped: boolean }> {
     this.identitySink?.(identity);
     return this.runtime.runCheckpoint(this.checkpointFn);
+  }
+
+  deleteInstance(): Promise<void> {
+    return this.deleteInstanceFn?.() ?? Promise.resolve();
   }
 
   getInstanceUrl(): Promise<string | null> {

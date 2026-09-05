@@ -75,6 +75,10 @@ class FakeExecutor implements QueryExecutor {
       const w = this.workspaces.get(params[0] as string);
       return w ? [structuredClone(w)] : [];
     }
+    if (sql.startsWith("SELECT * FROM workspaces")) {
+      // listWorkspaces (issue #85): no WHERE clause — every row.
+      return [...this.workspaces.values()].map((w) => structuredClone(w));
+    }
     if (sql.startsWith("SELECT * FROM sessions WHERE workspace_id")) {
       return [...this.sessions.values()]
         .filter((s) => s["workspace_id"] === params[0])
@@ -136,8 +140,14 @@ class FakeExecutor implements QueryExecutor {
       const id = params[params.length - 1] as string;
       const w = this.workspaces.get(id);
       if (!w) throw new Error(`workspace not found: ${id}`);
-      // Only runtime_state / last_activity_at / updated_at are patched by T8 wiring.
-      if (sql.includes("runtime_state")) w["runtime_state"] = params[0];
+      // Generic SET-clause parsing for `col = $N` pairs (`updated_at = now()`
+      // carries no placeholder and is applied implicitly below).
+      const setClause = sql.slice("UPDATE workspaces SET".length, sql.lastIndexOf("WHERE"));
+      for (const assign of setClause.split(",")) {
+        const m = assign.trim().match(/^([a-z_]+)\s*=\s*\$(\d+)$/i);
+        if (!m) continue;
+        w[m[1]!.toLowerCase()] = params[Number(m[2]) - 1];
+      }
       w["updated_at"] = new Date().toISOString();
       return;
     }
@@ -176,6 +186,37 @@ class FakeExecutor implements QueryExecutor {
       this.events.set(sessionId, rows);
       return;
     }
+    // Issue #85 deleteWorkspace cascade.
+    if (
+      sql.startsWith(
+        "DELETE FROM session_events WHERE session_id IN (SELECT id FROM sessions WHERE workspace_id",
+      )
+    ) {
+      const workspaceId = params[0] as string;
+      const sessionIds = new Set(
+        [...this.sessions.values()]
+          .filter((s) => s["workspace_id"] === workspaceId)
+          .map((s) => s["id"] as string),
+      );
+      for (const sessionId of sessionIds) this.events.delete(sessionId);
+      return;
+    }
+    if (sql.startsWith("DELETE FROM sessions WHERE workspace_id")) {
+      const workspaceId = params[0] as string;
+      for (const [id, s] of [...this.sessions]) {
+        if (s["workspace_id"] === workspaceId) {
+          this.sessions.delete(id);
+          this.events.delete(id);
+        }
+      }
+      return;
+    }
+    if (sql.startsWith("DELETE FROM workspace_checkpoints WHERE workspace_id")) return;
+    if (sql.startsWith("DELETE FROM controller_leases WHERE workspace_id")) return;
+    if (sql.startsWith("DELETE FROM workspaces WHERE id")) {
+      this.workspaces.delete(params[0] as string);
+      return;
+    }
     throw new Error(`FakeExecutor: unhandled exec: ${sql}`);
   }
 
@@ -198,6 +239,8 @@ class FakeHandle implements WorkspaceRuntimeHandle {
   openCalls = 0;
   stopCalls = 0;
   checkpointCalls = 0;
+  deleteCalls = 0;
+  deleteBehavior: "ok" | "fail" = "ok";
   inputAllowed = true;
 
   async open(): Promise<string> {
@@ -241,6 +284,13 @@ class FakeHandle implements WorkspaceRuntimeHandle {
 
   async getInstanceUrl(): Promise<string | null> {
     return this.instanceUrl;
+  }
+
+  async deleteInstance(): Promise<void> {
+    this.deleteCalls++;
+    if (this.deleteBehavior === "fail") {
+      throw new Error("Instances API delete failed (boom)");
+    }
   }
 }
 
@@ -490,6 +540,7 @@ describe("membership authorization (仕様書 sections 21/26 item 7)", () => {
     // carol is a known user but not a member of the workspace.
     const membershipRoutes: Array<() => Promise<Response>> = [
       () => h.fetchAs("carol", `/v1/workspaces/${workspaceId}`, { method: "GET" }),
+      () => h.fetchAs("carol", `/v1/workspaces/${workspaceId}`, { method: "DELETE" }),
       () =>
         h.fetchAs("carol", `/v1/workspaces/${workspaceId}/open`, {
           method: "POST",
@@ -590,6 +641,122 @@ describe("membership authorization (仕様書 sections 21/26 item 7)", () => {
     await h.membership.addMember(workspaceId, "bob");
     const res = await h.fetchAs("bob", `/v1/workspaces/${workspaceId}`, { method: "GET" });
     expect(res.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workspace deletion (issue #85 案B)
+// ---------------------------------------------------------------------------
+
+describe("DELETE /v1/workspaces/:id (issue #85)", () => {
+  test("owner deletes: Instance deleted, row + sessions + events gone", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      const sessionRes = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const sessionId = ((await sessionRes.json()) as { id: string }).id;
+      await h.repo.append(sessionId, [{ eventType: "a", eventTime: 1, data: {} }]);
+      const handle = new FakeHandle();
+      h.deps.runtimes.set(ws.id, handle);
+
+      const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`, { method: "DELETE" });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ workspaceId: ws.id, deleted: true });
+
+      // Instance deletion went through the workspace's own handle.
+      expect(handle.deleteCalls).toBe(1);
+      // Row and children are gone.
+      expect(await h.repo.getWorkspace(ws.id)).toBeNull();
+      expect(await h.repo.getSession(sessionId)).toBeNull();
+      expect(await h.repo.readEvents(sessionId)).toEqual([]);
+      // Reading the deleted workspace is 404, not 403.
+      expect((await h.fetchAs("alice", `/v1/workspaces/${ws.id}`, { method: "GET" })).status).toBe(
+        404,
+      );
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("non-member gets 403 and nothing is deleted", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      const handle = new FakeHandle();
+      h.deps.runtimes.set(ws.id, handle);
+
+      const res = await h.fetchAs("carol", `/v1/workspaces/${ws.id}`, { method: "DELETE" });
+      expect(res.status).toBe(403);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe("forbidden");
+
+      expect(handle.deleteCalls).toBe(0);
+      expect(await h.repo.getWorkspace(ws.id)).not.toBeNull();
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("unknown workspace -> 404", async () => {
+    const h = startHarness();
+    try {
+      const res = await h.fetchAs(
+        "alice",
+        "/v1/workspaces/00000000-0000-0000-0000-000000000000",
+        { method: "DELETE" },
+      );
+      expect(res.status).toBe(404);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("Instance delete failure -> 502 and the workspace row is kept (retryable)", async () => {
+    const logger = new InMemoryLogger();
+    const h = startHarness({ logger });
+    try {
+      const ws = await h.createWorkspace("alice");
+      const handle = new FakeHandle();
+      handle.deleteBehavior = "fail";
+      h.deps.runtimes.set(ws.id, handle);
+
+      const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`, { method: "DELETE" });
+      expect(res.status).toBe(502);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe(
+        "bad_gateway",
+      );
+
+      // Row kept for retry; the failure is a structured log with ids.
+      expect(await h.repo.getWorkspace(ws.id)).not.toBeNull();
+      const failed = logger.parsed.find(
+        (e) => e["event"] === "control-plane.workspace-delete.instance-failed",
+      );
+      expect(failed).toBeTruthy();
+      expect(failed!["workspaceId"]).toBe(ws.id);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("successful delete is a structured log with workspaceId", async () => {
+    const logger = new InMemoryLogger();
+    const h = startHarness({ logger });
+    try {
+      const ws = await h.createWorkspace("alice");
+      h.deps.runtimes.set(ws.id, new FakeHandle());
+
+      expect((await h.fetchAs("alice", `/v1/workspaces/${ws.id}`, { method: "DELETE" })).status).toBe(
+        200,
+      );
+      const line = logger.parsed.find((e) => e["event"] === "control-plane.workspace-deleted");
+      expect(line).toBeTruthy();
+      expect(line!["workspaceId"]).toBe(ws.id);
+    } finally {
+      h.stop();
+    }
   });
 });
 
@@ -1281,6 +1448,7 @@ describe("open/stop composition with the T8 runtime", () => {
         assertAgentInputAllowed: () => {},
         runManualCheckpoint: async () => ({ skipped: false }),
         getInstanceUrl: async () => null,
+        deleteInstance: async () => {},
       };
       h.deps.runtimes.set(ws.id, losing);
 
@@ -1973,6 +2141,7 @@ describe("unexpected error observability (issue #48)", () => {
         assertAgentInputAllowed: () => {},
         runManualCheckpoint: async () => ({ skipped: false }),
         getInstanceUrl: async () => null,
+        deleteInstance: async () => {},
       };
       h.deps.runtimes.set(ws.id, throwing);
 

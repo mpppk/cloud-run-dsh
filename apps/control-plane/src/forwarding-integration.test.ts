@@ -64,6 +64,7 @@ class TestInstanceHandle implements WorkspaceRuntimeHandle {
   async runManualCheckpoint(): Promise<{ skipped: boolean }> {
     return { skipped: false };
   }
+  async deleteInstance(): Promise<void> {}
   async getInstanceUrl(): Promise<string | null> {
     return this.instanceUrl;
   }

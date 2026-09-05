@@ -713,6 +713,24 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
       lastKnownUrl = current?.instanceUrl ?? null;
       return lastKnownUrl;
     };
-    return new WorkspaceRuntimeHandleAdapter(runtime, checkpointFn, instanceUrlProvider, identitySink);
+    // Issue #85: Instance deletion for the stopped-instance reaper and
+    // DELETE /v1/workspaces/:id. Idempotent: a missing Instance resolves
+    // successfully — the desired end state (no Instance) already holds, the
+    // same rationale as EnsureCreatedInstanceRuntime.stop() above.
+    const deleteInstance = async (): Promise<void> => {
+      try {
+        await client.delete(instanceName);
+      } catch (e) {
+        if (e instanceof InstanceNotFoundError) return;
+        throw e;
+      }
+    };
+    return new WorkspaceRuntimeHandleAdapter(
+      runtime,
+      checkpointFn,
+      instanceUrlProvider,
+      identitySink,
+      deleteInstance,
+    );
   });
 }

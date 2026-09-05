@@ -103,6 +103,10 @@ describe("readControlPlaneConfig", () => {
     expect(config.llmBaseUrl).toBeUndefined();
     expect(config.llmModel).toBeUndefined();
     expect(config.llmApprovalPolicy).toBeUndefined();
+    // Issue #85: GC cadence/threshold/cap default to hourly / 30 days / 10 per sweep.
+    expect(config.instanceGcIntervalMs).toBe(60 * 60 * 1000);
+    expect(config.instanceGcStaleAfterMs).toBe(30 * 24 * 60 * 60 * 1000);
+    expect(config.instanceGcMaxDeletesPerSweep).toBe(10);
   });
 
   test("missing OPENROUTER_API_KEY fails boot with the key NAME only (no value to leak)", () => {
@@ -185,6 +189,59 @@ describe("readControlPlaneConfig", () => {
     expect(() =>
       readControlPlaneConfig({ ...fullEnv(), INSTANCES_API_BASE_URL: "ftp://example.com/v2" }),
     ).toThrow(/invalid INSTANCES_API_BASE_URL/);
+  });
+
+  test("INSTANCE_GC_* tune the sweeper; blanks mean default; bad values fail boot (issue #85)", () => {
+    const tuned = readControlPlaneConfig({
+      ...fullEnv(),
+      INSTANCE_GC_INTERVAL_MS: "60000",
+      INSTANCE_GC_STALE_AFTER_MS: "86400000",
+      INSTANCE_GC_MAX_DELETES_PER_SWEEP: "5",
+    });
+    expect(tuned.instanceGcIntervalMs).toBe(60_000);
+    expect(tuned.instanceGcStaleAfterMs).toBe(86_400_000);
+    expect(tuned.instanceGcMaxDeletesPerSweep).toBe(5);
+
+    // Zero disables the background sweeper (on-demand DELETE still works).
+    expect(
+      readControlPlaneConfig({ ...fullEnv(), INSTANCE_GC_INTERVAL_MS: "0" })
+        .instanceGcIntervalMs,
+    ).toBe(0);
+
+    const blanked = readControlPlaneConfig({
+      ...fullEnv(),
+      INSTANCE_GC_INTERVAL_MS: "   ",
+      INSTANCE_GC_STALE_AFTER_MS: "",
+      INSTANCE_GC_MAX_DELETES_PER_SWEEP: "  ",
+    });
+    expect(blanked.instanceGcIntervalMs).toBe(60 * 60 * 1000);
+    expect(blanked.instanceGcStaleAfterMs).toBe(30 * 24 * 60 * 60 * 1000);
+    expect(blanked.instanceGcMaxDeletesPerSweep).toBe(10);
+
+    expect(() =>
+      readControlPlaneConfig({ ...fullEnv(), INSTANCE_GC_INTERVAL_MS: "not-a-number" }),
+    ).toThrow(/invalid INSTANCE_GC_INTERVAL_MS/);
+    expect(() =>
+      readControlPlaneConfig({ ...fullEnv(), INSTANCE_GC_INTERVAL_MS: "-1" }),
+    ).toThrow(/invalid INSTANCE_GC_INTERVAL_MS/);
+    // Staleness below 1 hour is rejected: with an hourly sweeper it would
+    // wipe every stopped Instance at once.
+    expect(() =>
+      readControlPlaneConfig({ ...fullEnv(), INSTANCE_GC_STALE_AFTER_MS: "0" }),
+    ).toThrow(/invalid INSTANCE_GC_STALE_AFTER_MS/);
+    expect(() =>
+      readControlPlaneConfig({ ...fullEnv(), INSTANCE_GC_STALE_AFTER_MS: "1" }),
+    ).toThrow(/invalid INSTANCE_GC_STALE_AFTER_MS/);
+    expect(() =>
+      readControlPlaneConfig({ ...fullEnv(), INSTANCE_GC_STALE_AFTER_MS: "3599999" }),
+    ).toThrow(/invalid INSTANCE_GC_STALE_AFTER_MS/);
+    expect(
+      readControlPlaneConfig({ ...fullEnv(), INSTANCE_GC_STALE_AFTER_MS: "3600000" })
+        .instanceGcStaleAfterMs,
+    ).toBe(3_600_000);
+    expect(() =>
+      readControlPlaneConfig({ ...fullEnv(), INSTANCE_GC_MAX_DELETES_PER_SWEEP: "0" }),
+    ).toThrow(/invalid INSTANCE_GC_MAX_DELETES_PER_SWEEP/);
   });
 });
 

@@ -193,6 +193,7 @@ sequenceDiagram
 |---|---|
 | `POST /v1/workspaces` | ワークスペースを作成する。id はサーバが採番する。 |
 | `GET /v1/workspaces/:id` | 状態を取得する。 |
+| `DELETE /v1/workspaces/:id` | ワークスペースを削除する。**STOPPED 以外（稼働中含む）でも強制削除する**（rm -rf semantics。409 ゲートは同一 TOCTOU で保証にならないため付けない）。先に Instance を消し、成功したら行を子（セッション・イベント・チェックポイント・リース）ごと削除する。Instance 削除に失敗したら 502 で行を残す。メンバーシップ必須（#85）。**GCS 上の checkpoint 実体は残る**（バケットに orphan が溜まる。既知の残件）。 |
 | `POST /v1/workspaces/:id/open` | Instance を起動する（同時実行は合流）。 |
 | `POST /v1/workspaces/:id/stop` | 停止する。agent-host の停止準備（`POST 停止準備`→チェックポイント保存）が成功してから Instance を stop する。準備に失敗したら `CHECKPOINT_FAILED` で stop しない（#72）。Instance は delete せず残す（#85）。 |
 | `POST /v1/workspaces/:id/checkpoints` | 手動チェックポイント。agent-host で実スナップショットを取ってから `checkpointed: true` を返す（#75）。clean tree のスキップは成功扱いで、応答の `skipped` が `true` になる（実際に取られたときは `false`）（#89）。Instance が止まっているときは 409。 |
@@ -590,7 +591,7 @@ gcloud 呼び出しが失敗するので解除する。
 
 | 箇所 | 状態 | Issue |
 |---|---|---|
-| 停止した Instance が溜まり続ける | `stop` のみで delete しないのは意図した設計（停止中は無課金と SKU で確認済み）。ただし誰も消さないため workspace 数だけ増える。region あたり 100 の quota。いつ誰が消すかは未定。 | [#85](https://github.com/mpppk/cloud-run-dsh/issues/85) |
+| 停止した Instance が溜まり続ける | GC の仕組みが入った: 1時間おきの sweeper が STOPPED かつ30日無触の workspace の Instance オブジェクトを消す（行・チェックポイントは残り、次の open は create から復元）。`DELETE /v1/workspaces/:id` で明示削除もできる。停止中が region あたり 100 の quota を消費するかは**未確認**（公開ドキュメントに記述なし。確認手順は [`stopped-instance-gc.md`](./stopped-instance-gc.md)）。 | [#85](https://github.com/mpppk/cloud-run-dsh/issues/85) |
 | stop → restart → 復元の実機確認 | ローカルでは全経路をテスト済み。GCP 実機での stop → restart → 復元は未実施（要 GCP 再構築＝課金）。 | [#72](https://github.com/mpppk/cloud-run-dsh/issues/72) |
 | マイグレーション後の `terraform destroy` | テーブルが `dsh_app` ロールを参照するため一度失敗する。撤収が失敗する＝課金が止まらない。 | [#73](https://github.com/mpppk/cloud-run-dsh/issues/73) |
 | cancel / approval の実機動作 | ローカルでは実キーで確認済み。GCP 上では未確認。 | [#39](https://github.com/mpppk/cloud-run-dsh/issues/39)（実装はマージ済み） |

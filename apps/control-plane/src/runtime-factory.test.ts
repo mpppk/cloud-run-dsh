@@ -60,6 +60,9 @@ function testConfig(): ControlPlaneConfig {
     // Issue #56: must agree with the host= of agentHostDatabaseUrl above
     // (/cloudsql/<connection-name>) — the consistency guard enforces it.
     cloudSqlConnectionName: "test-proj:test-region:main",
+    instanceGcIntervalMs: 3_600_000,
+    instanceGcStaleAfterMs: 30 * 24 * 3_600_000,
+    instanceGcMaxDeletesPerSweep: 10,
   };
 }
 
@@ -927,6 +930,41 @@ describe("getInstanceUrl — the #22 forwarding seam", () => {
     expect((await h.repo.getWorkspace("ws-1"))!.instanceUrl).toBe(
       "https://dsh-ws-1-new.run.app",
     );
+  });
+});
+
+describe("handle.deleteInstance — the #85 GC seam", () => {
+  test("issues DELETE for the workspace's own Instance name", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(async (req) => {
+      if (req.method === "DELETE") return { status: 200, body: {} };
+      throw new Error(`unexpected request: ${req.method} ${req.url}`);
+    });
+    const registry = makeRegistry(h);
+    const handle = await registry.get(workspace);
+    await handle.deleteInstance();
+    expect(h.transport.requests.map((r) => `${r.method} ${r.url}`)).toEqual([
+      `DELETE ${BASE_PATH}/instances/dsh-ws-1`,
+    ]);
+  });
+
+  test("missing Instance (404) resolves — the desired end state already holds", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(async () => ({ status: 404, body: { message: "not found" } }));
+    const registry = makeRegistry(h);
+    const handle = await registry.get(workspace);
+    await expect(handle.deleteInstance()).resolves.toBeUndefined();
+  });
+
+  test("other API failures propagate (the caller answers 502 and keeps the row)", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(async () => ({ status: 500, body: { message: "boom" } }));
+    const registry = makeRegistry(h);
+    const handle = await registry.get(workspace);
+    await expect(handle.deleteInstance()).rejects.toThrow(/boom/);
   });
 });
 

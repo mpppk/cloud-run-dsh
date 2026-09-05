@@ -77,9 +77,17 @@ export interface SessionPersistenceRepository {
   // Workspace CRUD
   createWorkspace(input: CreateWorkspaceInput): Promise<Workspace>;
   getWorkspace(id: string): Promise<Workspace | null>;
+  listWorkspaces(): Promise<Workspace[]>;
   updateWorkspace(id: string, patch: UpdateWorkspacePatch): Promise<Workspace>;
   updateRuntimeState(id: string, runtimeState: Workspace["runtimeState"]): Promise<Workspace>;
   updateLastActivityAt(id: string, lastActivityAt: string): Promise<Workspace>;
+  /**
+   * Deletes a workspace and everything under it (sessions, session events,
+   * checkpoints, controller lease) in one transaction (issue #85 案B: the
+   * schema has no ON DELETE CASCADE, so the application deletes children
+   * first). Returns false when the workspace does not exist.
+   */
+  deleteWorkspace(id: string): Promise<boolean>;
 
   // Session CRUD
   createSession(input: CreateSessionInput): Promise<Session>;
@@ -137,6 +145,13 @@ export class PostgresSessionPersistenceRepository implements SessionPersistenceR
     return rowToWorkspace(rows[0]!);
   }
 
+  async listWorkspaces(): Promise<Workspace[]> {
+    const rows = await this.executor.query<Record<string, unknown>>(
+      "SELECT * FROM workspaces ORDER BY created_at ASC",
+    );
+    return rows.map(rowToWorkspace);
+  }
+
   async updateWorkspace(id: string, patch: UpdateWorkspacePatch): Promise<Workspace> {
     // Generic SQL path: build dynamic SET clause
     const sets: string[] = [];
@@ -177,6 +192,31 @@ export class PostgresSessionPersistenceRepository implements SessionPersistenceR
 
   async updateLastActivityAt(id: string, lastActivityAt: string): Promise<Workspace> {
     return this.updateWorkspace(id, { lastActivityAt });
+  }
+
+  async deleteWorkspace(id: string): Promise<boolean> {
+    return this.executor.transaction(async (tx) => {
+      const existing = await tx.query<Record<string, unknown>>(
+        "SELECT * FROM workspaces WHERE id = $1",
+        [id],
+      );
+      if (existing.length === 0) return false;
+      // No ON DELETE CASCADE in 0001_init.sql, so children go first
+      // (events reference sessions, sessions/checkpoints/leases reference
+      // the workspace). The IN-subquery shape below is load-bearing for the
+      // in-memory fake: a workspace-scoped cascade is the ONLY allowed
+      // DELETE on session_events (ad-hoc event mutation stays rejected —
+      // see fakeExecutor.ts).
+      await tx.exec(
+        "DELETE FROM session_events WHERE session_id IN (SELECT id FROM sessions WHERE workspace_id = $1)",
+        [id],
+      );
+      await tx.exec("DELETE FROM sessions WHERE workspace_id = $1", [id]);
+      await tx.exec("DELETE FROM workspace_checkpoints WHERE workspace_id = $1", [id]);
+      await tx.exec("DELETE FROM controller_leases WHERE workspace_id = $1", [id]);
+      await tx.exec("DELETE FROM workspaces WHERE id = $1", [id]);
+      return true;
+    });
   }
 
   async createSession(input: CreateSessionInput): Promise<Session> {

@@ -268,5 +268,39 @@ export function defineRepositorySuite(
       // Scoped per workspace.
       expect(await repo.listCheckpoints("00000000-0000-0000-0000-000000000099")).toEqual([]);
     });
+
+    test("listWorkspaces returns every workspace in creation order", async () => {
+      const exec = await makeExecutor();
+      const repo = new PostgresSessionPersistenceRepository(exec);
+      expect(await repo.listWorkspaces()).toEqual([]);
+      const ids = [
+        "00000000-0000-0000-0000-000000000011",
+        "00000000-0000-0000-0000-000000000012",
+      ];
+      for (const id of ids) {
+        await repo.createWorkspace({
+          id,
+          ownerId: "user-1",
+          repositoryOwner: "mpppk",
+          repositoryName: "cloud-run-dsh",
+          baseBranch: "main",
+        });
+      }
+      expect((await repo.listWorkspaces()).map((w) => w.id)).toEqual(ids);
+    });
+
+    test("deleteWorkspace cascades to sessions and events; unknown id -> false", async () => {
+      const { repo, ws, session } = await setupWorkspaceAndSession(await makeExecutor());
+      await repo.append(session.id, [{ eventType: "a", eventTime: 1, data: {} }]);
+      expect(await repo.deleteWorkspace("00000000-0000-0000-0000-00000000ffff")).toBe(false);
+
+      expect(await repo.deleteWorkspace(ws.id)).toBe(true);
+      expect(await repo.getWorkspace(ws.id)).toBeNull();
+      expect(await repo.listWorkspaces()).toEqual([]);
+      // Children are gone: the session row and its events no longer read back.
+      expect(await repo.getSession(session.id)).toBeNull();
+      expect(await repo.listSessions(ws.id)).toEqual([]);
+      expect(await repo.readEvents(session.id)).toEqual([]);
+    });
   });
 }
