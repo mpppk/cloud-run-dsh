@@ -658,11 +658,34 @@ curl -s -X POST "https://<control-plane-host>/v1/workspaces/${WORKSPACE_ID}/stop
 Order matters: remove Instance-attached things first, empty the bucket, then Terraform.
 
 ```bash
-# 1. Stop & delete every Cloud Run Instance you (or the control plane) created.
-#    They are NOT in Terraform state — destroy will not remove them.
-gcloud run instances list --location="$REGION"    # enumerate (or via REST GET)
-gcloud run instances stop   dsh-ws-demo --location="$REGION" 2>/dev/null || true
-gcloud run instances delete dsh-ws-demo --location="$REGION" 2>/dev/null || true
+# 1. Delete EVERY Cloud Run Instance you (or the control plane) created.
+#    They are NOT in Terraform state — `terraform destroy` will NOT remove them.
+#    This step is the ONLY thing that stops their billing: verify the list is
+#    empty before moving on (issue #123).
+#    Instance names are `dsh-<workspace-uuid>` (e.g. `dsh-a5a8dbd5-...`), never a
+#    fixed name — enumerate and delete ALL of them. There is NO
+#    `gcloud run instances` command in current gcloud SDKs (measured 2026-09-05
+#    with SDK 582.0.0: `ERROR: (gcloud.run) Invalid choice: 'instances'`),
+#    so this step uses the v2 REST API — the same surface Steps 5.2/5.4 use.
+#    Deletes are asynchronous — poll until the list is empty before step 2
+#    (measured 2026-09-05: ~2 min from DELETE to an empty list).
+LIST_URL="https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/instances"
+NAMES="$(curl -s -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  "$LIST_URL" | jq -r '[.instances[]?.name | split("/") | last] | join(" ")')"
+for NAME in $NAMES; do
+  echo "deleting instance: $NAME"
+  curl -s -X DELETE -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+    "${LIST_URL}/${NAME}"
+done
+# Poll until the list is empty — do NOT proceed to step 2 while any remain.
+for i in $(seq 1 30); do
+  COUNT="$(curl -s -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+    "$LIST_URL" | jq -r '(.instances // []) | length')"
+  echo "instances remaining: $COUNT (check $i/30)"
+  [ "$COUNT" = "0" ] && break
+  sleep 30
+done
+[ "$COUNT" = "0" ] || { echo "instances never drained to 0 - NOT proceeding (billing continues)"; exit 1; }
 
 # 2. Delete the control-plane service:
 gcloud run services delete control-plane --region="$REGION" --quiet
@@ -841,6 +864,7 @@ The preflight script (`bun run preflight:gcp`) is likewise only proven in its "u
 >    - **(d) Gate cannot be passed (escape hatch — never leave a teardown billing):** step 3b ends with `exit 1` when the gauge never reaches 0, but **a teardown that never destroys keeps billing forever, while a destroy attempted too early fails with the retryable 400 above and bills no extra**. So the gate must never be a dead end. If step 3b prints `NO time series returned` for all 20 rounds, first re-verify the filter: `echo "$DATABASE_ID"` must be `project:instance` (e.g. `cloud-run-dsh:dev-dsh-pg` — issue #118), not the bare instance name and not `sql_connection_name` (which carries `project:region:instance`). If the filter is correct and series are still absent, or the gauge stays > 0 past the timeout, record the reason and run `terraform -chdir=infra/terraform destroy` directly — accepting the #115 risk — then follow (b), then (c). A failed destroy is recoverable; an unattempted one is not.
 >
 >    Terraform cannot gate this for you: `google_sql_database` exposes only `deletion_policy` (`DELETE`/`ABANDON`/`PREVENT`) — no drain, no force flag — and the Cloud SQL Admin API `DELETE databases` issues a plain `DROP DATABASE` that fails on active backends (upstream `force_delete` request is still open). See the note on `google_sql_database.dsh` in `cloudsql.tf`. The runbook gate above is the fix.
+> 4. **Step 8 step 1 not actually deleting Instances** — issue [#123](https://github.com/mpppk/cloud-run-dsh/issues/123), measured 2026-09-05: the old step 1 used `gcloud run instances ...`, which does not exist in current gcloud SDKs (`ERROR: (gcloud.run) Invalid choice: 'instances'` with SDK 582.0.0, no alpha/beta components installed), and deleted a fixed name (`dsh-ws-demo`) that never matches the real `dsh-<workspace-uuid>` names — so a runbook-following teardown left every Instance behind with billing continuing (caught only because the step 3b `num_backends` gate refused to pass: the surviving agent-host still held DB connections). Never "fix" this by deleting a single named Instance: always enumerate and delete all, then poll to empty as step 1 does.
 
 For the billing-approval gate (P6) you normally want the **minimal verification profile**, not the production-ish defaults:
 
