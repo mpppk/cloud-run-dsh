@@ -11,6 +11,9 @@
 //   auth headers at all, so the same file works under IAP untouched.
 // - no controller acquire / heartbeat / release calls: the server lines up
 //   single-writer ownership on prepare and the agent-host keeps it alive.
+//   When a write still meets a 409 with nobody holding the role (lapsed
+//   ownership — e.g. the dev server has no agent-host keep-alive), the
+//   screen prepares once more and retries the write once.
 //   Read-only state comes from GET .../controller's {held, mine} only.
 // - no polling route that extends the idle timer (spec section 11): the
 //   timers below only hit GET workspace, GET controller and the SSE stream
@@ -390,12 +393,21 @@ async function sendFlow() {
       return;
     }
     if (sent.status === 409) {
-      // Our pre-send read was stale (stopped between read and send), or
-      // someone else holds the single-writer role. Re-read once and branch.
+      // Our pre-send read was stale (stopped between read and send),
+      // ownership lapsed while the state stayed usable (READY with nobody
+      // holding it — the dev server has no agent-host keep-alive), or
+      // someone else holds the single-writer role. Re-read once and branch:
+      // POST "/open" re-lines-up ownership for this caller and is an
+      // idempotent no-op otherwise, so one prepare + one retry recovers
+      // both "stopped meanwhile" and "lapsed while usable" — unless the
+      // role is taken or the state is still moving. The server answers
+      // 409 before appending, so a 409ed send never wrote twice and a
+      // single retry cannot double-send.
       const reread = await api("GET", wsPath(conv.workspaceId));
       const s = reread.json?.runtimeState;
       if (reread.status === 200 && reread.json) renderWorkspace(reread.json);
-      if (s !== undefined && needsPrepare(s) && !TRANSIENT.has(s)) {
+      const settled = s !== undefined && !TRANSIENT.has(s);
+      if (settled && !(await refreshRole())) {
         const ok = await prepareAndWait(false);
         if (!ok) {
           note.textContent = "再開できませんでした。時間をおいてもう一度お試しください。";
@@ -600,11 +612,18 @@ function markAskDecided(id, text) {
 async function decideAsk(id, decision, approveBtn, rejectBtn, card) {
   approveBtn.disabled = true;
   rejectBtn.disabled = true;
-  const r = await api(
-    "POST",
-    `/v1/sessions/${encodeURIComponent(conv.sessionId)}/approvals/${encodeURIComponent(id)}`,
-    { decision },
-  );
+  const send = () =>
+    api("POST", `/v1/sessions/${encodeURIComponent(conv.sessionId)}/approvals/${encodeURIComponent(id)}`, {
+      decision,
+    });
+  let r = await send();
+  if (r.status === 409 && !(await refreshRole())) {
+    // Same lapsed-ownership recovery as sendFlow: one prepare (POST
+    // "/open" re-lines-up ownership for this caller) + one retry. The
+    // server answers 409 before appending, so the first attempt never
+    // wrote twice. Skipped when someone else holds the role.
+    if (await prepareAndWait(false)) r = await send();
+  }
   if (r.status === 201) {
     markAskDecided(id, decision === "rejected" ? "却下しました" : "承認しました");
   } else {
