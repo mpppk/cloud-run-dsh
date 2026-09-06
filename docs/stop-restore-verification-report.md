@@ -14,7 +14,7 @@ workspace 復元」を実機で通した記録**である。
 6周目だけは目的が違い、**#135（`open` の非同期化 / workspace 一覧 / product UI）と #141 の
 診断情報**を初めて実機に載せる周である。
 **復元は 6 周とも成立した**（4周目だけは open を呼び直す必要があった — §8.3）。
-**5周目は新しいバグが 1 件も出なかった** — その読み方は §11 末尾に書いた。
+**5周目は新しいバグが 1 件も出なかった** — その読み方は §12 末尾に書いた。
 
 検証後、GCP リソースはすべて削除済み（各周の撤収節）。
 
@@ -870,7 +870,7 @@ num_backends sample 3: 0 (from 1 series)    ← 4周目は 8 サンプル必要�
 
 ---
 
-## 10. 6周目（2026-09-06）— product UI と `open` の非同期化を実機で通す周
+## 10. 6周目（2026-09-07）— product UI と `open` の非同期化を実機で通す周
 
 **目的が今までと違う。** 1〜5周目は「stop → 復元」という同じ看板機能を繰り返し確かめる周だった。
 6周目は **[#135](https://github.com/mpppk/cloud-run-dsh/issues/135) の実装（`open` の非同期化 /
@@ -905,12 +905,17 @@ workspace 一覧 / product UI）と [#141](https://github.com/mpppk/cloud-run-ds
 #121 の shutdown 猶予が効くと約 3 分かかっていた（§9 の 36.9 秒はその「成功した方」の値である）。
 製品 UI が「3 分回るボタン」を持たずに済むという #136 の前提が、実機で成立した。
 
-### 10.2 これまで一度も実機で確認できていなかった 3 件が閉じた
+### 10.2 今回のビルドで実機を通し直した 3 件
 
-§4「未解決の項目」に長く残っていたものである。
+いずれも過去の周で実機に触れてはいる。**「初めて」なのは各項目に書いた差分だけである**ことを
+先に断っておく。先行する実機確認は `docs/e2e-verification-report.md` の §1.2（実 LLM ターン）・
+#25（実 Cloud SQL への実 runner）・ #26（実 GCS での保存・復元）、および本レポート §1 の
+`checkpoint.bin` の記録である。
 
-**(1) `infra/migrations/runner.ts` が Cloud SQL に対して走ったことがなかった。**
-過去の周はすべて生 SQL でスキーマを作っていた。今回初めてランナーを通した:
+**(1) 追加マイグレーション `0002_last_error.sql` の初回適用。**
+ランナー自体の実機走行は #25 で済んでいる。今回初めてなのは、#141 が足した
+**このリポジトリで最初の追加マイグレーション**の適用であり、その初回適用がいきなり本番だったことである。
+冪等性も同じ実行で確認している:
 
 ```
 Applied 2 migration(s): 0001_init.sql, 0002_last_error.sql
@@ -921,10 +926,13 @@ workspaces.last_error: {"column_name":"last_error","is_nullable":"YES"}
 schema_migrations: 0001_init.sql, 0002_last_error.sql
 ```
 
-`0002_last_error.sql` は #141 が足した**このリポジトリで最初の追加マイグレーション**であり、
-その初回適用がいきなり本番だった。冪等性も同じ実行で確認している。
+初回適用がいきなり本番だったからこそ、冪等性の同時確認に意味がある。
 
-**(2) エージェントの LLM 呼び出しが実機で走ったことがなかった。**
+**(2) `edit` ツールによる既存ファイルの書き換え。**
+実機での LLM ターン自体は 1〜5 周目も回っている（e2e レポート §1.2 の `read`、
+2〜5周目のマーカー書き込みの `write` / `read` / `glob`）。
+今回初めてなのは、clone 済みリポジトリの既存ファイルに対する `read` → `edit` の往復であり、
+`tool/result` の成功（`isError: false`）まで確認している。
 「README.md の先頭に挨拶を1行だけ足してください。」を送ったところ、1 ターンが最後まで回った:
 
 ```
@@ -934,15 +942,16 @@ turn/start → step 1: tool/call read  {"file_path": "/workspace/README.md"}
            → assistant/chunk ×51 → assistant/message ×3
 turn/end   {"reason":{"kind":"completed"}}
 model: deepseek/deepseek-v4-flash（provider: deepseek-official）
-usage: inputTokens 178 / outputTokens 64 / cacheReadTokens 4096
+usage: inputTokens 178 / outputTokens 64 / cacheReadTokens 4096（最終ステップの値。ターン累計 totalTokens は 4338）
 ```
 
-**エージェントは実際にリポジトリを clone し、ファイルを読んで書き換えている。**
+**エージェントは実際に clone 済みリポジトリのファイルを読んで書き換えている。**
 SSE は 41,213 バイト、`user_message` / `turn/*` / `step/*` / `tool/call` / `tool/result` /
 `assistant/*` が揃っていた。
 
-**(3) チェックポイントが実バケットに触ったことがなかった。**
-撤収時に消す対象として現れた:
+**(3) 現行ビルドのチェックポイントが実バケットに書かれることの再確認。**
+実バケットへの書き込み自体は 1 周目から毎周起きている（§1 の `checkpoint.bin`、#26 の保存・復元）。
+今回の記録は「#135 / #141 後のビルドでも書かれている」の再確認であり、撤収時に消す対象として現れた:
 
 ```
 Removing gs://cloud-run-dsh-dev-checkpoints/workspaces/9491e741-.../checkpoint.bin#1788728724905170...
@@ -984,8 +993,11 @@ Destroy complete! Resources: 47 destroyed.
 
 エラー 0 件。[#73](https://github.com/mpppk/cloud-run-dsh/issues/73)（マイグレーション後に
 `dsh_app` ロールを落とせない）は再発しなかった。撤収後に独立して数え直し、
-Cloud Run サービス / Cloud SQL / シークレット / バケット / Artifact Registry / サービスアカウント /
-ネットワーク / Cloud Run Instance / **IAP ブランド**がすべて 0 であることを確認した。
+Cloud Run サービス / Cloud SQL / シークレット / バケット / Artifact Registry /
+Cloud Run Instance がすべて 0 であることを確認した（Step 8.7 の記録）。
+サービスアカウントとネットワークは `terraform destroy`（47 件、エラーなし）の管理下で削除され、
+IAP ブランドは `count = 0` で作られていない（ログに `google_iap_brand` /
+`google_iap_client` の作成記録は無い）。
 ローカルの秘密（DB パスワード、LLM キー、`DATABASE_URL`）と `terraform.tfstate` は削除した。
 
 > 数字の出どころ: `52 added` とマイグレーションは `g1-bringup.log`、
@@ -1013,7 +1025,7 @@ Cloud Run サービス / Cloud SQL / シークレット / バケット / Artifac
 
 ## 12. 6 周を通しての総括
 
-環境を 6 回作って壊した（1〜3周目は同じ日、4〜6周目は翌日にまたがった）。
+環境を 6 回作って壊した（1〜3周目は同じ日、4・5周目は翌日、6周目はその翌日）。
 **6周目だけは目的が違う** — stop → 復元をもう一度なぞる周ではなく、
 #135 と #141 の新しい実装を初めて実機に載せる周である（§10）。
 
@@ -1030,7 +1042,7 @@ Cloud Run サービス / Cloud SQL / シークレット / バケット / Artifac
 **「周を追うごとにバグが減る」は 3周目までの話だった。** 4周目で 3 件に戻っている。
 減っていたのではなく、**まだ触っていない経路が残っていただけ**である。
 そして 5周目は **0 件**だった — ただしこれは「もう無い」ではなく、
-**5周目が 4周目と同じ叩き方をした**ことの帰結でもある（§11 末尾）。
+**5周目が 4周目と同じ叩き方をした**ことの帰結でもある（§12 末尾）。
 
 ### 何が変わると新しいバグが出るか
 
@@ -1047,7 +1059,7 @@ Cloud Run サービス / Cloud SQL / シークレット / バケット / Artifac
 
 **「手順書を読んで、書いてあるとおりに実行する」ことそれ自体が検証だった。**
 
-### バグの型は 4 周を通して変わっていない
+### バグの型は 6 周を通して変わっていない
 
 前回のレポート（open まで）は「バグ 14 件のすべてがテストダブルかコメントと
 実物の乖離だった」と結論した。**6 周を通しても、この形が大半である。**
