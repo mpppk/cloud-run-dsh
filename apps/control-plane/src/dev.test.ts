@@ -191,4 +191,38 @@ describe("dev composition (src/dev.ts)", () => {
     await Bun.sleep(DEV_OPEN_READY_DELAY_MS + 500);
     expect((await deps.repo.getWorkspace(ws.id))?.runtimeState).toBe("STOPPED");
   });
+
+  test("re-open of a READY workspace is a 200 no-op (no STARTING flap)", async () => {
+    // Mirrors the production WorkspaceRuntime.open() idempotency the route
+    // answers with 200: the dev stand-in must not flap the row back through
+    // STARTING (and must not arm a second READY timer behind it).
+    const created = await fetch(`${base}/v1/workspaces`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...iap("alice") },
+      body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
+    });
+    expect(created.status).toBe(201);
+    const ws = (await created.json()) as { id: string };
+
+    const opened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...iap("alice") },
+      body: JSON.stringify({}),
+    });
+    expect(opened.status).toBe(202);
+    expect(await waitForState(ws.id, "READY", DEV_OPEN_READY_DELAY_MS + 10_000)).toBe("READY");
+
+    const reopened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...iap("alice") },
+      body: JSON.stringify({}),
+    });
+    expect(reopened.status).toBe(200);
+    expect((await reopened.json()).state).toBe("READY");
+    // The row never left READY — not even transiently.
+    const read = await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: iap("alice") });
+    expect((await read.json()).runtimeState).toBe("READY");
+    await Bun.sleep(500);
+    expect((await deps.repo.getWorkspace(ws.id))?.runtimeState).toBe("READY");
+  });
 });

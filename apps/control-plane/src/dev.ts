@@ -45,6 +45,21 @@ const DEFAULT_PORT = 8787;
 export const DEV_OPEN_READY_DELAY_MS = 3000;
 
 /**
+ * Pending READY timers per workspace id (module-level, not per handle — see
+ * LoggingWorkspaceRuntimeHandle.open()). Workspace ids are UUIDs, so entries
+ * never collide across dev servers sharing this process (tests).
+ */
+const readyTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function clearDevReadyTimer(workspaceId: string): void {
+  const pending = readyTimers.get(workspaceId);
+  if (pending !== undefined) {
+    clearTimeout(pending);
+    readyTimers.delete(workspaceId);
+  }
+}
+
+/**
  * Minimal in-memory runtime handle for local development: open/stop flip the
  * state, agent input is always allowed, and every activity kind is logged so
  * a developer can see what the control plane thinks is happening.
@@ -57,7 +72,6 @@ export const DEV_OPEN_READY_DELAY_MS = 3000;
  */
 export class LoggingWorkspaceRuntimeHandle implements WorkspaceRuntimeHandle {
   private state = "STOPPED";
-  private readyTimer: ReturnType<typeof setTimeout> | null = null;
   readonly activities: ActivityKind[] = [];
 
   constructor(
@@ -67,18 +81,28 @@ export class LoggingWorkspaceRuntimeHandle implements WorkspaceRuntimeHandle {
 
   async open(): Promise<string> {
     // Issue #136: answer STARTING now and become READY on a timer, standing
-    // in for the production agent-host (see DEV_OPEN_READY_DELAY_MS). A
-    // re-open or stop cancels the pending timer so a STOPPED row can never
-    // be flipped to READY behind the caller's back.
-    if (this.readyTimer) {
-      clearTimeout(this.readyTimer);
-      this.readyTimer = null;
+    // in for the production agent-host (see DEV_OPEN_READY_DELAY_MS).
+    //
+    // Two idempotency guards keep the stand-in honest:
+    // - a re-open of an already-READY row is a no-op (mirrors the production
+    //   WorkspaceRuntime.open() idempotency that handlers answer with 200 —
+    //   without this the dev server flapped READY -> STARTING -> READY);
+    // - timers live in a module-level map keyed by workspace id (not on the
+    //   handle): the RuntimeRegistry rebuilds the handle when the lease
+    //   changes, and a per-handle timer would be orphaned by that rebuild —
+    //   a later stop() would clear only the new handle's (empty) timer while
+    //   the orphan still flips the STOPPED row to READY behind our back.
+    clearDevReadyTimer(this.workspaceId);
+    const current = await this.repo.getWorkspace(this.workspaceId);
+    if (current?.runtimeState === "READY") {
+      this.state = "READY";
+      return this.state;
     }
     await this.repo.updateWorkspace(this.workspaceId, { runtimeState: "STARTING" });
     this.state = "STARTING";
     console.log(`[dev] workspace ${this.workspaceId}: open -> STARTING (READY in ~${DEV_OPEN_READY_DELAY_MS}ms)`);
-    this.readyTimer = setTimeout(() => {
-      this.readyTimer = null;
+    const timer = setTimeout(() => {
+      readyTimers.delete(this.workspaceId);
       void this.repo
         .updateWorkspace(this.workspaceId, { runtimeState: "READY" })
         .then(() => {
@@ -89,14 +113,12 @@ export class LoggingWorkspaceRuntimeHandle implements WorkspaceRuntimeHandle {
           console.log(`[dev] workspace ${this.workspaceId}: READY transition failed: ${String(e)}`);
         });
     }, DEV_OPEN_READY_DELAY_MS);
+    readyTimers.set(this.workspaceId, timer);
     return this.state;
   }
 
   async stop(): Promise<string> {
-    if (this.readyTimer) {
-      clearTimeout(this.readyTimer);
-      this.readyTimer = null;
-    }
+    clearDevReadyTimer(this.workspaceId);
     await this.repo.updateWorkspace(this.workspaceId, { runtimeState: "STOPPED" });
     this.state = "STOPPED";
     console.log(`[dev] workspace ${this.workspaceId}: stop -> STOPPED`);
