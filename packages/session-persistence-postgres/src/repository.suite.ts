@@ -301,6 +301,41 @@ export function defineRepositorySuite(
       expect((await repo.listWorkspaces()).map((w) => w.id)).toEqual(ids);
     });
 
+    test("listWorkspacesByIds fetches only the requested rows in creation order", async () => {
+      const exec = await makeExecutor();
+      const repo = new PostgresSessionPersistenceRepository(exec);
+      expect(await repo.listWorkspacesByIds([])).toEqual([]);
+      const ids = [
+        "00000000-0000-0000-0000-000000000021",
+        "00000000-0000-0000-0000-000000000022",
+        "00000000-0000-0000-0000-000000000023",
+      ];
+      for (const id of ids) {
+        await repo.createWorkspace({
+          id,
+          ownerId: "user-1",
+          repositoryOwner: "mpppk",
+          repositoryName: "cloud-run-dsh",
+          baseBranch: "main",
+        });
+      }
+      // Subset only — the unrequested row is never returned. Creation order
+      // holds regardless of the input order (ORDER BY created_at ASC).
+      expect((await repo.listWorkspacesByIds([ids[2]!, ids[0]!])).map((w) => w.id)).toEqual([
+        ids[0]!,
+        ids[2]!,
+      ]);
+      // Unknown ids are skipped, never an error.
+      expect(
+        (await repo.listWorkspacesByIds([ids[1]!, "00000000-0000-0000-0000-00000000ffff"])).map(
+          (w) => w.id,
+        ),
+      ).toEqual([ids[1]!]);
+      expect(await repo.listWorkspacesByIds(["00000000-0000-0000-0000-00000000ffff"])).toEqual(
+        [],
+      );
+    });
+
     test("deleteWorkspace cascades to sessions and events; unknown id -> false", async () => {
       const { repo, ws, session } = await setupWorkspaceAndSession(await makeExecutor());
       await repo.append(session.id, [{ eventType: "a", eventTime: 1, data: {} }]);

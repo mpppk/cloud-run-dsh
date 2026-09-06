@@ -128,6 +128,27 @@ export const getWorkspace: RouteHandler = async (ctx) => {
   return json(toWorkspaceDto(workspace));
 };
 
+/**
+ * Lists the caller's own workspaces (issue #137).
+ *
+ * Two filtered queries, never a full scan or N+1: the MembershipStore
+ * resolves visible ids first (`WHERE owner_id = $1` in production, a map
+ * scan in memory — 案A), then the rows load with `WHERE id IN (...)`
+ * (one bound scalar per id).
+ * An empty membership short-circuits to `{ workspaces: [] }` without
+ * touching the workspace table at all.
+ *
+ * Deliberately touches NO runtime handle and calls NO `recordActivity`
+ * (仕様書 section 11): opening the list must not extend the idle timer.
+ * Same treatment as `getControllerStatus` and the SSE stream.
+ */
+export const listWorkspaces: RouteHandler = async (ctx) => {
+  const ids = await ctx.deps.membership.listWorkspaceIdsForUser(ctx.user.id);
+  if (ids.length === 0) return json({ workspaces: [] });
+  const workspaces = await ctx.deps.repo.listWorkspacesByIds(ids);
+  return json({ workspaces: workspaces.map(toWorkspaceDto) });
+};
+
 export const openWorkspace: RouteHandler = async (ctx) => {
   const id = requireSegment(ctx.params.id, "id");
   await parseOptionalJsonBody(ctx.request);

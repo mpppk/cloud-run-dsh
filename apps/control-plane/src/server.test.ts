@@ -37,6 +37,7 @@ import {
   type UpdateWorkspacePatch,
 } from "@cloud-run-dsh/session-persistence-postgres";
 import type { QueryExecutor } from "@cloud-run-dsh/session-persistence-postgres";
+import { listWorkspaces } from "./handlers.js";
 import type { Clock } from "@cloud-run-dsh/workspace-checkpoint";
 import { createDbReadinessProbe } from "./prod-adapters.js";
 import {
@@ -71,6 +72,16 @@ class FakeExecutor implements QueryExecutor {
   private seq = 0;
 
   async query<T>(sql: string, params: readonly unknown[]): Promise<Record<string, unknown>[]> {
+    if (sql.startsWith("SELECT * FROM workspaces WHERE id IN (")) {
+      // listWorkspacesByIds (issue #137): exactly the requested rows, one
+      // bound scalar per id (NOT `= ANY($1)` — Bun.SQL cannot bind a JS
+      // array; see repository.ts). Checked BEFORE the single-row `WHERE id`
+      // branch below, whose prefix this SQL shares.
+      const ids = new Set(params as string[]);
+      return [...this.workspaces.values()]
+        .filter((w) => ids.has(w["id"] as string))
+        .map((w) => structuredClone(w));
+    }
     if (sql.startsWith("SELECT * FROM workspaces WHERE id")) {
       const w = this.workspaces.get(params[0] as string);
       return w ? [structuredClone(w)] : [];
@@ -642,6 +653,164 @@ describe("membership authorization (仕様書 sections 21/26 item 7)", () => {
     await h.membership.addMember(workspaceId, "bob");
     const res = await h.fetchAs("bob", `/v1/workspaces/${workspaceId}`, { method: "GET" });
     expect(res.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workspace listing (issue #137)
+// ---------------------------------------------------------------------------
+
+describe("GET /v1/workspaces (issue #137)", () => {
+  let h: TestHarness;
+  let aliceIds: string[];
+  let bobId: string;
+
+  beforeAll(async () => {
+    h = startHarness();
+    const a1 = await h.createWorkspace("alice");
+    const a2 = await h.createWorkspace("alice");
+    const b1 = await h.createWorkspace("bob");
+    aliceIds = [a1.id, a2.id];
+    bobId = b1.id;
+  });
+  afterAll(() => h.stop());
+
+  test("returns only the caller's own workspaces", async () => {
+    const aliceRes = await h.fetchAs("alice", "/v1/workspaces", { method: "GET" });
+    expect(aliceRes.status).toBe(200);
+    const aliceBody = (await aliceRes.json()) as { workspaces: Array<{ id: string }> };
+    expect(aliceBody.workspaces.map((w) => w.id).sort()).toEqual([...aliceIds].sort());
+
+    const bobRes = await h.fetchAs("bob", "/v1/workspaces", { method: "GET" });
+    expect(bobRes.status).toBe(200);
+    const bobBody = (await bobRes.json()) as { workspaces: Array<{ id: string }> };
+    expect(bobBody.workspaces.map((w) => w.id)).toEqual([bobId]);
+  });
+
+  test("a shared (non-owner) member also sees the workspace", async () => {
+    await h.membership.addMember(aliceIds[0]!, "bob");
+    const res = await h.fetchAs("bob", "/v1/workspaces", { method: "GET" });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { workspaces: Array<{ id: string }> };
+    expect(body.workspaces.map((w) => w.id).sort()).toEqual([aliceIds[0]!, bobId].sort());
+  });
+
+  test("a user with no workspaces gets { workspaces: [] }", async () => {
+    // carol owns nothing yet (she creates one in the coexistence test below,
+    // which runs last) — the empty shape is pinned here.
+    const res = await h.fetchAs("carol", "/v1/workspaces", { method: "GET" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ workspaces: [] });
+  });
+
+  test("no auth headers -> 401, never 404", async () => {
+    const res = await fetch(h.url("/v1/workspaces"), { method: "GET" });
+    expect(res.status).toBe(401);
+  });
+
+  test("list entries use the same DTO as GET /v1/workspaces/:id", async () => {
+    const single = await h.fetchAs("alice", `/v1/workspaces/${aliceIds[0]}`, { method: "GET" });
+    expect(single.status).toBe(200);
+    const singleBody = await single.json();
+    const list = await h.fetchAs("alice", "/v1/workspaces", { method: "GET" });
+    expect(list.status).toBe(200);
+    const listBody = (await list.json()) as { workspaces: Array<Record<string, unknown>> };
+    expect(listBody.workspaces.find((w) => w["id"] === aliceIds[0])).toEqual(singleBody);
+  });
+
+  test("listing never calls recordActivity (idle timer untouched)", async () => {
+    const spy = new FakeHandle();
+    h.deps.runtimes.set(aliceIds[0]!, spy);
+    const res = await h.fetchAs("alice", "/v1/workspaces", { method: "GET" });
+    expect(res.status).toBe(200);
+    expect(spy.activities).toEqual([]);
+  });
+
+  test("POST /v1/workspaces (create) still coexists with the new GET route", async () => {
+    const res = await h.fetchAs("carol", "/v1/workspaces", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo", baseBranch: "main" }),
+    });
+    expect(res.status).toBe(201);
+    // ...and carol now lists exactly that one workspace.
+    const list = await h.fetchAs("carol", "/v1/workspaces", { method: "GET" });
+    const body = (await list.json()) as { workspaces: Array<{ id: string }> };
+    expect(body.workspaces).toHaveLength(1);
+  });
+});
+
+/** Counts SELECTs to pin the no-N+1 property of the list route. */
+class CountingFakeExecutor extends FakeExecutor {
+  queryCount = 0;
+  override async query<T>(
+    sql: string,
+    params: readonly unknown[],
+  ): Promise<Record<string, unknown>[]> {
+    this.queryCount++;
+    return super.query(sql, params);
+  }
+}
+
+describe("listWorkspaces query shape (issue #137, no N+1)", () => {
+  function listCtx(
+    membership: InMemoryMembershipStore,
+    repo: SessionPersistenceRepository,
+    userId: string,
+  ) {
+    return {
+      request: new Request("http://x/v1/workspaces"),
+      params: {} as Record<string, string>,
+      url: new URL("http://x/v1/workspaces"),
+      deps: { membership, repo } as unknown as ControlPlaneDeps,
+      user: { id: userId, email: `${userId}@example.com` },
+    };
+  }
+
+  test("N visible workspaces load in a single workspace-table query", async () => {
+    const exec = new CountingFakeExecutor();
+    const repo = new PostgresSessionPersistenceRepository(exec);
+    const membership = new InMemoryMembershipStore();
+    for (let i = 0; i < 5; i++) {
+      const id = `ws-list-${i}`;
+      await repo.createWorkspace({
+        id,
+        ownerId: "alice",
+        repositoryOwner: "mpppk",
+        repositoryName: "demo",
+        baseBranch: "main",
+      });
+      await membership.addMember(id, "alice");
+    }
+    // A decoy owned by someone else: visible ids resolve first, so its row
+    // must never be fetched.
+    await repo.createWorkspace({
+      id: "ws-list-decoy",
+      ownerId: "bob",
+      repositoryOwner: "mpppk",
+      repositoryName: "demo",
+      baseBranch: "main",
+    });
+    await membership.addMember("ws-list-decoy", "bob");
+
+    exec.queryCount = 0;
+    const res = await listWorkspaces(listCtx(membership, repo, "alice"));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { workspaces: Array<{ id: string; ownerId: string }> };
+    expect(body.workspaces).toHaveLength(5);
+    expect(body.workspaces.every((w) => w.ownerId === "alice")).toBe(true);
+    // Exactly 1 query (WHERE id IN (...)) — independent of the count.
+    expect(exec.queryCount).toBe(1);
+  });
+
+  test("empty membership answers without touching the workspace table", async () => {
+    const exec = new CountingFakeExecutor();
+    const repo = new PostgresSessionPersistenceRepository(exec);
+    const membership = new InMemoryMembershipStore();
+    const res = await listWorkspaces(listCtx(membership, repo, "carol"));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ workspaces: [] });
+    expect(exec.queryCount).toBe(0);
   });
 });
 

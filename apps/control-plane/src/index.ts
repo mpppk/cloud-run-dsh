@@ -55,6 +55,7 @@ export {
 } from "./forwarding.js";
 export {
   createWorkspace,
+  listWorkspaces,
   getWorkspace,
   deleteWorkspace,
   openWorkspace,

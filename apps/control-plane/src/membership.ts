@@ -18,6 +18,17 @@ export interface MembershipStore {
   removeMember(workspaceId: string, userId: string): Promise<void>;
   /** Lists member user ids. */
   listMembers(workspaceId: string): Promise<string[]>;
+  /**
+   * Lists workspace ids visible to `userId` (issue #137).
+   *
+   * A single filtered lookup — never a full workspace scan. Each backend
+   * derives it from its own source of truth, the same set `isMember` answers
+   * from: the owner column in production (`OwnerMembershipStore`, where the
+   * owner is the only member — shared non-owner members cannot exist in this
+   * milestone because `addMember` rejects them), the member map in memory
+   * (`InMemoryMembershipStore`, where shared members ARE included).
+   */
+  listWorkspaceIdsForUser(userId: string): Promise<string[]>;
 }
 
 export class InMemoryMembershipStore implements MembershipStore {
@@ -42,6 +53,14 @@ export class InMemoryMembershipStore implements MembershipStore {
 
   async listMembers(workspaceId: string): Promise<string[]> {
     return Array.from(this.members.get(workspaceId) ?? []);
+  }
+
+  async listWorkspaceIdsForUser(userId: string): Promise<string[]> {
+    const ids: string[] = [];
+    for (const [workspaceId, members] of this.members) {
+      if (members.has(userId)) ids.push(workspaceId);
+    }
+    return ids;
   }
 }
 

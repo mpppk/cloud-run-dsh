@@ -290,6 +290,19 @@ export class OwnerMembershipStore implements MembershipStore {
     );
     return rows.length === 0 ? [] : [String(rows[0]!["owner_id"])];
   }
+
+  /**
+   * Workspaces visible to `userId` (issue #137 案A): the owner is the only
+   * member, so this is ONE filtered query — never a full-table fetch into
+   * application memory (db-f1-micro connection pressure, issue #109).
+   */
+  async listWorkspaceIdsForUser(userId: string): Promise<string[]> {
+    const rows = await this.executor.query<Record<string, unknown>>(
+      "SELECT id FROM workspaces WHERE owner_id = $1 ORDER BY created_at ASC",
+      [userId],
+    );
+    return rows.map((row) => String(row["id"]));
+  }
 }
 
 // ---------------------------------------------------------------------------
