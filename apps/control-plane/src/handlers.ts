@@ -133,7 +133,8 @@ export const getWorkspace: RouteHandler = async (ctx) => {
  *
  * Two filtered queries, never a full scan or N+1: the MembershipStore
  * resolves visible ids first (`WHERE owner_id = $1` in production, a map
- * scan in memory — 案A), then the rows load with `WHERE id = ANY($1)`.
+ * scan in memory — 案A), then the rows load with `WHERE id IN (...)`
+ * (one bound scalar per id).
  * An empty membership short-circuits to `{ workspaces: [] }` without
  * touching the workspace table at all.
  *

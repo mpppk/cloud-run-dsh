@@ -203,11 +203,12 @@ export class InMemoryFakeExecutor implements QueryExecutor {
       return [] as T[];
     }
     if (lower.startsWith("select") && lower.includes("from workspaces")) {
-      // Issue #137: WHERE id = ANY($1) — exactly the requested rows in one
-      // round trip. Checked BEFORE the `where id =` single-row branch below:
-      // "where id = any($1)" contains "where id =" as a substring.
-      if (lower.includes("where id = any")) {
-        const ids = new Set((params?.[0] as string[]) ?? []);
+      // Issue #137: WHERE id IN ($1, ..., $N) — exactly the requested rows
+      // in one round trip, one bound scalar per id (repository.ts explains
+      // why this is IN and not `= ANY($1)`). Checked BEFORE the `where id =`
+      // single-row branch below, whose prefix this SQL shares.
+      if (lower.includes("where id in (")) {
+        const ids = new Set((params ?? []) as string[]);
         return Array.from(this.tables.workspaces.values())
           .filter((w) => ids.has(w.id))
           .map(toWorkspaceRow) as unknown as T[];

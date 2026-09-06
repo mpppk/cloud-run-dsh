@@ -81,7 +81,7 @@ export interface SessionPersistenceRepository {
   /**
    * Fetches exactly the given workspaces in ONE query (issue #137: the list
    * route resolves visible ids from the MembershipStore first, then loads
-   * the rows with `WHERE id = ANY($1)` — no full scan, no per-row round
+   * the rows with `WHERE id IN (...)` — no full scan, no per-row round
    * trip). Unknown ids are silently skipped. Empty input answers [] without
    * touching the database.
    */
@@ -164,9 +164,15 @@ export class PostgresSessionPersistenceRepository implements SessionPersistenceR
 
   async listWorkspacesByIds(ids: string[]): Promise<Workspace[]> {
     if (ids.length === 0) return [];
+    // One bound scalar per id, NOT `= ANY($1)` with a JS array: Bun.SQL
+    // serializes a JS string array as a bare comma-joined string (no braces),
+    // which real PostgreSQL rejects with 22P02 `malformed array literal`
+    // (measured 2026-09-06 against PG 16; the fake executor hid it). Scalars
+    // bind exactly like the existing `WHERE id = $1`.
+    const placeholders = ids.map((_, i) => `$${i + 1}`).join(", ");
     const rows = await this.executor.query<Record<string, unknown>>(
-      "SELECT * FROM workspaces WHERE id = ANY($1) ORDER BY created_at ASC",
-      [ids],
+      `SELECT * FROM workspaces WHERE id IN (${placeholders}) ORDER BY created_at ASC`,
+      ids,
     );
     return rows.map(rowToWorkspace);
   }

@@ -21,9 +21,12 @@ export interface MembershipStore {
   /**
    * Lists workspace ids visible to `userId` (issue #137).
    *
-   * A single filtered lookup — never a full workspace scan. Backends derive
-   * it from their own source of truth (the owner column in production, the
-   * member map in memory), so shared (non-owner) members are included.
+   * A single filtered lookup — never a full workspace scan. Each backend
+   * derives it from its own source of truth, the same set `isMember` answers
+   * from: the owner column in production (`OwnerMembershipStore`, where the
+   * owner is the only member — shared non-owner members cannot exist in this
+   * milestone because `addMember` rejects them), the member map in memory
+   * (`InMemoryMembershipStore`, where shared members ARE included).
    */
   listWorkspaceIdsForUser(userId: string): Promise<string[]>;
 }

@@ -72,11 +72,12 @@ class FakeExecutor implements QueryExecutor {
   private seq = 0;
 
   async query<T>(sql: string, params: readonly unknown[]): Promise<Record<string, unknown>[]> {
-    if (sql.startsWith("SELECT * FROM workspaces WHERE id = ANY")) {
-      // listWorkspacesByIds (issue #137): exactly the requested rows.
-      // Checked BEFORE the single-row `WHERE id` branch below: the ANY
-      // SQL shares that prefix, and params[0] is a string[] here.
-      const ids = new Set(params[0] as string[]);
+    if (sql.startsWith("SELECT * FROM workspaces WHERE id IN (")) {
+      // listWorkspacesByIds (issue #137): exactly the requested rows, one
+      // bound scalar per id (NOT `= ANY($1)` — Bun.SQL cannot bind a JS
+      // array; see repository.ts). Checked BEFORE the single-row `WHERE id`
+      // branch below, whose prefix this SQL shares.
+      const ids = new Set(params as string[]);
       return [...this.workspaces.values()]
         .filter((w) => ids.has(w["id"] as string))
         .map((w) => structuredClone(w));
@@ -798,7 +799,7 @@ describe("listWorkspaces query shape (issue #137, no N+1)", () => {
     const body = (await res.json()) as { workspaces: Array<{ id: string; ownerId: string }> };
     expect(body.workspaces).toHaveLength(5);
     expect(body.workspaces.every((w) => w.ownerId === "alice")).toBe(true);
-    // Exactly 1 query (WHERE id = ANY($1)) — independent of the count.
+    // Exactly 1 query (WHERE id IN (...)) — independent of the count.
     expect(exec.queryCount).toBe(1);
   });
 
