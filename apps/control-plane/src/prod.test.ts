@@ -419,6 +419,11 @@ class MembershipFakeExecutor implements QueryExecutor {
       const owner = this.owners.get(params[0] as string);
       return (owner === undefined ? [] : [{ owner_id: owner }]) as T[];
     }
+    if (sql === "SELECT id FROM workspaces WHERE owner_id = $1 ORDER BY created_at ASC") {
+      return Array.from(this.owners.entries())
+        .filter(([, owner]) => owner === (params[0] as string))
+        .map(([id]) => ({ id })) as T[];
+    }
     throw new Error(`MembershipFakeExecutor: unhandled query: ${sql}`);
   }
 
@@ -468,6 +473,17 @@ describe("OwnerMembershipStore", () => {
     const store = new OwnerMembershipStore(executor);
     expect(await store.listMembers("ws-1")).toEqual(["alice"]);
     expect(await store.listMembers("ws-unknown")).toEqual([]);
+  });
+
+  test("listWorkspaceIdsForUser returns only the caller's workspaces (issue #137)", async () => {
+    const executor = new MembershipFakeExecutor();
+    executor.owners.set("ws-1", "alice");
+    executor.owners.set("ws-2", "alice");
+    executor.owners.set("ws-3", "bob");
+    const store = new OwnerMembershipStore(executor);
+    expect(await store.listWorkspaceIdsForUser("alice")).toEqual(["ws-1", "ws-2"]);
+    expect(await store.listWorkspaceIdsForUser("bob")).toEqual(["ws-3"]);
+    expect(await store.listWorkspaceIdsForUser("carol")).toEqual([]);
   });
 });
 

@@ -64,6 +64,17 @@ Copy the returned `id` into `WS_ID`:
 WS_ID=<paste the workspace id>
 ```
 
+### 1b. List your workspaces (200)
+
+Returns only workspaces you belong to — never anyone else's. With no
+workspaces the shape is `{"workspaces": []}`. Like the controller status
+read, listing never extends the idle timer:
+
+```bash
+curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" "$BASE/v1/workspaces"
+# {"workspaces":[{"id":"…","ownerId":"alice",…,"runtimeState":"STOPPED",…}]}
+```
+
 ### 2. Open the workspace (200)
 
 ```bash
@@ -160,7 +171,8 @@ is needed.
   localStorage, omitted when empty).
 - Under IAP leave both boxes empty: the proxy injects the headers, so the
   same screen works in production with no code change.
-- There is no workspace list API — created ids are kept in the browser's
+- Your workspaces are listed by `GET /v1/workspaces` (step 1b above);
+  created ids are also kept in the browser's
   localStorage (an "existing id" box imports ids made via curl).
 
 ---

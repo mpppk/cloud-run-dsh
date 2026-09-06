@@ -78,6 +78,14 @@ export interface SessionPersistenceRepository {
   createWorkspace(input: CreateWorkspaceInput): Promise<Workspace>;
   getWorkspace(id: string): Promise<Workspace | null>;
   listWorkspaces(): Promise<Workspace[]>;
+  /**
+   * Fetches exactly the given workspaces in ONE query (issue #137: the list
+   * route resolves visible ids from the MembershipStore first, then loads
+   * the rows with `WHERE id = ANY($1)` — no full scan, no per-row round
+   * trip). Unknown ids are silently skipped. Empty input answers [] without
+   * touching the database.
+   */
+  listWorkspacesByIds(ids: string[]): Promise<Workspace[]>;
   updateWorkspace(id: string, patch: UpdateWorkspacePatch): Promise<Workspace>;
   updateRuntimeState(id: string, runtimeState: Workspace["runtimeState"]): Promise<Workspace>;
   updateLastActivityAt(id: string, lastActivityAt: string): Promise<Workspace>;
@@ -150,6 +158,15 @@ export class PostgresSessionPersistenceRepository implements SessionPersistenceR
   async listWorkspaces(): Promise<Workspace[]> {
     const rows = await this.executor.query<Record<string, unknown>>(
       "SELECT * FROM workspaces ORDER BY created_at ASC",
+    );
+    return rows.map(rowToWorkspace);
+  }
+
+  async listWorkspacesByIds(ids: string[]): Promise<Workspace[]> {
+    if (ids.length === 0) return [];
+    const rows = await this.executor.query<Record<string, unknown>>(
+      "SELECT * FROM workspaces WHERE id = ANY($1) ORDER BY created_at ASC",
+      [ids],
     );
     return rows.map(rowToWorkspace);
   }

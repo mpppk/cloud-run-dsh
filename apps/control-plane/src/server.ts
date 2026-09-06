@@ -25,6 +25,7 @@ interface Route {
 
 const routes: Route[] = [
   { method: "POST", segments: ["v1", "workspaces"], handler: handlers.createWorkspace },
+  { method: "GET", segments: ["v1", "workspaces"], handler: handlers.listWorkspaces },
   { method: "GET", segments: ["v1", "workspaces", ":id"], handler: handlers.getWorkspace },
   { method: "DELETE", segments: ["v1", "workspaces", ":id"], handler: handlers.deleteWorkspace },
   { method: "POST", segments: ["v1", "workspaces", ":id", "open"], handler: handlers.openWorkspace },

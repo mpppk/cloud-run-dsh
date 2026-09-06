@@ -203,6 +203,24 @@ export class InMemoryFakeExecutor implements QueryExecutor {
       return [] as T[];
     }
     if (lower.startsWith("select") && lower.includes("from workspaces")) {
+      // Issue #137: WHERE id = ANY($1) — exactly the requested rows in one
+      // round trip. Checked BEFORE the `where id =` single-row branch below:
+      // "where id = any($1)" contains "where id =" as a substring.
+      if (lower.includes("where id = any")) {
+        const ids = new Set((params?.[0] as string[]) ?? []);
+        return Array.from(this.tables.workspaces.values())
+          .filter((w) => ids.has(w.id))
+          .map(toWorkspaceRow) as unknown as T[];
+      }
+      // Issue #137 案A: OwnerMembershipStore.listWorkspaceIdsForUser.
+      // Filtered here — falling through to the return-all below would leak
+      // other owners' workspaces into the list.
+      if (lower.includes("where owner_id =")) {
+        const ownerId = params?.[0] as string;
+        return Array.from(this.tables.workspaces.values())
+          .filter((w) => w.ownerId === ownerId)
+          .map(toWorkspaceRow) as unknown as T[];
+      }
       const idParam = params?.[0] as string | undefined;
       if (idParam && lower.includes("where id =")) {
         const w = this.tables.workspaces.get(idParam);
