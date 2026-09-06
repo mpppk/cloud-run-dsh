@@ -195,6 +195,9 @@ export class InMemoryFakeExecutor implements QueryExecutor {
         instanceName: (params?.[5] as string | null) ?? null,
         instanceUrl: (params?.[6] as string | null) ?? null,
         runtimeState: (params?.[7] as Workspace["runtimeState"]) ?? "STOPPED",
+        // 0002_last_error.sql defaults new rows to NULL; the fake mirrors it
+        // so pre-migration and post-migration shapes agree here too.
+        lastError: null,
         lastActivityAt: (params?.[8] as string | null) ?? null,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -268,6 +271,9 @@ export class InMemoryFakeExecutor implements QueryExecutor {
             break;
           case "instance_url":
             (next as unknown as Record<string, unknown>)["instanceUrl"] = val;
+            break;
+          case "last_error":
+            (next as unknown as Record<string, unknown>)["lastError"] = val;
             break;
           case "owner_id":
             (next as unknown as Record<string, unknown>)["ownerId"] = val;
@@ -524,6 +530,7 @@ function toWorkspaceRow(w: Workspace): Record<string, unknown> {
     instance_name: w.instanceName,
     instance_url: w.instanceUrl,
     runtime_state: w.runtimeState,
+    last_error: w.lastError,
     last_activity_at: w.lastActivityAt,
     created_at: w.createdAt,
     updated_at: w.updatedAt,

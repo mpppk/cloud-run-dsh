@@ -17,6 +17,11 @@ export {
 } from "./connection.js";
 export type { BunSqlConnectionTarget, BunSqlPoolOptions, BunSqlSocketOptions } from "./connection.js";
 export { PostgresSessionPersistenceRepository, type SessionPersistenceRepository } from "./repository.js";
+export {
+  RESTORE_ERROR_EMPTY_FALLBACK,
+  RESTORE_ERROR_MAX_LENGTH,
+  summarizeRestoreError,
+} from "./restore-error.js";
 export { PostgresSessionPersistence, type SessionPersistence } from "./sessionPersistence.js";
 
 // Legacy placeholder (kept for compatibility with T1 skeleton)

@@ -626,6 +626,47 @@ describe("getInstanceUrl — the #22 forwarding seam", () => {
   });
 });
 
+describe("handle.describeInstance — the #141 fast-fail probe", () => {
+  test("missing Instance (GET 404) reports exists:false with exactly one GET", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(async () => ({ status: 404, body: { message: "not found" } }));
+    const handle = await makeRegistry(h).get(workspace);
+    expect(handle.describeInstance).toBeDefined();
+    expect(await handle.describeInstance!()).toEqual({ exists: false });
+    // One GET, never a poll: the #136 案C rejection (no background CPU)
+    // applies to this probe too.
+    expect(h.transport.requests.map((r) => `${r.method} ${r.url}`)).toEqual([
+      `GET ${BASE_PATH}/instances/dsh-ws-1`,
+    ]);
+  });
+
+  test("FAILED Instance reports its state; READY reports READY (both defer/fail upstream)", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(async () => ({
+      status: 200,
+      body: { name: "dsh-ws-1", terminalCondition: { state: "CONDITION_FAILED" } },
+    }));
+    const handle = await makeRegistry(h).get(workspace);
+    expect(await handle.describeInstance!()).toEqual({ exists: true, state: "FAILED" });
+
+    h.transport.setHandler(async () => ({
+      status: 200,
+      body: instanceBody("dsh-ws-1", "https://dsh-ws-1.run.app"),
+    }));
+    expect(await handle.describeInstance!()).toEqual({ exists: true, state: "READY" });
+  });
+
+  test("transient API failure throws (the caller defers — unknown is never failed)", async () => {
+    const h = makeHarness();
+    const workspace = await seedWorkspace(h.repo);
+    h.transport.setHandler(async () => ({ status: 500, body: { message: "boom" } }));
+    const handle = await makeRegistry(h).get(workspace);
+    await expect(handle.describeInstance!()).rejects.toThrow(/boom/);
+  });
+});
+
 describe("handle.deleteInstance — the #85 GC seam", () => {
   test("issues DELETE for the workspace's own Instance name", async () => {
     const h = makeHarness();
@@ -974,6 +1015,7 @@ describe("buildInstanceEnv — agent-host env contract", () => {
       instanceName: null,
       instanceUrl: null,
       runtimeState: "STOPPED",
+      lastError: null,
       lastActivityAt: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -1032,6 +1074,7 @@ describe("buildInstanceEnv — agent-host env contract", () => {
       instanceName: null,
       instanceUrl: null,
       runtimeState: "STOPPED",
+      lastError: null,
       lastActivityAt: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -1054,6 +1097,7 @@ describe("buildInstanceEnv — agent-host env contract", () => {
       instanceName: null,
       instanceUrl: null,
       runtimeState: "STOPPED",
+      lastError: null,
       lastActivityAt: null,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),

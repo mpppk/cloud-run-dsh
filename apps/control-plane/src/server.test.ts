@@ -41,6 +41,7 @@ import { listWorkspaces } from "./handlers.js";
 import type { Clock } from "@cloud-run-dsh/workspace-checkpoint";
 import { createDbReadinessProbe } from "./prod-adapters.js";
 import { STALE_STARTING_THRESHOLD_MS } from "./handlers.js";
+import { FAST_FAIL_INSTANCE_GRACE_MS } from "./handlers.js";
 import {
   badRequest,
   createControlPlaneDeps,
@@ -53,8 +54,8 @@ import {
   type ControlPlaneClock,
   type ControlPlaneDeps,
   type WorkspaceRuntimeHandle,
+  type InstanceDiagnostic,
 } from "./index.js";
-
 // ---------------------------------------------------------------------------
 // Test doubles
 // ---------------------------------------------------------------------------
@@ -86,6 +87,13 @@ class FakeExecutor implements QueryExecutor {
     if (sql.startsWith("SELECT * FROM workspaces WHERE id")) {
       const w = this.workspaces.get(params[0] as string);
       return w ? [structuredClone(w)] : [];
+    }
+    if (sql.startsWith("SELECT runtime_state FROM workspaces WHERE id")) {
+      // markRestoreFailedIfStarting CAS read (issue #141): row lock is a
+      // no-op in the fake (transactions run inline), but the state value
+      // must behave identically so the CAS precondition is really tested.
+      const w = this.workspaces.get(params[0] as string);
+      return w ? [{ runtime_state: w["runtime_state"] }] : [];
     }
     if (sql.startsWith("SELECT * FROM workspaces")) {
       // listWorkspaces (issue #85): no WHERE clause — every row.
@@ -142,6 +150,8 @@ class FakeExecutor implements QueryExecutor {
         instance_name: instanceName,
         instance_url: instanceUrl,
         runtime_state: runtimeState,
+        // 0002_last_error.sql defaults new rows to NULL.
+        last_error: null,
         last_activity_at: null,
         created_at: now,
         updated_at: now,
@@ -299,6 +309,14 @@ class FakeHandle implements WorkspaceRuntimeHandle {
   async getInstanceUrl(): Promise<string | null> {
     return this.instanceUrl;
   }
+
+  /**
+   * Issue #141 fast-fail probe stub. Unset by default: the seam is ABSENT
+   * (like the dev handle), so tests without it exercise the legacy
+   * defer-to-stale-rule path. Tests set it to a fixed diagnostic (or a
+   * thrower for transient-lookup coverage).
+   */
+  describeInstance?: () => Promise<InstanceDiagnostic>;
 
   async deleteInstance(): Promise<void> {
     this.deleteCalls++;
@@ -1936,13 +1954,176 @@ describe("async open (issue #136)", () => {
       backdateUpdatedAt(h, ws.id, STALE_STARTING_THRESHOLD_MS + 60_000);
       const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`);
       expect(((await res.json()) as { runtimeState: string }).runtimeState).toBe("RESTORE_FAILED");
+      // The stale mark records its reason on the row (issue #141 案1).
+      expect((await h.repo.getWorkspace(ws.id))!.lastError).toContain("no progress for 10m");
     } finally {
       h.stop();
     }
   });
 
-  test("open on a stale STARTING row fails it first, then retries into STARTING", async () => {
-    const h = startHarness();
+  // -----------------------------------------------------------------------
+  // Issue #141 — fast fail (案2) + reason on the row (案1) + CAS hardening
+  // -----------------------------------------------------------------------
+
+  describe("restore failure diagnosis (issue #141)", () => {
+    /** Pins a handle whose single-GET probe answers the fixed diagnostic. */
+    function pinProbedHandle(h: TestHarness, workspaceId: string, diagnostic: InstanceDiagnostic | "throw"): FakeHandle {
+      const handle = pinStartingHandle(h, workspaceId);
+      handle.describeInstance =
+        diagnostic === "throw"
+          ? async () => {
+              throw new Error("Instances API flaked (transient)");
+            }
+          : async () => diagnostic;
+      return handle;
+    }
+
+    test("missing Instance fails fast with a reason, without waiting 10 minutes", async () => {
+      const h = startHarness();
+      try {
+        const ws = await h.createWorkspace("alice");
+        pinProbedHandle(h, ws.id, { exists: false });
+        await h.repo.updateWorkspace(ws.id, { runtimeState: "STARTING" });
+        // Past the 2-minute probe grace but far short of the 10-minute rule.
+        backdateUpdatedAt(h, ws.id, FAST_FAIL_INSTANCE_GRACE_MS + 60_000);
+        const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`);
+        expect(res.status).toBe(200);
+        expect(((await res.json()) as { runtimeState: string }).runtimeState).toBe(
+          "RESTORE_FAILED",
+        );
+        const row = (await h.repo.getWorkspace(ws.id))!;
+        expect(row.runtimeState).toBe("RESTORE_FAILED");
+        expect(row.lastError).toContain("not found");
+        expect(row.lastError).toContain(`dsh-${ws.id}`);
+      } finally {
+        h.stop();
+      }
+    });
+
+    test("FAILED Instance fails fast with a reason", async () => {
+      const h = startHarness();
+      try {
+        const ws = await h.createWorkspace("alice");
+        pinProbedHandle(h, ws.id, { exists: true, state: "FAILED" });
+        await h.repo.updateWorkspace(ws.id, { runtimeState: "RESTORING" });
+        backdateUpdatedAt(h, ws.id, FAST_FAIL_INSTANCE_GRACE_MS + 60_000);
+        const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`);
+        expect(((await res.json()) as { runtimeState: string }).runtimeState).toBe(
+          "RESTORE_FAILED",
+        );
+        expect((await h.repo.getWorkspace(ws.id))!.lastError).toContain("is FAILED");
+      } finally {
+        h.stop();
+      }
+    });
+
+    test("fresh missing Instance still reads as preparing (create is in flight)", async () => {
+      const h = startHarness();
+      try {
+        const ws = await h.createWorkspace("alice");
+        pinProbedHandle(h, ws.id, { exists: false });
+        await h.repo.updateWorkspace(ws.id, { runtimeState: "STARTING" });
+        // Within the grace: the row just moved; the create may not have
+        // landed yet. Must NOT fail — this is every healthy open's shape.
+        const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`);
+        expect(((await res.json()) as { runtimeState: string }).runtimeState).toBe("STARTING");
+        expect((await h.repo.getWorkspace(ws.id))!.lastError).toBeNull();
+      } finally {
+        h.stop();
+      }
+    });
+
+    test("#121 shape: old STARTING row with a live-but-unready Instance defers to the 10-minute rule", async () => {
+      const h = startHarness();
+      try {
+        const ws = await h.createWorkspace("alice");
+        // Stop-then-open keeps its EXISTING Instance: present, still
+        // starting — the probe must not fail it, however old the row.
+        pinProbedHandle(h, ws.id, { exists: true, state: "PENDING" });
+        await h.repo.updateWorkspace(ws.id, { runtimeState: "STARTING" });
+        backdateUpdatedAt(h, ws.id, STALE_STARTING_THRESHOLD_MS - 60_000);
+        const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`);
+        expect(((await res.json()) as { runtimeState: string }).runtimeState).toBe("STARTING");
+        expect((await h.repo.getWorkspace(ws.id))!.lastError).toBeNull();
+      } finally {
+        h.stop();
+      }
+    });
+
+    test("transient probe failure defers (unknown is never failed)", async () => {
+      const h = startHarness();
+      try {
+        const ws = await h.createWorkspace("alice");
+        pinProbedHandle(h, ws.id, "throw");
+        await h.repo.updateWorkspace(ws.id, { runtimeState: "STARTING" });
+        backdateUpdatedAt(h, ws.id, FAST_FAIL_INSTANCE_GRACE_MS + 60_000);
+        const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`);
+        expect(((await res.json()) as { runtimeState: string }).runtimeState).toBe("STARTING");
+      } finally {
+        h.stop();
+      }
+    });
+
+    test("no probe seam defers to the stale rule (dev handle shape)", async () => {
+      const h = startHarness();
+      try {
+        const ws = await h.createWorkspace("alice");
+        // Deliberately no describeInstance: the factory-built FakeHandle has
+        // no probe, exactly like the dev-server handle.
+        pinStartingHandle(h, ws.id);
+        await h.repo.updateWorkspace(ws.id, { runtimeState: "STARTING" });
+        backdateUpdatedAt(h, ws.id, FAST_FAIL_INSTANCE_GRACE_MS + 60_000);
+        const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`);
+        expect(((await res.json()) as { runtimeState: string }).runtimeState).toBe("STARTING");
+      } finally {
+        h.stop();
+      }
+    });
+
+    test("late agent-host READY between read and mark is served, never clobbered (CAS)", async () => {
+      const h = startHarness();
+      try {
+        const ws = await h.createWorkspace("alice");
+        pinStartingHandle(h, ws.id);
+        await h.repo.updateWorkspace(ws.id, { runtimeState: "STARTING" });
+        backdateUpdatedAt(h, ws.id, STALE_STARTING_THRESHOLD_MS + 60_000);
+        // Stage the race: the agent-host persists READY after our GET read
+        // but before the CAS mark. The mark then finds no STARTING row and
+        // must serve the winner.
+        const realMark = h.deps.repo.markRestoreFailedIfStarting.bind(h.deps.repo);
+        h.deps.repo.markRestoreFailedIfStarting = (async (id: string, reason: string) => {
+          await h.repo.updateWorkspace(id, { runtimeState: "READY" });
+          return realMark(id, reason);
+        }) as typeof h.deps.repo.markRestoreFailedIfStarting;
+        const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`);
+        expect(((await res.json()) as { runtimeState: string }).runtimeState).toBe("READY");
+        expect((await h.repo.getWorkspace(ws.id))!.runtimeState).toBe("READY");
+      } finally {
+        h.stop();
+      }
+    });
+
+    test("reasons never carry secrets: fixed templates only (no error text echoed)", async () => {
+      const h = startHarness();
+      try {
+        const ws = await h.createWorkspace("alice");
+        // A probe error carrying secret-shaped text must not reach the row:
+        // lookup failures defer, and marks use fixed templates.
+        pinProbedHandle(h, ws.id, "throw");
+        await h.repo.updateWorkspace(ws.id, { runtimeState: "STARTING" });
+        backdateUpdatedAt(h, ws.id, STALE_STARTING_THRESHOLD_MS + 60_000);
+        await h.fetchAs("alice", `/v1/workspaces/${ws.id}`);
+        const row = (await h.repo.getWorkspace(ws.id))!;
+        expect(row.runtimeState).toBe("RESTORE_FAILED");
+        expect(row.lastError ?? "").not.toContain("transient");
+        expect(row.lastError).toContain("no progress for 10m");
+      } finally {
+        h.stop();
+      }
+    });
+  });
+
+  test("open on a stale STARTING row fails it first, then retries into STARTING", async () => {    const h = startHarness();
     try {
       const ws = await h.createWorkspace("alice");
       const handle = pinStartingHandle(h, ws.id);

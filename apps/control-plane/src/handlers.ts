@@ -178,23 +178,51 @@ export const STALE_STARTING_THRESHOLD_MS = 10 * 60 * 1000;
 const STALE_STARTING_STATES: readonly Workspace["runtimeState"][] = ["STARTING", "RESTORING"];
 
 /**
- * Issue #136 案A: fails a STARTING / RESTORING workspace whose row has not
- * moved for longer than STALE_STARTING_THRESHOLD_MS.
+ * Issue #141 案2: grace before the single-GET Instance probe may fail a row.
  *
- * Why HERE and not in a background waiter: the control plane runs on Cloud
- * Run WITHOUT --no-cpu-throttling, so anything running after the response
- * is throttled (案C was rejected for exactly this). Judging staleness at
- * read time needs no background CPU at all.
+ * A fresh STARTING row MUST NOT fail when its Instance is momentarily
+ * missing: openInstance() moves the row to STARTING BEFORE the synchronous
+ * create-then-start, so every healthy open has a seconds-long window with a
+ * missing Instance. 2 minutes mirrors the removed sync poll's Instance-READY
+ * budget (60 polls x 2s) — a legitimate open always has a live Instance by
+ * then (create runs inside the open request; a failed create rejects the
+ * request and records RESTORE_FAILED in-request instead of stranding
+ * STARTING). Well below the 10-minute stale threshold, and safe for #121:
+ * the 3-minute stop-then-open case keeps its EXISTING Instance the whole
+ * time (it restarts; it is never missing or FAILED), so this grace can only
+ * defer it to the unchanged stale rule, never fail it.
+ */
+export const FAST_FAIL_INSTANCE_GRACE_MS = 2 * 60 * 1000;
+
+/**
+ * Issue #136 案A + issue #141 (案1 fast-fail + reason, CAS hardening):
+ * fails a STARTING / RESTORING workspace nobody is advancing.
+ *
+ * Two ordered judgments, both persisting a sanitized reason into
+ * `workspaces.last_error` (read the row or the structured log — the public
+ * DTO deliberately carries no reason, so the product UI can never render
+ * the raw technical text per #138):
+ *
+ * 1. FAST (案2): past FAST_FAIL_INSTANCE_GRACE_MS, exactly ONE Instances
+ *    API GET (never a poll, never background work — the #136 案C rejection
+ *    still holds: no --no-cpu-throttling, so nothing runs after the
+ *    response). An Instance that does not exist, or that reports FAILED, is
+ *    definitive: fail now instead of waiting out the 10 minutes. A present
+ *    but unready Instance (PENDING, READY-but-restoring, UNKNOWN) or a
+ *    failed lookup defers to judgment 2 — the probe never fails the row on
+ *    "unknown".
+ * 2. STALE (案A, unchanged timing): older than STALE_STARTING_THRESHOLD_MS
+ *    with no state advancement — no process is alive to advance it.
+ *
+ * Both writes go through markRestoreFailedIfStarting (compare-and-set on
+ * STARTING / RESTORING): a late agent-host READY that lands between our
+ * read and the write is observed (null) and served — never clobbered back
+ * to RESTORE_FAILED. That closes the blind-write race #140 accepted as
+ * negligible.
  *
  * Returns the workspace to serve (the failed row when marked, the input
  * otherwise). Never fails on an unreadable updated_at — unknown freshness
  * reads as "still preparing", never as failed.
- *
- * Race note: updateWorkspace is a blind write, so an agent-host persisting
- * READY between our read and this write would be clobbered back to
- * RESTORE_FAILED. That requires a legitimate restore to take >10 minutes
- * AND land in that instant — accepted as negligible, and the next GET would
- * then let a retry re-open from RESTORE_FAILED anyway.
  */
 export async function failStaleStartingWorkspace(
   deps: ControlPlaneDeps,
@@ -203,15 +231,90 @@ export async function failStaleStartingWorkspace(
   if (!STALE_STARTING_STATES.includes(workspace.runtimeState)) return workspace;
   const updatedMs = Date.parse(workspace.updatedAt);
   if (Number.isNaN(updatedMs)) return workspace;
-  if (deps.clock.now().getTime() - updatedMs <= STALE_STARTING_THRESHOLD_MS) {
+  const ageMs = deps.clock.now().getTime() - updatedMs;
+
+  if (ageMs > FAST_FAIL_INSTANCE_GRACE_MS) {
+    const fastReason = await probeInstanceFailureOnce(deps, workspace);
+    if (fastReason !== null) {
+      deps.logger?.info("control-plane.open.fast-fail-starting", {
+        workspaceId: workspace.id,
+        runtimeState: workspace.runtimeState,
+        instanceName: workspace.instanceName ?? `dsh-${workspace.id}`,
+        reason: fastReason,
+      });
+      return markOrServeWinner(deps, workspace, fastReason);
+    }
+  }
+
+  if (ageMs <= STALE_STARTING_THRESHOLD_MS) {
     return workspace;
   }
+  const staleReason =
+    `no progress for 10m while ${workspace.runtimeState} ` +
+    `(agent-host never reported READY; instance was present but unready, or the lookup failed)`;
   deps.logger?.info("control-plane.open.stale-starting-failed", {
     workspaceId: workspace.id,
     runtimeState: workspace.runtimeState,
     updatedAt: workspace.updatedAt,
+    reason: staleReason,
   });
-  return deps.repo.updateWorkspace(workspace.id, { runtimeState: "RESTORE_FAILED" });
+  return markOrServeWinner(deps, workspace, staleReason);
+}
+
+/**
+ * CAS mark with read-the-winner fallback. `reason` is always a fixed
+ * template (instance name + probe outcome) — no error text, no URLs, no
+ * secrets to redact.
+ */
+async function markOrServeWinner(
+  deps: ControlPlaneDeps,
+  workspace: Workspace,
+  reason: string,
+): Promise<Workspace> {
+  const marked = await deps.repo.markRestoreFailedIfStarting(workspace.id, reason);
+  if (marked) return marked;
+  // Lost the race: the row moved (typically a late agent-host READY) — serve
+  // the winner's state instead of clobbering it.
+  const current = await deps.repo.getWorkspace(workspace.id);
+  return current ?? workspace;
+}
+
+/**
+ * Issue #141 案2: one read-triggered Instances API GET, at most one per
+ * failStaleStartingWorkspace call. Returns a fixed-template reason when the
+ * probe is DEFINITIVE (missing / FAILED), null when it defers (seam absent,
+ * lookup failed, Instance present but unready). Never throws: every
+ * "unknown" — including a factory that cannot build a handle here — reads
+ * as "still preparing".
+ */
+async function probeInstanceFailureOnce(
+  deps: ControlPlaneDeps,
+  workspace: Workspace,
+): Promise<string | null> {
+  let handle: Awaited<ReturnType<ControlPlaneDeps["runtimes"]["get"]>>;
+  try {
+    handle = await deps.runtimes.get(workspace);
+  } catch {
+    return null;
+  }
+  if (!handle.describeInstance) return null;
+  let diagnostic: Awaited<ReturnType<NonNullable<typeof handle.describeInstance>>>;
+  try {
+    diagnostic = await handle.describeInstance();
+  } catch {
+    // Transient lookup failure (network/auth): unknown, not failed.
+    return null;
+  }
+  // Same naming rule as the production factory's defaultInstanceName
+  // (`dsh-<workspace-id>` when the row carries no name yet).
+  const instanceName = workspace.instanceName ?? `dsh-${workspace.id}`;
+  if (!diagnostic.exists) {
+    return `instance ${instanceName} not found (never created or already deleted)`;
+  }
+  if (diagnostic.state === "FAILED") {
+    return `instance ${instanceName} is FAILED`;
+  }
+  return null;
 }
 
 export const openWorkspace: RouteHandler = async (ctx) => {

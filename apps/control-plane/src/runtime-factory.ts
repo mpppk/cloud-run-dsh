@@ -90,7 +90,7 @@ import type {
   Workspace,
 } from "@cloud-run-dsh/session-persistence-postgres";
 import { RuntimeRegistry, WorkspaceRuntimeHandleAdapter } from "./deps.js";
-import type { ControlPlaneClock } from "./deps.js";
+import type { ControlPlaneClock, InstanceDiagnostic } from "./deps.js";
 import type { ControlPlaneConfig } from "./config.js";
 import { conflict } from "./errors.js";
 import type { ForwardIdentity, MessageForwarder } from "./forwarding.js";
@@ -555,6 +555,21 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
       lastKnownUrl = current?.instanceUrl ?? null;
       return lastKnownUrl;
     };
+    // Issue #141 案2: the single-GET Instance probe behind
+    // WorkspaceRuntimeHandle.describeInstance. Exactly one client.get per
+    // call — no polling, no retry, no row write. A missing Instance resolves
+    // to { exists: false }; any other lookup failure THROWS so the caller
+    // can tell "unknown" (defer to the stale rule) apart from "missing"
+    // (fail fast). Never fabricates a state.
+    const describeInstance = async (): Promise<InstanceDiagnostic> => {
+      try {
+        const info = await client.get(instanceName);
+        return { exists: true, state: info.state };
+      } catch (e) {
+        if (e instanceof InstanceNotFoundError) return { exists: false };
+        throw e;
+      }
+    };
     // Issue #85: Instance deletion for the stopped-instance reaper and
     // DELETE /v1/workspaces/:id. Idempotent: a missing Instance resolves
     // successfully — the desired end state (no Instance) already holds, the
@@ -573,6 +588,7 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
       instanceUrlProvider,
       identitySink,
       deleteInstance,
+      describeInstance,
     );
   });
 }

@@ -237,6 +237,47 @@ export function defineRepositorySuite(
       expect(events.length).toBe(0);
     });
 
+    // Issue #141: workspaces.last_error round-trips through updateWorkspace
+    // (set + clear) and the CAS fail helper. Runs against BOTH backends, so
+    // the SQL is proven on real PostgreSQL, not just the fake.
+    test("last_error round-trips: null by default, settable, clearable", async () => {
+      const { repo, ws } = await setupWorkspaceAndSession(await makeExecutor());
+      expect((await repo.getWorkspace(ws.id))!.lastError).toBeNull();
+
+      const failed = await repo.updateWorkspace(ws.id, { lastError: "instance dsh-x not found" });
+      expect(failed.lastError).toBe("instance dsh-x not found");
+      expect((await repo.getWorkspace(ws.id))!.lastError).toBe("instance dsh-x not found");
+
+      // Setting the state alone leaves the reason untouched.
+      const moved = await repo.updateWorkspace(ws.id, { runtimeState: "STARTING" });
+      expect(moved.lastError).toBe("instance dsh-x not found");
+
+      const cleared = await repo.updateWorkspace(ws.id, { lastError: null });
+      expect(cleared.lastError).toBeNull();
+      expect((await repo.getWorkspace(ws.id))!.lastError).toBeNull();
+    });
+
+    test("markRestoreFailedIfStarting CAS: marks, then refuses once moved", async () => {
+      const { repo, ws } = await setupWorkspaceAndSession(await makeExecutor());
+      await repo.updateWorkspace(ws.id, { runtimeState: "STARTING" });
+
+      const marked = await repo.markRestoreFailedIfStarting(ws.id, "instance dsh-x not found");
+      expect(marked).not.toBeNull();
+      expect(marked!.runtimeState).toBe("RESTORE_FAILED");
+      expect(marked!.lastError).toBe("instance dsh-x not found");
+
+      // Second mark on the terminal row is a no-op (null), not a rewrite.
+      expect(await repo.markRestoreFailedIfStarting(ws.id, "other")).toBeNull();
+      expect((await repo.getWorkspace(ws.id))!.lastError).toBe("instance dsh-x not found");
+
+      // A late READY (the accepted #140 race) is never clobbered back.
+      await repo.updateWorkspace(ws.id, { runtimeState: "READY" });
+      expect(await repo.markRestoreFailedIfStarting(ws.id, "late")).toBeNull();
+      const winner = (await repo.getWorkspace(ws.id))!;
+      expect(winner.runtimeState).toBe("READY");
+      expect(winner.lastError).toBe("instance dsh-x not found");
+    });
+
     test("checkpoint audit: every record appends one row, even for the same key (issue #110)", async () => {
       const { repo, ws } = await setupWorkspaceAndSession(await makeExecutor());
       expect(await repo.listCheckpoints(ws.id)).toEqual([]);

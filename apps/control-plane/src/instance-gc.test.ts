@@ -455,6 +455,7 @@ describe("pre-delete re-read (TOCTOU: never delete a live Instance)", () => {
       instanceName: "dsh-ws-gone",
       instanceUrl: "https://ws-gone.run.app",
       runtimeState: "STOPPED",
+      lastError: null,
       lastActivityAt: null,
       createdAt: OLD_ISO,
       updatedAt: OLD_ISO,
