@@ -1,0 +1,39 @@
+body { font-family: system-ui, sans-serif; max-width: 960px; margin: 0 auto; padding: 1rem; }
+section { border: 1px solid #ccc; border-radius: 8px; padding: 0.75rem 1rem; margin: 1rem 0; }
+.hint { color: #555; font-size: 0.9em; }
+button { margin: 2px; }
+input { margin: 2px; }
+
+/* workspace list */
+#ws-list { list-style: none; padding-left: 0; }
+#ws-list li { border-bottom: 1px solid #eee; padding: 6px 4px; }
+.ws-repo { font-weight: bold; }
+.ws-status { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.85em; margin-left: 6px; }
+.ws-ready { background: #d4edda; color: #155724; }
+.ws-working { background: #fff3cd; color: #856404; }
+.ws-stopped { background: #eee; color: #555; }
+.ws-failed { background: #f8d7da; color: #721c24; }
+
+/* status banner on the conversation screen */
+.banner { padding: 6px 12px; border-radius: 6px; margin: 8px 0; }
+.banner-hidden { display: none; }
+.banner-working { background: #fff3cd; color: #856404; }
+.banner-stopped { background: #eee; color: #555; }
+.banner-failed { background: #f8d7da; color: #721c24; }
+.banner-readonly { background: #f8d7da; color: #721c24; font-weight: bold; }
+
+/* conversation */
+#messages { list-style: none; padding-left: 0; }
+#messages li { padding: 6px 10px; border-radius: 8px; margin: 6px 0; word-break: break-word; }
+.msg-user { background: #e8f5e9; text-align: right; }
+.msg-assistant { background: #e8f4fd; }
+.msg-tool { background: #fafafa; color: #555; font-size: 0.85em; }
+.msg-system { background: #efebe9; color: #555; font-size: 0.85em; }
+.msg-approval { background: #fce4ec; }
+.msg-approval .approval-buttons { margin-top: 6px; }
+.msg-approval button { margin-right: 6px; }
+.msg-approval.decided { opacity: 0.75; }
+
+/* composer */
+#composer { margin-top: 12px; }
+#stream-state { margin-top: 6px; }

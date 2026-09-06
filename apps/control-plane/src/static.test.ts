@@ -1,10 +1,10 @@
-// Tests for the debug Web UI delivery (issue #128) and its SSE parser.
+// Tests for the debug Web UI delivery (issue #128) and the shared SSE parser.
 //
 // The static allowlist (src/static.ts) must serve the UI without auth while
 // leaving every existing route's behavior untouched — in particular unknown
-// paths must still 401 before auth, never HTML. The SSE parser in
-// public/app.js is imported directly (the file only touches `document`
-// inside a guarded boot(), so it loads cleanly under bun test).
+// paths must still 401 before auth, never HTML. The shared SSE parser in
+// public/sse.js is imported directly (it touches neither DOM nor fetch, so
+// it loads cleanly under bun test).
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { join } from "node:path";
@@ -12,7 +12,8 @@ import type { ActivityKind } from "@cloud-run-dsh/workspace-runtime";
 import { createDevControlPlaneDeps } from "./dev.js";
 import { startControlPlane, type RunningControlPlane } from "./server.js";
 import type { ControlPlaneDeps, WorkspaceRuntimeHandle } from "./index.js";
-import { createSseParser, leaseRole, parseSseChunks } from "../public/app.js";
+import { leaseRole } from "../public/app.js";
+import { createSseParser, parseSseChunks } from "../public/sse.js";
 
 let deps: ControlPlaneDeps;
 let server: RunningControlPlane;
@@ -92,6 +93,21 @@ describe("static UI delivery (issue #128)", () => {
     expect(res.headers.get("content-type")).toBe("text/css; charset=utf-8");
   });
 
+  test("GET /ui/sse.js -> 200 text/javascript (shared parser, issue #138)", async () => {
+    const res = await fetch(`${base}/ui/sse.js`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/javascript; charset=utf-8");
+    expect(await res.text()).toContain("parseSseChunks");
+  });
+
+  test("debug app.js shares the parser instead of copying it", async () => {
+    const js = await Bun.file(join(import.meta.dir, "..", "public", "app.js")).text();
+    expect(js).toContain('from "./sse.js"');
+    // No second copy of the parser implementation lives in app.js.
+    expect(js).not.toContain("function parseSseChunks");
+    expect(js).not.toContain("function createSseParser");
+  });
+
   test("HEAD / -> 200 with an empty body", async () => {
     const res = await fetch(`${base}/`, { method: "HEAD" });
     expect(res.status).toBe(200);
@@ -143,8 +159,8 @@ describe("static UI delivery (issue #128)", () => {
     expect(read.status).toBe(200);
   });
 
-  test("public/ ships all three files", async () => {
-    for (const file of ["index.html", "app.js", "app.css"]) {
+  test("public/ ships all four files", async () => {
+    for (const file of ["index.html", "app.js", "app.css", "sse.js"]) {
       const f = Bun.file(join(import.meta.dir, "..", "public", file));
       expect(await f.exists()).toBe(true);
     }
@@ -167,7 +183,7 @@ describe("static UI delivery (issue #128)", () => {
     const spy = new ActivitySpy();
     deps.runtimes.set(ws.id, spy);
 
-    for (const path of ["/", "/ui", "/ui/", "/ui/app.js", "/ui/app.css"]) {
+    for (const path of ["/", "/ui", "/ui/", "/ui/app.js", "/ui/app.css", "/ui/sse.js"]) {
       expect((await fetch(`${base}${path}`)).status).toBe(200);
     }
     expect((await fetch(`${base}/`, { method: "HEAD" })).status).toBe(200);
@@ -230,7 +246,7 @@ describe("leaseRole in public/app.js (issues #130 + #133)", () => {
   });
 });
 
-describe("SSE parser in public/app.js", () => {
+describe("SSE parser in public/sse.js", () => {
   test("several events in one chunk", () => {
     const parser = createSseParser();
     const out = parseSseChunks(
