@@ -16,6 +16,7 @@ import {
   NotLeaseOwnerError,
 } from "@cloud-run-dsh/controller-lease";
 import type { Session, Workspace } from "@cloud-run-dsh/session-persistence-postgres";
+import { summarizeRestoreError } from "@cloud-run-dsh/session-persistence-postgres";
 import { ApiError, badGateway, badRequest, conflict, notFound } from "./errors.js";
 import {
   AgentHostConflictError,
@@ -350,11 +351,55 @@ export const openWorkspace: RouteHandler = async (ctx) => {
   // STARTING) and answers 202; the agent-host persists READY on the shared
   // row, which the client observes by polling GET /v1/workspaces/:id.
   const handle = await ctx.deps.runtimes.get(current, controllerId);
-  const state = await handle.open();
+  let state: string;
+  try {
+    state = await handle.open();
+  } catch (e) {
+    // In-request open failure (auth, Instances API error, quota — the most
+    // common bring-up failure): the T8 runtime already moved the row to
+    // RESTORE_FAILED via recordFailureStateBestEffort, but that path writes
+    // state only, leaving last_error NULL. Fill in the sanitized reason here
+    // (best-effort — the original error is always rethrown as 500).
+    await recordInRequestOpenFailureBestEffort(ctx.deps, current.id, e);
+    throw e;
+  }
   // 202 while the agent-host phase is still outstanding; 200 when the open
   // was an idempotent no-op on an already-READY workspace.
   return json({ workspaceId: current.id, state }, state === "READY" ? 200 : 202);
 };
+
+/**
+ * Best-effort reason write for an in-request `handle.open()` failure.
+ *
+ * - The reason ALWAYS goes through summarizeRestoreError() (the #144
+ *   no-secrets invariant: every last_error writer uses this choke point).
+ * - The write is CAS via recordRestoreErrorIfFailed: it fills the reason
+ *   when the row is STARTING / RESTORING (T8 lost its own race) or
+ *   RESTORE_FAILED-with-NULL (the normal T8-already-moved case), and is a
+ *   no-op on READY / STOPPED / already-reasoned rows — a late agent-host
+ *   READY is never clobbered and a first writer's reason is never
+ *   overwritten. No state is written twice in the common case.
+ * - Never throws and never replaces the original error: a failed record
+ *   still answers the original 500 + errorId (the response body never
+ *   carries the reason — internals stay in the row and the structured log).
+ */
+async function recordInRequestOpenFailureBestEffort(
+  deps: ControlPlaneDeps,
+  workspaceId: string,
+  error: unknown,
+): Promise<void> {
+  const reason = summarizeRestoreError(error);
+  try {
+    const recorded = await deps.repo.recordRestoreErrorIfFailed(workspaceId, reason);
+    deps.logger?.info("control-plane.open.in-request-failed", {
+      workspaceId,
+      reason,
+      recorded: recorded !== null,
+    });
+  } catch {
+    // ignore — the caller rethrows the original open failure.
+  }
+}
 
 /**
  * Resolves the single controller identity for an open (issue #60 案B).

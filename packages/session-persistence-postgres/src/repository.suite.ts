@@ -278,6 +278,41 @@ export function defineRepositorySuite(
       expect(winner.lastError).toBe("instance dsh-x not found");
     });
 
+    test("recordRestoreErrorIfFailed: fills reason on RESTORE_FAILED-with-NULL, CAS-guarded", async () => {
+      const { repo, ws } = await setupWorkspaceAndSession(await makeExecutor());
+      // STARTING -> moves to RESTORE_FAILED with the reason (T8 lost its race).
+      await repo.updateWorkspace(ws.id, { runtimeState: "STARTING" });
+      const marked = await repo.recordRestoreErrorIfFailed(ws.id, "instance start failed");
+      expect(marked).not.toBeNull();
+      expect(marked!.runtimeState).toBe("RESTORE_FAILED");
+      expect(marked!.lastError).toBe("instance start failed");
+
+      // RESTORE_FAILED with a reason already recorded: no overwrite.
+      expect(await repo.recordRestoreErrorIfFailed(ws.id, "other")).toBeNull();
+      expect((await repo.getWorkspace(ws.id))!.lastError).toBe("instance start failed");
+
+      // A late READY is never clobbered back.
+      await repo.updateWorkspace(ws.id, { runtimeState: "READY" });
+      expect(await repo.recordRestoreErrorIfFailed(ws.id, "late")).toBeNull();
+      const winner = (await repo.getWorkspace(ws.id))!;
+      expect(winner.runtimeState).toBe("READY");
+      expect(winner.lastError).toBe("instance start failed");
+    });
+
+    test("recordRestoreErrorIfFailed: reason-only fill on already-FAILED row", async () => {
+      const { repo, ws } = await setupWorkspaceAndSession(await makeExecutor());
+      // The normal in-request path: T8 already moved the row, reason is NULL.
+      await repo.updateWorkspace(ws.id, { runtimeState: "STARTING" });
+      await repo.markRestoreFailedIfStarting(ws.id, "first");
+      // Simulate T8-without-reason: clear to NULL while staying FAILED.
+      await repo.updateWorkspace(ws.id, { lastError: null });
+      expect((await repo.getWorkspace(ws.id))!.runtimeState).toBe("RESTORE_FAILED");
+      const filled = await repo.recordRestoreErrorIfFailed(ws.id, "instance start failed");
+      expect(filled).not.toBeNull();
+      expect(filled!.runtimeState).toBe("RESTORE_FAILED");
+      expect(filled!.lastError).toBe("instance start failed");
+    });
+
     test("checkpoint audit: every record appends one row, even for the same key (issue #110)", async () => {
       const { repo, ws } = await setupWorkspaceAndSession(await makeExecutor());
       expect(await repo.listCheckpoints(ws.id)).toEqual([]);

@@ -106,6 +106,23 @@ export interface SessionPersistenceRepository {
    */
   markRestoreFailedIfStarting(id: string, lastError: string): Promise<Workspace | null>;
   /**
+   * In-request open-failure reason write (follow-up to #141).
+   *
+   * The T8 runtime's recordFailureStateBestEffort already moves the row to
+   * RESTORE_FAILED when handle.open() throws in-request — this method adds
+   * ONLY the sanitized reason, never a blind state write:
+   * - STARTING / RESTORING: moves to RESTORE_FAILED with the reason (covers
+   *   the case where the T8 bookkeeping write lost its own race);
+   * - RESTORE_FAILED with last_error IS NULL: fills the reason only;
+   * - anything else (READY, STOPPED, RESTORE_FAILED with a reason already
+   *   recorded): no-op, returns null — a late READY is never clobbered and
+   *   a first writer's reason is never overwritten.
+   *
+   * The caller MUST pass a summarizeRestoreError() value — same contract as
+   * markRestoreFailedIfStarting above.
+   */
+  recordRestoreErrorIfFailed(id: string, lastError: string): Promise<Workspace | null>;
+  /**
    * Deletes a workspace and everything under it (sessions, session events,
    * checkpoints, controller lease) in one transaction (issue #85 案B: the
    * schema has no ON DELETE CASCADE, so the application deletes children
@@ -259,6 +276,45 @@ export class PostgresSessionPersistenceRepository implements SessionPersistenceR
         ["RESTORE_FAILED", lastError, id],
       );
       return true;
+    });
+    if (!marked) return null;
+    const updated = await this.getWorkspace(id);
+    if (!updated) throw new Error(`workspace not found after update: ${id}`);
+    return updated;
+  }
+
+  async recordRestoreErrorIfFailed(id: string, lastError: string): Promise<Workspace | null> {
+    // Single-transaction CAS (same SELECT ... FOR UPDATE pattern as
+    // markRestoreFailedIfStarting above): concurrent transitions serialize
+    // on the row lock, so a READY committed between the caller's read and
+    // this write is observed here and left alone instead of clobbered.
+    // SELECT * (not just runtime_state) so the RESTORE_FAILED + NULL guard
+    // below can be decided on the locked row without a second round trip;
+    // both in-repo fakes answer this prefix identically to the plain read.
+    const marked = await this.executor.transaction(async (tx) => {
+      const rows = await tx.query<Record<string, unknown>>(
+        "SELECT * FROM workspaces WHERE id = $1 FOR UPDATE",
+        [id],
+      );
+      if (rows.length === 0) return false;
+      const current = rows[0]!["runtime_state"];
+      const existingError = rows[0]!["last_error"] as string | null;
+      if (current === "STARTING" || current === "RESTORING") {
+        // Column order follows updateWorkspace above (id LAST).
+        await tx.exec(
+          "UPDATE workspaces SET runtime_state = $1, last_error = $2, updated_at = now() WHERE id = $3",
+          ["RESTORE_FAILED", lastError, id],
+        );
+        return true;
+      }
+      if (current === "RESTORE_FAILED" && (existingError === null || existingError === undefined)) {
+        await tx.exec(
+          "UPDATE workspaces SET last_error = $1, updated_at = now() WHERE id = $2",
+          [lastError, id],
+        );
+        return true;
+      }
+      return false;
     });
     if (!marked) return null;
     const updated = await this.getWorkspace(id);
