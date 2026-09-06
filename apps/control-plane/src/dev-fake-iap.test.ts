@@ -95,5 +95,11 @@ describe("dev fake IAP (issue #138)", () => {
     expect(main).not.toContain("./dev.js");
     expect(main).not.toContain("FakeIap");
     expect(main).not.toContain("FAKE_IAP");
+    // The dev lease heartbeat stand-in (DEV_LEASE_HEARTBEAT_*) must never
+    // leak into the production composition either: there the agent-host owns
+    // renewal, and a control-plane-side timer would double-renew.
+    expect(main).not.toContain("DEV_LEASE_HEARTBEAT");
+    expect(main).not.toContain("LeaseHeartbeat");
+    expect(main).not.toContain("leaseHeartbeat");
   });
 });

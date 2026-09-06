@@ -384,4 +384,88 @@ describe("one-action start + transparent resume (API shape the UI drives)", () =
     expect(resent.status).toBe(201);
     expect(((await resent.json()) as { seq: number }).seq).toBe(1);
   }, 30_000);
+
+  test("READY with only the lease lost -> 409, then re-open recovers the same send at seq 0", async () => {
+    // Pins the product UI's recovery procedure at the API layer: when the
+    // workspace is READY but the controller lease alone has lapsed (the
+    // permanent-409 dead end behind the UI's retry), a re-open re-establishes
+    // the lease and the very same send succeeds — exactly once.
+    const created = await fetch(`${base}/v1/workspaces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo", baseBranch: "main" }),
+    });
+    expect(created.status).toBe(201);
+    const ws = (await created.json()) as { id: string };
+
+    const opened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(opened.status).toBe(202);
+    expect(await waitForState(ws.id, "READY", DEV_OPEN_READY_DELAY_MS + 10_000)).toBe("READY");
+
+    const made = await fetch(`${base}/v1/workspaces/${ws.id}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(made.status).toBe(201);
+    const session = (await made.json()) as { id: string };
+
+    const held = (await (await fetch(`${base}/v1/workspaces/${ws.id}/controller`)).json()) as {
+      held: boolean;
+    };
+    expect(held.held).toBe(true);
+
+    // Lose ONLY the lease: the row stays READY while getActive goes null —
+    // the same API shape a 45s-lapsed lease has (release deletes the row,
+    // expiry filters it out of getActive; both read identically here).
+    const lease = await deps.leases.get(ws.id);
+    expect(lease).not.toBeNull();
+    await deps.leases.release(ws.id, lease!.controllerId);
+
+    const read = await fetch(`${base}/v1/workspaces/${ws.id}`);
+    expect(read.status).toBe(200);
+    expect(((await read.json()) as { runtimeState: string }).runtimeState).toBe("READY");
+    const lost = (await (await fetch(`${base}/v1/workspaces/${ws.id}/controller`)).json()) as {
+      held: boolean;
+    };
+    expect(lost.held).toBe(false);
+
+    // The dead end the UI retries against: 409 before anything is appended.
+    const refused = await fetch(`${base}/v1/sessions/${session.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content: "hello after lease loss" }),
+    });
+    expect(refused.status).toBe(409);
+    expect(((await refused.json()) as { error: { message: string } }).error.message).toContain(
+      "no active controller",
+    );
+
+    // The UI's recovery (re-open, then send once more) succeeds on the same
+    // session — and at seq 0, proving the 409 appended nothing: no double
+    // send from the single retry.
+    const reopened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(reopened.status).toBe(200);
+    expect(((await reopened.json()) as { state: string }).state).toBe("READY");
+    const regained = (await (await fetch(`${base}/v1/workspaces/${ws.id}/controller`)).json()) as {
+      held: boolean;
+    };
+    expect(regained.held).toBe(true);
+
+    const resent = await fetch(`${base}/v1/sessions/${session.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content: "hello after lease loss" }),
+    });
+    expect(resent.status).toBe(201);
+    expect(((await resent.json()) as { seq: number }).seq).toBe(0);
+  }, 30_000);
 });
