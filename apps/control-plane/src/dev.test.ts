@@ -4,7 +4,13 @@
 // no real GCP or DB. Server is stopped cleanly in afterAll.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { createDevControlPlaneDeps, DEV_OPEN_READY_DELAY_MS } from "./dev.js";
+import { HEARTBEAT_INTERVAL_MS } from "@cloud-run-dsh/controller-lease";
+import {
+  createDevControlPlaneDeps,
+  DEV_LEASE_HEARTBEAT_INTERVAL_MS,
+  DEV_OPEN_READY_DELAY_MS,
+  isDevLeaseHeartbeatRunning,
+} from "./dev.js";
 import { startControlPlane, type RunningControlPlane } from "./server.js";
 import type { ControlPlaneDeps } from "./index.js";
 
@@ -224,5 +230,52 @@ describe("dev composition (src/dev.ts)", () => {
     expect((await read.json()).runtimeState).toBe("READY");
     await Bun.sleep(500);
     expect((await deps.repo.getWorkspace(ws.id))?.runtimeState).toBe("READY");
+  });
+
+  test("dev lease heartbeat uses the production interval (same thinking, one constant)", () => {
+    // Production renews every HEARTBEAT_INTERVAL_MS via the agent-host loop;
+    // the dev stand-in must tick on the same constant, not a private copy
+    // that can silently drift past LEASE_EXPIRY_MS.
+    expect(DEV_LEASE_HEARTBEAT_INTERVAL_MS).toBe(HEARTBEAT_INTERVAL_MS);
+  });
+
+  test("open arms the lease heartbeat; re-open keeps it; stop clears it", async () => {
+    const created = await fetch(`${base}/v1/workspaces`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...iap("alice") },
+      body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
+    });
+    expect(created.status).toBe(201);
+    const ws = (await created.json()) as { id: string };
+    expect(isDevLeaseHeartbeatRunning(ws.id)).toBe(false);
+
+    const opened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...iap("alice") },
+      body: JSON.stringify({}),
+    });
+    expect(opened.status).toBe(202);
+    expect(isDevLeaseHeartbeatRunning(ws.id)).toBe(true);
+    expect(await waitForState(ws.id, "READY", DEV_OPEN_READY_DELAY_MS + 10_000)).toBe("READY");
+
+    // Idempotent re-open: 200 no-op, and the heartbeat stays armed (the
+    // holder's lease still needs its dev stand-in renewal).
+    const reopened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...iap("alice") },
+      body: JSON.stringify({}),
+    });
+    expect(reopened.status).toBe(200);
+    expect(isDevLeaseHeartbeatRunning(ws.id)).toBe(true);
+
+    // Stop: no agent-host left to renew for, so the timer is cleared (same
+    // rule as the production loop's isStopped self-stop).
+    const stopped = await fetch(`${base}/v1/workspaces/${ws.id}/stop`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...iap("alice") },
+      body: JSON.stringify({}),
+    });
+    expect(stopped.status).toBe(200);
+    expect(isDevLeaseHeartbeatRunning(ws.id)).toBe(false);
   });
 });

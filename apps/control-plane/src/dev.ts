@@ -13,7 +13,7 @@
 // Run with: bun run dev:control-plane
 // See docs/local-development.md for a curl walkthrough.
 
-import { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
+import { ControllerLeaseService, HEARTBEAT_INTERVAL_MS } from "@cloud-run-dsh/controller-lease";
 import { InMemoryLeaseStore } from "@cloud-run-dsh/controller-lease/testing";
 import { PostgresSessionPersistenceRepository } from "@cloud-run-dsh/session-persistence-postgres";
 import { InMemoryFakeExecutor } from "@cloud-run-dsh/session-persistence-postgres/testing";
@@ -62,6 +62,52 @@ function clearDevReadyTimer(workspaceId: string): void {
 }
 
 /**
+ * Dev stand-in for the production agent-host lease heartbeat
+ * (`apps/agent-host/src/lease-heartbeat.ts`: every HEARTBEAT_INTERVAL_MS the
+ * host extends the lease it adopted, so the lease stays alive while the
+ * Instance runs).
+ *
+ * The dev server has no agent-host, so without this the lease always lapses
+ * LEASE_EXPIRY_MS (45s) after open while the row stays READY — a state
+ * production never reaches (the host renews every 15s) but every slow local
+ * click-walk does. The interval is the production constant itself, not a
+ * copy: same thinking, one source of truth.
+ *
+ * Lives ONLY in this dev entrypoint: production (main.ts) composes
+ * createFetchHandler directly and never imports this module, so this timer
+ * can never run in production.
+ */
+export const DEV_LEASE_HEARTBEAT_INTERVAL_MS = HEARTBEAT_INTERVAL_MS;
+
+/**
+ * Lease heartbeat timers per workspace id (module-level, keyed by workspace
+ * id — same reason as readyTimers above: the RuntimeRegistry rebuilds the
+ * handle when the lease changes, so a per-handle timer would be orphaned by
+ * that rebuild and a later stop() could not reach it).
+ */
+const leaseHeartbeatTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+function clearDevLeaseHeartbeat(workspaceId: string): void {
+  const pending = leaseHeartbeatTimers.get(workspaceId);
+  if (pending !== undefined) {
+    clearInterval(pending);
+    leaseHeartbeatTimers.delete(workspaceId);
+  }
+}
+
+/** Stops every dev lease heartbeat (process shutdown). */
+export function stopAllDevLeaseHeartbeats(): void {
+  for (const workspaceId of [...leaseHeartbeatTimers.keys()]) {
+    clearDevLeaseHeartbeat(workspaceId);
+  }
+}
+
+/** Test seam: whether the dev lease heartbeat is currently armed. */
+export function isDevLeaseHeartbeatRunning(workspaceId: string): boolean {
+  return leaseHeartbeatTimers.has(workspaceId);
+}
+
+/**
  * Minimal in-memory runtime handle for local development: open/stop flip the
  * state, agent input is always allowed, and every activity kind is logged so
  * a developer can see what the control plane thinks is happening.
@@ -79,7 +125,54 @@ export class LoggingWorkspaceRuntimeHandle implements WorkspaceRuntimeHandle {
   constructor(
     private readonly workspaceId: string,
     private readonly repo: SessionPersistenceRepository,
+    private readonly leases: ControllerLeaseService,
   ) {}
+
+  /**
+   * One heartbeat tick: extend whoever currently holds this workspace's
+   * lease — exactly what the production agent-host renews (it extends the
+   * adopted lease, never takes a new one). Resolving the holder fresh each
+   * tick (instead of a captured controllerId) keeps the meaning identical
+   * across re-opens, which may resolve a different lease.
+   *
+   * Never re-acquires: a lost lease (released, expired, taken over, or gone
+   * with a deleted workspace) stops this timer silently. The dev server owns
+   * no user identity to acquire with; the next open() acquires fresh for its
+   * caller and re-arms the timer via ensureLeaseHeartbeat() below.
+   */
+  private async tickDevLeaseHeartbeat(): Promise<void> {
+    const current = await this.leases.getActive(this.workspaceId);
+    if (!current) {
+      clearDevLeaseHeartbeat(this.workspaceId);
+      console.log(`[dev] workspace ${this.workspaceId}: lease heartbeat stopped (no active lease)`);
+      return;
+    }
+    try {
+      await this.leases.heartbeat(this.workspaceId, current.controllerId);
+    } catch (e) {
+      clearDevLeaseHeartbeat(this.workspaceId);
+      console.log(
+        `[dev] workspace ${this.workspaceId}: lease heartbeat stopped (renewal failed: ${e instanceof Error ? e.message : String(e)})`,
+      );
+    }
+  }
+
+  /** Arms the heartbeat for this workspace unless already armed (idempotent). */
+  private ensureLeaseHeartbeat(): void {
+    if (leaseHeartbeatTimers.has(this.workspaceId)) return;
+    const timer = setInterval(() => {
+      void this.tickDevLeaseHeartbeat().catch((e) => {
+        console.log(
+          `[dev] workspace ${this.workspaceId}: lease heartbeat tick failed: ${String(e)}`,
+        );
+      });
+    }, DEV_LEASE_HEARTBEAT_INTERVAL_MS);
+    // Unref'd so a forgotten timer can never keep the dev process (or a test
+    // runner) alive — same rule as the agent-host's systemIntervalScheduler.
+    const t = timer as unknown as { unref?: () => void };
+    if (typeof t.unref === "function") t.unref();
+    leaseHeartbeatTimers.set(this.workspaceId, timer);
+  }
 
   async open(): Promise<string> {
     // Issue #136: answer STARTING now and become READY on a timer, standing
@@ -98,6 +191,9 @@ export class LoggingWorkspaceRuntimeHandle implements WorkspaceRuntimeHandle {
     const current = await this.repo.getWorkspace(this.workspaceId);
     if (current?.runtimeState === "READY") {
       this.state = "READY";
+      // Idempotent no-op, but the heartbeat must keep running: the lease the
+      // opener holds still needs its dev stand-in renewal.
+      this.ensureLeaseHeartbeat();
       return this.state;
     }
     await this.repo.updateWorkspace(this.workspaceId, { runtimeState: "STARTING" });
@@ -116,11 +212,17 @@ export class LoggingWorkspaceRuntimeHandle implements WorkspaceRuntimeHandle {
         });
     }, DEV_OPEN_READY_DELAY_MS);
     readyTimers.set(this.workspaceId, timer);
+    // The workspace is running now: stand in for the agent-host heartbeat so
+    // the lease outlives LEASE_EXPIRY_MS exactly like production.
+    this.ensureLeaseHeartbeat();
     return this.state;
   }
 
   async stop(): Promise<string> {
     clearDevReadyTimer(this.workspaceId);
+    // A stopped workspace has no agent-host, so there is nothing left to
+    // renew — same rule as the production loop's isStopped self-stop.
+    clearDevLeaseHeartbeat(this.workspaceId);
     await this.repo.updateWorkspace(this.workspaceId, { runtimeState: "STOPPED" });
     this.state = "STOPPED";
     console.log(`[dev] workspace ${this.workspaceId}: stop -> STOPPED`);
@@ -168,7 +270,7 @@ export function createDevControlPlaneDeps(): ControlPlaneDeps {
   const membership = new InMemoryMembershipStore();
   const runtimes = new RuntimeRegistry((workspace: Workspace) => {
     console.log(`[dev] creating runtime handle for workspace ${workspace.id}`);
-    return new LoggingWorkspaceRuntimeHandle(workspace.id, repo);
+    return new LoggingWorkspaceRuntimeHandle(workspace.id, repo, leases);
   });
 
   return createControlPlaneDeps({
@@ -271,10 +373,12 @@ function main(): void {
 
   process.on("SIGINT", () => {
     console.log("\n[dev] shutting down");
+    stopAllDevLeaseHeartbeats();
     server.stop();
     process.exit(0);
   });
   process.on("SIGTERM", () => {
+    stopAllDevLeaseHeartbeats();
     server.stop();
     process.exit(0);
   });
