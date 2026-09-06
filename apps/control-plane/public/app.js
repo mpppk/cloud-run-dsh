@@ -13,8 +13,10 @@
 //
 // Idle-timer discipline (spec section 11): NOTHING here fires on its own
 // except the event stream and one low-frequency workspace refresh while the
-// stream is connected. open / stop / message / approval / cancel /
-// checkpoint are only ever sent from button clicks.
+// stream is connected (the controller status piggybacks on that same timer,
+// issue #133 — both reads skip recordActivity). open / stop / message /
+// approval / cancel / checkpoint are only ever sent from button clicks.
+// The 1s badge re-render reads the local clock only and never fetches.
 
 // ---------------------------------------------------------------------------
 // SSE parser (pure: no DOM). Tested from bun test via static.test.ts.
@@ -109,18 +111,29 @@ export function parseSseChunks(parser, chunk) {
 // ---------------------------------------------------------------------------
 
 /**
- * Decides the badge role from the locally held lease and the local clock
- * only (issue #130). Never fetches, so re-rendering on a timer cannot
- * extend the server idle timer (spec section 11).
+ * Decides the badge role from the SERVER's view of the caller's controller
+ * relationship (issue #133: `GET /v1/workspaces/:id/controller` returns
+ * `{ held, mine, expiresAt }`) plus the local clock only. Never fetches, so
+ * re-rendering on a timer cannot extend the server idle timer (spec
+ * section 11).
+ *
+ * Previously this took "did this browser acquire a controllerId", which
+ * disagreed with the server gate (`requireController`: active lease's
+ * `userId === caller`) whenever `open` had implicitly taken the lease —
+ * the badge said observer while messages went through with 201.
  *
  * Boundary matches T6 `ControllerLeaseService` (`expiresAt <= now` counts
  * as expired): `expiresAt === nowMs` returns "expired", not "controller".
- * A held lease whose expiresAt is missing or unparseable is also "expired"
- * — failing toward the warning, never toward a false green CONTROLLER.
+ * A held+mine status whose expiresAt is missing or unparseable is also
+ * "expired" — failing toward the warning, never toward a false green
+ * CONTROLLER. The server never returns held:true for an expired lease
+ * (`getActive` filters it), so "expired" only appears for a stale local
+ * status whose expiresAt has since passed (#130 display, kept here).
  */
-export function leaseRole(lease, nowMs) {
-  if (!lease) return "observer";
-  const expiresMs = Date.parse(lease.expiresAt);
+export function leaseRole(status, nowMs) {
+  if (!status || !status.held) return "observer";
+  if (!status.mine) return "observer";
+  const expiresMs = Date.parse(status.expiresAt);
   if (Number.isNaN(expiresMs)) return "expired";
   return expiresMs > nowMs ? "controller" : "expired";
 }
@@ -138,7 +151,8 @@ const LS = {
 const state = {
   workspaceId: null,
   sessionId: null,
-  leases: {}, // workspaceId -> { controllerId, expiresAt }
+  leases: {}, // workspaceId -> { controllerId, expiresAt } (local acquire cache: the heartbeat/release capability)
+  controller: {}, // workspaceId -> { held, mine, expiresAt } (server view from GET .../controller; drives the badge)
   sse: null, // { abort: AbortController, sessionId } while connected
   sseTimer: null, // low-frequency workspace refresh while streaming
   maxSeq: -1,
@@ -253,6 +267,7 @@ function selectWorkspace(id) {
   state.workspaceId = id;
   renderWsList();
   renderRole();
+  void refreshController(id);
 }
 
 function renderWsDetail(ws) {
@@ -272,22 +287,46 @@ function renderWsDetail(ws) {
 
 function renderRole() {
   const badge = $("role-badge");
-  const lease = state.workspaceId ? state.leases[state.workspaceId] : null;
-  const role = leaseRole(lease, Date.now());
+  const status = state.workspaceId ? (state.controller[state.workspaceId] ?? null) : null;
+  const role = leaseRole(status, Date.now());
   if (role === "controller") {
-    badge.textContent = `role: CONTROLLER (you hold ${lease.controllerId})`;
+    badge.textContent = "role: CONTROLLER";
     badge.className = "role-controller";
   } else if (role === "expired") {
-    badge.textContent = `role: CONTROLLER — lease EXPIRED at ${lease.expiresAt} (press heartbeat)`;
+    badge.textContent = `role: CONTROLLER — lease EXPIRED at ${status.expiresAt} (press heartbeat)`;
     badge.className = "role-expired";
+  } else if (status && status.held) {
+    badge.textContent = "role: observer (別のメンバーが controller)";
+    badge.className = "role-observer";
   } else {
-    badge.textContent = "role: observer (no controllerId held from acquire)";
+    badge.textContent = "role: observer (controller 不在)";
     badge.className = "role-observer";
   }
   const detail = $("lease-detail");
+  const serverView = status
+    ? `held: ${status.held} mine: ${status.mine} / expiresAt: ${status.expiresAt}`
+    : "held: - / mine: - / expiresAt: -";
+  const lease = state.workspaceId ? state.leases[state.workspaceId] : null;
   detail.textContent = lease
-    ? `controllerId: ${lease.controllerId} / expiresAt: ${lease.expiresAt}`
-    : "controllerId: - / expiresAt: -";
+    ? `${serverView} (local controllerId: ${lease.controllerId})`
+    : serverView;
+}
+
+/**
+ * Refreshes the server-view controller status for one workspace (issue
+ * #133). Safe to call freely: `GET .../controller` never calls
+ * recordActivity, so it cannot extend the server idle timer (spec
+ * section 11). Called on workspace select, after open/stop/acquire/
+ * heartbeat/release, and piggybacked on the 15s SSE workspace refresh —
+ * never on the 1s re-render timer.
+ */
+async function refreshController(id) {
+  const r = await apiFetch("GET", `/v1/workspaces/${encodeURIComponent(id)}/controller`);
+  if (r.status === 200 && r.json) {
+    state.controller[id] = { held: r.json.held, mine: r.json.mine, expiresAt: r.json.expiresAt };
+    if (id === state.workspaceId) renderRole();
+  }
+  return r;
 }
 
 // --- sessions ---
@@ -363,10 +402,15 @@ function setSseState(text) {
 function startWorkspacePolling() {
   stopWorkspacePolling();
   // Low-frequency refresh of the state badge ONLY while streaming.
-  // This plus the stream itself is the only automatic traffic this page
-  // ever sends (spec section 11: opening the page must not extend idle).
+  // The controller status piggybacks on this same timer (issue #133) —
+  // no new timer is added, and neither refresh calls recordActivity, so
+  // this plus the stream itself remains the only automatic traffic this
+  // page ever sends (spec section 11: opening the page must not extend idle).
   state.sseTimer = setInterval(() => {
-    if (state.workspaceId) void refreshWorkspace(state.workspaceId);
+    if (state.workspaceId) {
+      void refreshWorkspace(state.workspaceId);
+      void refreshController(state.workspaceId);
+    }
   }, 15000);
 }
 
@@ -493,6 +537,7 @@ function boot() {
       renderWsList();
       renderRole();
       await refreshWorkspace(r.json.id);
+      await refreshController(r.json.id);
     }
   };
   $("btn-add-ws").onclick = async () => {
@@ -505,21 +550,26 @@ function boot() {
     renderRole();
     $("in-add-ws").value = "";
     await refreshWorkspace(id);
+    await refreshController(id);
   };
   $("btn-refresh-ws").onclick = () => {
     if (state.workspaceId) void refreshWorkspace(state.workspaceId);
   };
   $("btn-open-ws").onclick = () => {
     if (state.workspaceId) {
-      void apiFetch("POST", `/v1/workspaces/${encodeURIComponent(state.workspaceId)}/open`, {}).then(
-        () => refreshWorkspace(state.workspaceId),
+      const id = state.workspaceId;
+      // open implicitly takes the controller lease for the opener (issue
+      // #133), so the badge must re-read the server view afterwards.
+      void apiFetch("POST", `/v1/workspaces/${encodeURIComponent(id)}/open`, {}).then(() =>
+        Promise.all([refreshWorkspace(id), refreshController(id)]),
       );
     }
   };
   $("btn-stop-ws").onclick = () => {
     if (state.workspaceId) {
-      void apiFetch("POST", `/v1/workspaces/${encodeURIComponent(state.workspaceId)}/stop`, {}).then(
-        () => refreshWorkspace(state.workspaceId),
+      const id = state.workspaceId;
+      void apiFetch("POST", `/v1/workspaces/${encodeURIComponent(id)}/stop`, {}).then(() =>
+        Promise.all([refreshWorkspace(id), refreshController(id)]),
       );
     }
   };
@@ -531,6 +581,7 @@ function boot() {
     if (r.status === 200) {
       saveWorkspaces(loadWorkspaces().filter((x) => x !== id));
       delete state.leases[id];
+      delete state.controller[id];
       if (state.workspaceId === id) state.workspaceId = null;
       renderWsList();
       renderRole();
@@ -556,50 +607,53 @@ function boot() {
   setInterval(renderRole, 1000);
   $("btn-acquire").onclick = async () => {
     if (!state.workspaceId) return;
+    const id = state.workspaceId;
     const r = await apiFetch(
       "POST",
-      `/v1/workspaces/${encodeURIComponent(state.workspaceId)}/controller/acquire`,
+      `/v1/workspaces/${encodeURIComponent(id)}/controller/acquire`,
       {},
     );
     if (r.status === 200 && r.json) {
-      state.leases[state.workspaceId] = {
+      state.leases[id] = {
         controllerId: r.json.controllerId,
         expiresAt: r.json.expiresAt,
       };
     }
-    renderRole();
+    await refreshController(id);
   };
   $("btn-heartbeat").onclick = async () => {
     if (!state.workspaceId) return;
-    const lease = state.leases[state.workspaceId];
+    const id = state.workspaceId;
+    const lease = state.leases[id];
     if (!lease) {
       $("lease-detail").textContent = "no controllerId held — acquire first";
       return;
     }
     const r = await apiFetch(
       "POST",
-      `/v1/workspaces/${encodeURIComponent(state.workspaceId)}/controller/heartbeat`,
+      `/v1/workspaces/${encodeURIComponent(id)}/controller/heartbeat`,
       { controllerId: lease.controllerId },
     );
     if (r.status === 200 && r.json) {
-      state.leases[state.workspaceId] = {
+      state.leases[id] = {
         controllerId: r.json.controllerId,
         expiresAt: r.json.expiresAt,
       };
     }
-    renderRole();
+    await refreshController(id);
   };
   $("btn-release").onclick = async () => {
     if (!state.workspaceId) return;
-    const lease = state.leases[state.workspaceId];
+    const id = state.workspaceId;
+    const lease = state.leases[id];
     if (!lease) return;
     const r = await apiFetch(
       "POST",
-      `/v1/workspaces/${encodeURIComponent(state.workspaceId)}/controller/release`,
+      `/v1/workspaces/${encodeURIComponent(id)}/controller/release`,
       { controllerId: lease.controllerId },
     );
-    if (r.status === 200) delete state.leases[state.workspaceId];
-    renderRole();
+    if (r.status === 200) delete state.leases[id];
+    await refreshController(id);
   };
 
   // sessions

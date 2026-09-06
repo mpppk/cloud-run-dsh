@@ -557,6 +557,40 @@ export const releaseController: RouteHandler = async (ctx) => {
   }
 };
 
+/**
+ * Read-only controller status for the debug UI badge (issue #133).
+ *
+ * Returns ONLY the caller's relationship to the active lease — never the
+ * lease's `controllerId` and never anyone's `userId`. `controllerId` is
+ * effectively a capability (heartbeat/release authenticate the owner by
+ * it), so handing another member's id out would let them steal the lease;
+ * even the holder's own id is withheld because the acquire response already
+ * delivered it and the badge needs only `mine` + `expiresAt`.
+ *
+ * Deliberately calls NO `recordActivity` (仕様書 section 11): the screen
+ * polls this route, and polling must not extend the idle timer. Same
+ * treatment as the SSE stream (see sse.ts).
+ *
+ * `mine` uses exactly the server-side gate in `requireController` above
+ * (`lease.userId === caller`): whatever this route reports, message send
+ * enforces. `getActive` already excludes expired leases
+ * (`expiresAt <= now` -> null), so an expired lease reads as unheld.
+ */
+export const getControllerStatus: RouteHandler = async (ctx) => {
+  const workspaceId = requireSegment(ctx.params.id, "id");
+  const workspace = await loadWorkspace(ctx.deps, workspaceId);
+  await assertMember(ctx.deps, workspace.id, ctx.user.id);
+  const lease = await ctx.deps.leases.getActive(workspace.id);
+  if (!lease) {
+    return json({ held: false, mine: false, expiresAt: null });
+  }
+  return json({
+    held: true,
+    mine: lease.userId === ctx.user.id,
+    expiresAt: lease.expiresAt.toISOString(),
+  });
+};
+
 // ---------------------------------------------------------------------------
 // DTOs — responses never expose internals or secrets.
 // ---------------------------------------------------------------------------
