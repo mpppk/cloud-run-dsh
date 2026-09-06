@@ -15,14 +15,3 @@ export class WorkspaceNotFoundError extends Error {
     super(`workspace not found: ${workspaceId}`);
   }
 }
-
-/** Thrown when the Cloud Run Instance is not READY during recovery. */
-export class InstanceNotHealthyError extends Error {
-  readonly name = "InstanceNotHealthyError";
-  constructor(
-    public readonly instanceName: string,
-    public readonly state: string,
-  ) {
-    super(`instance ${instanceName} is not healthy (state=${state})`);
-  }
-}

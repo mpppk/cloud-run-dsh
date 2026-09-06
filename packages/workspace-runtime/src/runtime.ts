@@ -31,8 +31,6 @@ export class InvalidOperationError extends Error {
  * session persistence and Cloud Run instance client.
  */
 export interface WorkspaceLifecycleSteps {
-  /** Wait until the started Cloud Run instance is healthy (実装手順書 section 27). */
-  waitForInstanceHealth(): Promise<void>;
   /** git clone (仕様書 section 8). */
   cloneRepository(): Promise<void>;
   /** checkout base commit (仕様書 section 8). */
@@ -173,9 +171,18 @@ export class WorkspaceRuntime {
   }
 
   /**
-   * Opens the workspace: STARTING -> instance start -> health -> RESTORING ->
+   * Opens the workspace: STARTING -> instance start -> RESTORING ->
    * clone -> checkout base -> restore checkpoint -> create sandbox ->
    * restore harness -> READY (仕様書 section 8, 実装手順書 sections 19/22/27).
+   *
+   * Issue #136: the start phase NO LONGER waits for agent-host readiness.
+   * Readiness observation used to live here (a minutes-long poll of the
+   * Instance URL), which forced POST /open to hold its request for up to ~6
+   * minutes. The completion authority is now the agent-host's
+   * completeRestore() persisting READY on the shared row; clients learn it
+   * by polling GET /v1/workspaces/:id, and a STARTING/RESTORING row older
+   * than the stale threshold is failed lazily at read time (案A — no
+   * background waiter, so Cloud Run CPU throttling cannot break it).
    *
    * Concurrent open requests coalesce into a single start operation
    * (実装手順書 section 27). An already-READY workspace resolves immediately.
@@ -200,9 +207,12 @@ export class WorkspaceRuntime {
   }
 
   /**
-   * Control-plane phase (issue #60 案C): STOPPED -> STARTING, instance start,
-   * health observation. Returns while still STARTING — the RESTORING -> READY
-   * transitions belong to the agent-host's completeRestore().
+   * Control-plane phase (issue #60 案C, issue #136 async open): STOPPED ->
+   * STARTING, then the instance start API call. Returns while still STARTING
+   * — the RESTORING -> READY transitions belong to the agent-host's
+   * completeRestore(), and readiness observation NO LONGER happens here
+   * (#136: the old in-request health poll held POST /open for minutes, so it
+   * was removed; the request now covers only the fast instance start).
    *
    * Concurrent calls coalesce into a single start operation (実装手順書
    * section 27), same as open().
@@ -249,8 +259,10 @@ export class WorkspaceRuntime {
 
     await this.machine.transition("STARTING", "open");
     try {
+      // Issue #136: ONLY the fast instance start runs in-request. Readiness
+      // used to be polled here (waitForInstanceHealth, minutes) — it now
+      // belongs to the agent-host phase, so open() answers within seconds.
       await this.deps.instanceRuntime.start(this.deps.instanceName);
-      await this.deps.steps.waitForInstanceHealth();
       // Intentionally STAYS in STARTING: the agent-host drives
       // STARTING -> RESTORING -> READY via completeRestore() (issue #60).
       return this.machine.getState();

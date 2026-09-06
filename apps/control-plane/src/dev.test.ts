@@ -4,7 +4,7 @@
 // no real GCP or DB. Server is stopped cleanly in afterAll.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { createDevControlPlaneDeps } from "./dev.js";
+import { createDevControlPlaneDeps, DEV_OPEN_READY_DELAY_MS } from "./dev.js";
 import { startControlPlane, type RunningControlPlane } from "./server.js";
 import type { ControlPlaneDeps } from "./index.js";
 
@@ -31,6 +31,19 @@ describe("dev composition (src/dev.ts)", () => {
     };
   }
 
+  /** Polls GET until runtimeState matches (or the deadline passes). Returns the last seen state. */
+  async function waitForState(workspaceId: string, want: string, timeoutMs: number): Promise<string> {
+    const deadline = Date.now() + timeoutMs;
+    let seen = "";
+    for (;;) {
+      const read = await fetch(`${base}/v1/workspaces/${workspaceId}`, { headers: iap("alice") });
+      expect(read.status).toBe(200);
+      seen = ((await read.json()) as { runtimeState: string }).runtimeState;
+      if (seen === want || Date.now() > deadline) return seen;
+      await Bun.sleep(200);
+    }
+  }
+
   test("binds an ephemeral port, not a fixed one", () => {
     expect(server.port).toBeGreaterThan(0);
     expect(server.port).not.toBe(8787);
@@ -43,7 +56,7 @@ describe("dev composition (src/dev.ts)", () => {
     expect(body.error.code).toBe("unauthorized");
   });
 
-  test("create + open workspace succeeds for the owner", async () => {
+  test("create + open workspace succeeds for the owner (issue #136: 202 STARTING, then READY)", async () => {
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
       headers: { "content-type": "application/json", ...iap("alice") },
@@ -58,9 +71,11 @@ describe("dev composition (src/dev.ts)", () => {
       headers: { "content-type": "application/json", ...iap("alice") },
       body: JSON.stringify({}),
     });
-    expect(opened.status).toBe(200);
+    expect(opened.status).toBe(202);
     const body = await opened.json();
-    expect(body.state).toBe("READY");
+    expect(body.state).toBe("STARTING");
+    // The dev stand-in for the agent-host flips the row to READY shortly after.
+    expect(await waitForState(ws.id, "READY", DEV_OPEN_READY_DELAY_MS + 10_000)).toBe("READY");
   });
 
   test("403 for a non-member", async () => {
@@ -118,7 +133,7 @@ describe("dev composition (src/dev.ts)", () => {
     expect(body.error.code).toBe("conflict");
   });
 
-  test("open persists READY: GET and repo.getWorkspace agree (issue #131)", async () => {
+  test("open walks STARTING -> READY: GET and repo.getWorkspace agree (issues #131/#136)", async () => {
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
       headers: { "content-type": "application/json", ...iap("alice") },
@@ -132,12 +147,14 @@ describe("dev composition (src/dev.ts)", () => {
       headers: { "content-type": "application/json", ...iap("alice") },
       body: JSON.stringify({}),
     });
-    expect(opened.status).toBe(200);
-    expect((await opened.json()).state).toBe("READY");
+    expect(opened.status).toBe(202);
+    expect((await opened.json()).state).toBe("STARTING");
 
     const read = await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: iap("alice") });
     expect(read.status).toBe(200);
-    expect((await read.json()).runtimeState).toBe("READY");
+    expect((await read.json()).runtimeState).toBe("STARTING");
+
+    expect(await waitForState(ws.id, "READY", DEV_OPEN_READY_DELAY_MS + 10_000)).toBe("READY");
     expect((await deps.repo.getWorkspace(ws.id))?.runtimeState).toBe("READY");
   });
 
@@ -155,7 +172,7 @@ describe("dev composition (src/dev.ts)", () => {
       headers: { "content-type": "application/json", ...iap("alice") },
       body: JSON.stringify({}),
     });
-    expect(opened.status).toBe(200);
+    expect(opened.status).toBe(202);
 
     const stopped = await fetch(`${base}/v1/workspaces/${ws.id}/stop`, {
       method: "POST",
@@ -169,5 +186,43 @@ describe("dev composition (src/dev.ts)", () => {
     expect(read.status).toBe(200);
     expect((await read.json()).runtimeState).toBe("STOPPED");
     expect((await deps.repo.getWorkspace(ws.id))?.runtimeState).toBe("STOPPED");
+    // The pending READY timer was cancelled by the stop: even after its
+    // delay passes, the row must stay STOPPED (never flip behind our back).
+    await Bun.sleep(DEV_OPEN_READY_DELAY_MS + 500);
+    expect((await deps.repo.getWorkspace(ws.id))?.runtimeState).toBe("STOPPED");
+  });
+
+  test("re-open of a READY workspace is a 200 no-op (no STARTING flap)", async () => {
+    // Mirrors the production WorkspaceRuntime.open() idempotency the route
+    // answers with 200: the dev stand-in must not flap the row back through
+    // STARTING (and must not arm a second READY timer behind it).
+    const created = await fetch(`${base}/v1/workspaces`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...iap("alice") },
+      body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
+    });
+    expect(created.status).toBe(201);
+    const ws = (await created.json()) as { id: string };
+
+    const opened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...iap("alice") },
+      body: JSON.stringify({}),
+    });
+    expect(opened.status).toBe(202);
+    expect(await waitForState(ws.id, "READY", DEV_OPEN_READY_DELAY_MS + 10_000)).toBe("READY");
+
+    const reopened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...iap("alice") },
+      body: JSON.stringify({}),
+    });
+    expect(reopened.status).toBe(200);
+    expect((await reopened.json()).state).toBe("READY");
+    // The row never left READY — not even transiently.
+    const read = await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: iap("alice") });
+    expect((await read.json()).runtimeState).toBe("READY");
+    await Bun.sleep(500);
+    expect((await deps.repo.getWorkspace(ws.id))?.runtimeState).toBe("READY");
   });
 });

@@ -13,7 +13,7 @@ Cloud SQL, or Cloud Run required) and drive it with `curl`.
 | Session persistence (`PostgresSessionPersistenceRepository`) | over `InMemoryFakeExecutor` (from `@cloud-run-dsh/session-persistence-postgres/testing`) |
 | Controller lease (`ControllerLeaseService`) | over `InMemoryLeaseStore` (from `@cloud-run-dsh/controller-lease/testing`) |
 | Workspace membership | `InMemoryMembershipStore` (the workspace owner is added automatically) |
-| Runtime handles | `RuntimeRegistry` + `LoggingWorkspaceRuntimeHandle` — open/stop flip the state and every activity kind is printed to the console |
+| Runtime handles | `RuntimeRegistry` + `LoggingWorkspaceRuntimeHandle` — `open` answers `STARTING` at once and flips to `READY` ~3s later (the async agent-host leg, played by a timer), `stop` flips to `STOPPED`, and every activity kind is printed to the console |
 | Clock | `SystemClock` |
 | Identity | **any** IAP identity is accepted; the subject becomes the internal user id |
 
@@ -75,12 +75,21 @@ curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" "$BASE/v1/workspaces"
 # {"workspaces":[{"id":"…","ownerId":"alice",…,"runtimeState":"STOPPED",…}]}
 ```
 
-### 2. Open the workspace (200)
+### 2. Open the workspace (202, async)
+
+`open` returns within seconds with `202` + the live state (`STARTING`).
+The dev server stands in for the agent-host and flips the row to `READY`
+~3 seconds later (`DEV_OPEN_READY_DELAY_MS` in `apps/control-plane/src/dev.ts`;
+in production the agent-host does this after boot + restore). Poll `GET`
+until `runtimeState` reads `READY`:
 
 ```bash
 curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" -H 'content-type: application/json' \
   -X POST "$BASE/v1/workspaces/$WS_ID/open" -d '{}'
-# {"workspaceId":"…","state":"READY"}
+# {"workspaceId":"…","state":"STARTING"}
+
+curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" "$BASE/v1/workspaces/$WS_ID"
+# … "runtimeState":"STARTING" … → (a few seconds later) … "runtimeState":"READY" …
 ```
 
 ### 3. Create a session (201)
@@ -129,6 +138,11 @@ curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" -H 'content-type: application/json' \
 # {"sessionId":"…","seq":0,"eventType":"user_message","eventTime":…,"data":{"content":"fix the flaky test"}}
 ```
 
+In production, messaging a workspace that is still `STARTING` / `RESTORING`
+answers `409` — finish step 2 (poll to `READY`) first. The dev server never
+refuses (it has no agent-host to be unready), so the walkthrough order above
+is the production-safe order.
+
 ### 6. Watch the event stream (SSE)
 
 ```bash
@@ -153,6 +167,9 @@ and watch it appear.
   cancel / manual checkpoint ("observer"), or a second controller tries to
   acquire while the lease is active. A concurrent `stop` that loses the
   shared-row race also answers 409 (`conflict`) — just retry the stop.
+  In production, message / approval / cancel against a workspace that is
+  still `STARTING` / `RESTORING` (open accepted, agent-host not done yet)
+  also answers 409 — poll `GET /v1/workspaces/:id` to `READY` first.
 - **400** — malformed path segments, invalid JSON, missing fields.
 - Console logs from the dev server show every `open`/`stop` and activity kind
   (`user_message`, `approval`, `checkpoint`, `workspace_operation`).

@@ -35,6 +35,8 @@ class FakeInstanceRuntime implements InstanceRuntime {
   calls: string[] = [];
   failStart = false;
   failStop = false;
+  /** When set, start() waits on it — lets a test interleave another runtime on the shared row. */
+  startGate: ReturnType<typeof deferred<void>> | null = null;
 
   async create(_workspace: InstanceWorkspace): Promise<InstanceInfo> {
     this.calls.push("create");
@@ -42,6 +44,7 @@ class FakeInstanceRuntime implements InstanceRuntime {
   }
   async start(_instanceName: string): Promise<void> {
     this.calls.push("start");
+    if (this.startGate) await this.startGate.promise;
     if (this.failStart) throw new Error("instance start failed");
   }
   async stop(instanceName: string): Promise<void> {
@@ -69,9 +72,6 @@ class FakeSteps implements WorkspaceLifecycleSteps {
     if (failure) throw failure();
   }
 
-  waitForInstanceHealth(): Promise<void> {
-    return this.run("waitForInstanceHealth");
-  }
   cloneRepository(): Promise<void> {
     return this.run("cloneRepository");
   }
@@ -132,7 +132,6 @@ describe("WorkspaceRuntime — restore orchestration (仕様書 section 8, 実�
     expect(state).toBe("READY");
     expect(h.instance.calls).toEqual(["start"]);
     expect(h.steps.calls).toEqual([
-      "waitForInstanceHealth",
       "cloneRepository",
       "checkoutBase",
       "restoreCheckpoint",
@@ -162,7 +161,6 @@ describe("WorkspaceRuntime — restore orchestration (仕様書 section 8, 実�
     await expect(h.runtime.open()).rejects.toThrow("checkpoint download failed");
     expect(h.runtime.getState()).toBe("RESTORE_FAILED");
     expect(h.steps.calls).toEqual([
-      "waitForInstanceHealth",
       "cloneRepository",
       "checkoutBase",
       "restoreCheckpoint",
@@ -215,32 +213,31 @@ describe("WorkspaceRuntime — restore orchestration (仕様書 section 8, 実�
 });
 
 describe("WorkspaceRuntime — issue #63: a STARTING failure keeps the original error", () => {
-  test("health observation failure while STARTING lands in RESTORE_FAILED with the original error", async () => {
-    // The GCP path: the instance started, but the agent-host health never
-    // reports ready (its git clone failed inside the instance). The control
-    // plane must surface the health error — not a state-transition error —
+  test("instance start failure while STARTING lands in RESTORE_FAILED with the original error", async () => {
+    // Issue #136: the start phase no longer polls agent-host health, so the
+    // synchronous instance-start failure is the STARTING failure path. The
+    // runtime must surface the start error — not a state-transition error —
     // and still record RESTORE_FAILED (仕様書 section 8).
     const h = makeHarness();
-    h.steps.failures.set(
-      "waitForInstanceHealth",
-      () => new Error("agent-host never became healthy"),
-    );
-    await expect(h.runtime.openInstance()).rejects.toThrow("agent-host never became healthy");
+    h.instance.failStart = true;
+    await expect(h.runtime.openInstance()).rejects.toThrow("instance start failed");
     expect(h.runtime.getState()).toBe("RESTORE_FAILED");
     expect(h.runtime.getLastError()).toMatchObject({
-      message: "agent-host never became healthy",
+      message: "instance start failed",
     });
   });
 
   test("shared-row race: agent-host records RESTORE_FAILED first, control plane still surfaces its own error", async () => {
     // Two runtimes, one row (issue #60 split): the agent-host fails git clone
-    // and commits RESTORE_FAILED while the control plane is still polling
-    // health in STARTING. The control plane's belated bookkeeping must not
-    // replace its own failure with IllegalTransitionError (the exact GCP
+    // and commits RESTORE_FAILED while the control plane's instance start is
+    // still in flight in STARTING. The control plane's belated bookkeeping
+    // finds nothing left to record (RESTORE_FAILED has no self edge) and must
+    // surface its own failure — never IllegalTransitionError (the exact GCP
     // report: "illegal state transition: STARTING -> RESTORE_FAILED").
     const h = makeHarness();
     const gate = deferred<void>();
-    h.steps.gates.set("waitForInstanceHealth", gate as unknown as ReturnType<typeof deferred<void>>);
+    h.instance.startGate = gate as unknown as ReturnType<typeof deferred<void>>;
+    h.instance.failStart = true;
     const agentSteps = new FakeSteps();
     agentSteps.failures.set("cloneRepository", () => new Error("git clone failed: boom"));
     const agent = new WorkspaceRuntime({
@@ -264,17 +261,17 @@ describe("WorkspaceRuntime — issue #63: a STARTING failure keeps the original 
     // The agent-host fails and records RESTORE_FAILED on the shared row.
     await expect(agent.completeRestore()).rejects.toThrow("git clone failed: boom");
 
-    // ... then the control plane's own health observation fails too.
-    gate.reject(new Error("agent-host never became healthy"));
+    // ... then the control plane's own instance start fails too.
+    gate.resolve();
     const err = await caughtP;
     expect(err).not.toBeNull();
     expect(err).not.toBeInstanceOf(IllegalTransitionError);
-    expect(err!.message).toBe("agent-host never became healthy");
+    expect(err!.message).toBe("instance start failed");
     // The failure state the agent-host recorded is left untouched.
     expect(await h.store.load("ws-1")).toBe("RESTORE_FAILED");
     expect(h.runtime.getState()).toBe("RESTORE_FAILED");
     expect(h.runtime.getLastError()).toMatchObject({
-      message: "agent-host never became healthy",
+      message: "instance start failed",
     });
   });
 
@@ -306,13 +303,17 @@ describe("WorkspaceRuntime — issue #63: a STARTING failure keeps the original 
     }
   }
 
-  function makeRuntimeWithStore(store: TransactionalStateStore, steps: FakeSteps): WorkspaceRuntime {
+  function makeRuntimeWithStore(
+    store: TransactionalStateStore,
+    steps: FakeSteps,
+    instance?: FakeInstanceRuntime,
+  ): WorkspaceRuntime {
     const clock = new FakeClock();
     return new WorkspaceRuntime({
       workspaceId: "ws-1",
       store,
       clock,
-      instanceRuntime: new FakeInstanceRuntime(),
+      instanceRuntime: instance ?? new FakeInstanceRuntime(),
       instanceName: "dsh-ws-1",
       steps,
       idle: new IdleManager(clock),
@@ -321,19 +322,23 @@ describe("WorkspaceRuntime — issue #63: a STARTING failure keeps the original 
 
   test("a lost bookkeeping race is chained as cause; the original error is still thrown", async () => {
     const steps = new FakeSteps();
-    steps.failures.set("waitForInstanceHealth", () => new Error("health poll timed out"));
+    // Issue #136: openInstance fails via the instance start (the health
+    // poll is gone) — the bookkeeping race below is unchanged.
+    const instance = new FakeInstanceRuntime();
+    instance.failStart = true;
     const runtime = makeRuntimeWithStore(
       new LostRaceStore(
         () => new IllegalTransitionError("RESTORE_FAILED", "RESTORE_FAILED"),
       ),
       steps,
+      instance,
     );
     const err = await runtime
       .openInstance()
       .then((): Error | null => null, (e: unknown) => e as Error);
     expect(err).not.toBeNull();
     expect(err).not.toBeInstanceOf(IllegalTransitionError);
-    expect(err!.message).toBe("health poll timed out");
+    expect(err!.message).toBe("instance start failed");
     // The secondary bookkeeping failure rides along as cause so the race
     // stays visible without replacing the real failure.
     expect(err!.cause).toBeInstanceOf(IllegalTransitionError);
@@ -344,16 +349,18 @@ describe("WorkspaceRuntime — issue #63: a STARTING failure keeps the original 
     // errors (IllegalTransitionError) may be chained onto errors that end up
     // in structured logs.
     const steps = new FakeSteps();
-    steps.failures.set("waitForInstanceHealth", () => new Error("health poll timed out"));
+    const instance = new FakeInstanceRuntime();
+    instance.failStart = true;
     const runtime = makeRuntimeWithStore(
       new LostRaceStore(() => new Error("postgres connect failed: host=/cloudsql/p:r:i")),
       steps,
+      instance,
     );
     const err = await runtime
       .openInstance()
       .then((): Error | null => null, (e: unknown) => e as Error);
     expect(err).not.toBeNull();
-    expect(err!.message).toBe("health poll timed out");
+    expect(err!.message).toBe("instance start failed");
     expect(err!.cause).toBeUndefined();
   });
 });
@@ -382,7 +389,8 @@ describe("WorkspaceRuntime — concurrent open coalescing (実装手順書 secti
     const state = await h.runtime.open();
     expect(state).toBe("READY");
     expect(h.instance.calls.filter((c) => c === "start")).toHaveLength(1);
-    expect(h.steps.calls).toHaveLength(6);
+    // Issue #136: 5 lifecycle steps (the readiness wait is gone).
+    expect(h.steps.calls).toHaveLength(5);
   });
 
   test("the second caller joins the in-flight open even after the first fails", async () => {
@@ -636,7 +644,9 @@ describe("WorkspaceRuntime — graceful stop (実装手順書 section 29)", () =
   test("stop is refused in STARTING/RESTORING", async () => {
     const h = makeHarness();
     const gate = deferred<void>();
-    h.steps.gates.set("waitForInstanceHealth", gate as unknown as ReturnType<typeof deferred<void>>);
+    // Issue #136: the start phase runs no lifecycle step, so the STARTING
+    // hold is the instance start itself.
+    h.instance.startGate = gate as unknown as ReturnType<typeof deferred<void>>;
     const openPromise = h.runtime.open();
     await new Promise((r) => setTimeout(r, 5));
     await expect(h.runtime.stop()).rejects.toThrow(InvalidOperationError);
@@ -731,7 +741,7 @@ describe("WorkspaceRuntime — prepareStop (issue #72)", () => {
   test("prepareStop is refused in STARTING/RESTORING", async () => {
     const h = makeHarness();
     const gate = deferred<void>();
-    h.steps.gates.set("waitForInstanceHealth", gate as unknown as ReturnType<typeof deferred<void>>);
+    h.instance.startGate = gate as unknown as ReturnType<typeof deferred<void>>;
     const openPromise = h.runtime.open();
     await new Promise((r) => setTimeout(r, 5));
     await expect(h.runtime.prepareStop()).rejects.toThrow(InvalidOperationError);
@@ -844,12 +854,14 @@ describe("WorkspaceRuntime — split open phases (issue #60 案C/案D)", () => {
     });
   }
 
-  test("openInstance stops at STARTING without running any restore step", async () => {
+  test("openInstance stops at STARTING without running any lifecycle step", async () => {
     const h = makeHarness();
     const state = await h.runtime.openInstance();
     expect(state).toBe("STARTING");
     expect(h.instance.calls).toEqual(["start"]);
-    expect(h.steps.calls).toEqual(["waitForInstanceHealth"]);
+    // Issue #136: no step runs in the start phase — readiness observation
+    // belongs to the agent-host phase, so open() answers within seconds.
+    expect(h.steps.calls).toEqual([]);
     expect(h.store.getHistory().map((r) => `${r.from}->${r.to}`)).toEqual([
       "STOPPED->STARTING",
     ]);
@@ -878,7 +890,8 @@ describe("WorkspaceRuntime — split open phases (issue #60 案C/案D)", () => {
     const h = makeHarness();
     const agent = makePeer(h);
 
-    // Control-plane phase: instance lifecycle + health observation only.
+    // Control-plane phase: the instance start only (issue #136: no
+    // in-request readiness observation — the agent phase owns that).
     expect(await h.runtime.openInstance()).toBe("STARTING");
 
     // The agent-host must NOT run the full open() on the shared row — this
@@ -943,7 +956,7 @@ describe("WorkspaceRuntime — split open phases (issue #60 案C/案D)", () => {
   test("two concurrent openInstance calls coalesce into a single start", async () => {
     const h = makeHarness();
     const gate = deferred<void>();
-    h.steps.gates.set("waitForInstanceHealth", gate as unknown as ReturnType<typeof deferred<void>>);
+    h.instance.startGate = gate as unknown as ReturnType<typeof deferred<void>>;
 
     const both = Promise.all([h.runtime.openInstance(), h.runtime.openInstance()]);
     gate.resolve();
@@ -957,11 +970,11 @@ describe("WorkspaceRuntime — split open phases (issue #60 案C/案D)", () => {
 
 describe("WorkspaceRuntime — issue #122: the turn gate must not stick on a stale in-memory state", () => {
   test("a turn is accepted after another process restores the row to READY (no re-open)", async () => {
-    // The #122 timeline: this runtime (the control plane) fails its health
-    // observation and records RESTORE_FAILED — in memory AND in the store.
+    // The #122 timeline: this runtime (the control plane) fails its instance
+    // start and records RESTORE_FAILED — in memory AND in the store.
     const h = makeHarness();
-    h.steps.failures.set("waitForInstanceHealth", () => new Error("agent-host never became healthy"));
-    await expect(h.runtime.openInstance()).rejects.toThrow("agent-host never became healthy");
+    h.instance.failStart = true;
+    await expect(h.runtime.openInstance()).rejects.toThrow("instance start failed");
     expect(h.runtime.getState()).toBe("RESTORE_FAILED");
     expect(await h.store.load("ws-1")).toBe("RESTORE_FAILED");
 

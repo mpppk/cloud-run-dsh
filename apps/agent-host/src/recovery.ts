@@ -13,7 +13,6 @@ import type {
   CheckpointScheduler,
   Clock,
 } from "@cloud-run-dsh/workspace-checkpoint";
-import type { InstanceRuntime } from "@cloud-run-dsh/cloud-run-instance-client";
 import type { SandboxManager } from "@cloud-run-dsh/cloud-run-sandbox";
 import { LeaseAlreadyHeldError } from "@cloud-run-dsh/controller-lease";
 import type { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
@@ -26,7 +25,7 @@ import type {
   WorkspaceRuntime,
 } from "@cloud-run-dsh/workspace-runtime";
 import type { AgentHostConfig } from "./config.js";
-import { WorkspaceNotFoundError, InstanceNotHealthyError } from "./errors.js";
+import { WorkspaceNotFoundError } from "./errors.js";
 import type { TurnStarter } from "./gateway.js";
 import type { HarnessComposition } from "./harness.js";
 import type { WorkspaceBootstrapper } from "./bootstrap.js";
@@ -34,7 +33,6 @@ import type { HealthService } from "./health.js";
 
 export interface LifecycleStepDeps {
   readonly config: AgentHostConfig;
-  readonly instanceRuntime: InstanceRuntime;
   readonly bootstrapper: WorkspaceBootstrapper;
   readonly checkpointScheduler: CheckpointScheduler;
   readonly sandboxManager: SandboxManager;
@@ -57,12 +55,10 @@ export interface LifecycleStepDeps {
  */
 export function buildLifecycleSteps(deps: LifecycleStepDeps): WorkspaceLifecycleSteps {
   return {
-    waitForInstanceHealth: async () => {
-      const info = await deps.instanceRuntime.get(deps.config.instanceName);
-      if (info.state !== "READY") {
-        throw new InstanceNotHealthyError(deps.config.instanceName, info.state);
-      }
-    },
+    // Issue #136: the WorkspaceLifecycleSteps seam no longer carries
+    // waitForInstanceHealth — the control-plane open stopped polling
+    // readiness in-request, and this host never called that step from its
+    // completeRestore() path anyway (readiness IS this recovery completing).
     cloneRepository: () => deps.bootstrapper.cloneRepository(),
     checkoutBase: () => deps.bootstrapper.checkoutBase(),
     restoreCheckpoint: () => deps.bootstrapper.restoreCheckpoint(),

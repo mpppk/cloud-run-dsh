@@ -17,17 +17,22 @@
 //
 // What the lifecycle steps mean on the control plane (which has no workspace
 // files, no git, no sandbox — the image deliberately omits them):
-//   waitForInstanceHealth  REAL: polls Instances API GET until READY, then
-//                          polls the agent-host readiness endpoint
-//                          (AGENT_HOST_HEALTH_PATH — "/readyz", NEVER
-//                          "/healthz": Cloud Run reserves "/healthz", issue
-//                          #68) until it reports ready, and persists
-//                          workspaces.instance_url.
+//   openInstance  REAL: the instance start (create-or-start + :start API
+//                 calls). Issue #136 made this async: NO readiness polling
+//                 happens in-request anymore — the old waitForInstanceHealth
+//                 (Instances API GET until READY, then the agent-host /readyz
+//                 poll, up to ~6 minutes) held POST /open for minutes, so it
+//                 was removed. Completion authority is the agent-host's
+//                 completeRestore() persisting READY on the shared row;
+//                 clients poll GET /v1/workspaces/:id, and a STARTING /
+//                 RESTORING row older than STALE_STARTING_THRESHOLD_MS
+//                 (handlers.ts, 案A) reads as RESTORE_FAILED. The last live
+//                 URL is resolved on demand by instanceUrlProvider below, so
+//                 message forwarding self-heals without the poll's row write.
 //   clone/checkout/        NO-OP: executed INSIDE the instance by the
 //   restore/sandbox/       agent-host restart recovery (実装手順書 section 30).
-//   restoreHarness         The control plane observes their completion via the
-//                          agent-host readiness poll above; READY here means
-//                          "instance healthy AND agent-host recovery complete".
+//   restoreHarness         The control plane never observes their completion —
+//                          the agent-host persists READY itself when done.
 //
 // Issue #60 案C: the control plane owns ONLY the instance lifecycle and the
 // health observation above. Its WorkspaceRuntime runs openInstance()
@@ -75,8 +80,7 @@ import type {
 } from "@cloud-run-dsh/cloud-run-instance-client";
 import { GcsCheckpointStorage } from "@cloud-run-dsh/workspace-checkpoint";
 import type { GcsClient } from "@cloud-run-dsh/workspace-checkpoint";
-import { AGENT_HOST_HEALTH_PATH, IdleManager, WorkspaceRuntime } from "@cloud-run-dsh/workspace-runtime";
-import { redactValue } from "@cloud-run-dsh/observability";
+import { IdleManager, WorkspaceRuntime } from "@cloud-run-dsh/workspace-runtime";
 import type {
   TransactionalStateStore,
   WorkspaceLifecycleSteps,
@@ -89,48 +93,7 @@ import { RuntimeRegistry, WorkspaceRuntimeHandleAdapter } from "./deps.js";
 import type { ControlPlaneClock } from "./deps.js";
 import type { ControlPlaneConfig } from "./config.js";
 import { conflict } from "./errors.js";
-import type {
-  ForwardIdentity,
-  IdTokenProvider,
-  MessageForwarder,
-} from "./forwarding.js";
-
-/**
- * Minimal surface used to poll the agent-host readiness endpoint
- * (AGENT_HOST_HEALTH_PATH) with global fetch in prod. The `init` carries
- * the invoker-IAM Authorization header minted by the default
- * implementation; test stubs may ignore it. `text()` is required (not
- * optional) so a failing poll can always report WHAT the host answered —
- * issue #68: a status-only `{ok, status}` shape plus a swallowing catch
- * made 401-vs-unreachable indistinguishable in the logs.
- */
-export interface HealthCheckResponse {
-  readonly ok: boolean;
-  readonly status: number;
-  text(): Promise<string>;
-}
-
-export type HealthFetch = (url: string, init?: RequestInit) => Promise<HealthCheckResponse>;
-
-export interface PollConfig {
-  readonly maxAttempts: number;
-  readonly intervalMs: number;
-}
-
-/** ~2 minutes: Instance create/start cold start budget. */
-export const DEFAULT_INSTANCE_POLL: PollConfig = { maxAttempts: 60, intervalMs: 2000 };
-/** ~1 minute: agent-host recovery (clone + restore + sandbox) budget once READY. */
-export const DEFAULT_AGENT_HEALTH_POLL: PollConfig = { maxAttempts: 30, intervalMs: 2000 };
-/**
- * ~3 minutes: Google-frontend shutdown-window allowance (issue #121).
- * After `stop`, Cloud Run keeps serving the frontend HTML error page on the
- * Instance URL for ~60s while the old generation shuts down; those answers
- * are "the URL is not serving yet", not "the app is unhealthy", so they are
- * counted against THIS budget, never against DEFAULT_AGENT_HEALTH_POLL.
- * Genuinely broken hosts therefore still fail fast (~1 min) while a
- * stop-then-open still succeeds once the new generation answers.
- */
-export const DEFAULT_AGENT_SHUTDOWN_GRACE: PollConfig = { maxAttempts: 90, intervalMs: 2000 };
+import type { ForwardIdentity, MessageForwarder } from "./forwarding.js";
 
 export interface ProductionRuntimeOptions {
   readonly config: ControlPlaneConfig;
@@ -142,30 +105,7 @@ export interface ProductionRuntimeOptions {
   readonly instanceTransport: HttpTransport;
   /** GCS client behind the checkpoint storage (fake in tests). */
   readonly gcsClient: GcsClient;
-  readonly healthFetch?: HealthFetch;
-  /**
-   * ID-token mint for the health poll (issue #68, reused from #22 forwarding:
-   * the SAME RefreshingIdTokenProvider main.ts gives the forwarder — tokens
-   * are audience-bound per Instance URL so the cache is shared, not minted
-   * twice). Used ONLY by the default healthFetch; tests that inject their
-   * own healthFetch never touch it. When absent the default poll goes out
-   * unauthenticated (local dev without invoker IAM).
-   */
-  readonly idTokenProvider?: IdTokenProvider;
-  /** Transport behind the default healthFetch (global fetch in prod; a recording fake in tests). */
-  readonly fetchImpl?: typeof fetch;
-  readonly instancePoll?: PollConfig;
-  readonly agentHealthPoll?: PollConfig;
-  /**
-   * Issue #121: separate budget for Google-frontend shutdown-window pages
-   * (HTML 5xx while the old generation shuts down). Defaults to
-   * DEFAULT_AGENT_SHUTDOWN_GRACE (~3 min — covers the observed ~60s window
-   * plus margin). Finite by design: an endless frontend page still rejects.
-   */
-  readonly shutdownGracePoll?: PollConfig;
-  readonly sleep?: (ms: number) => Promise<void>;
-  /**
-   * Test override for the injected CONTROLLER_ID. Production callers pass the
+  /** Test override for the injected CONTROLLER_ID. Production callers pass the
    * open-established lease id per open() (issue #60 案B) and this hook is
    * only the fallback for paths that resolve no lease. Defaults to
    * crypto.randomUUID() per handle — which MUST match the lease the
@@ -390,164 +330,6 @@ class EnsureCreatedInstanceRuntime implements InstanceRuntime {
 }
 
 /**
- * Issue #121 案B: tells "the URL is not serving yet" apart from "the app
- * answered unhealthy". While Cloud Run shuts the old generation down, the
- * Instance URL serves the Google-frontend HTML error page (observed:
- * `HTTP 500: <html>...<title>500 Server Error</title>...`). The agent-host
- * itself ALWAYS answers JSON (`{"status": ...}` — healthy 200 or 503 while
- * restoring), so a 5xx with an HTML body cannot be the host reporting on
- * itself; it is the frontend saying no generation is behind the URL yet.
- * Such answers must not consume the agent-health budget — they are the
- * shutdown window, not evidence of unhealth.
- *
- * The match is deliberately `<html` ONLY (no `server error` alternative):
- * the agent-host's own catch-all is `500 {"error":"internal server error",
- * ...}` (gateway handle()), which contains that phrase — matching on it
- * would misclassify a genuinely broken host as "still shutting down" and
- * burn the 3-minute shutdown budget instead of failing fast on the health
- * budget. Google-frontend error pages are always HTML, so nothing real is
- * lost by requiring the tag.
- */
-export function isFrontendShutdownResponse(status: number, bodyText: string): boolean {
-  if (status < 500 || status > 599) return false;
-  return bodyText.toLowerCase().includes("<html");
-}
-
-/**
- * Summarizes one failed health attempt for the timeout error (issue #68,
- * cause 3): status + a truncated, redactor-scrubbed body snippet. The body
- * is NEVER embedded raw — an error page could echo request details — so it
- * goes through the observability redactor (high-entropy tokens, secret
- * assignments) and is cut to 200 chars.
- */
-export function summarizeHealthFailure(status: number, bodyText: string): string {
-  const redacted = String(redactValue(bodyText.trim()));
-  const snippet = redacted.length <= 200 ? redacted : `${redacted.slice(0, 200)}…`;
-  return snippet === "" ? `HTTP ${status} (empty body)` : `HTTP ${status}: ${snippet}`;
-}
-
-/** Best-effort body read for the failure summary above; never throws. */
-async function safeHealthBody(res: HealthCheckResponse): Promise<string> {
-  try {
-    return await res.text();
-  } catch {
-    return "";
-  }
-}
-
-/** Audience for the poll's ID token: the Instance origin (issue #22 rule). */
-export function healthPollAudience(healthUrl: string): string {
-  try {
-    return new URL(healthUrl).origin;
-  } catch {
-    return healthUrl;
-  }
-}
-
-async function waitForInstanceHealth(args: {
-  client: CloudRunInstanceClient;
-  instanceName: string;
-  repo: SessionPersistenceRepository;
-  workspaceId: string;
-  healthFetch: HealthFetch;
-  instancePoll: PollConfig;
-  agentHealthPoll: PollConfig;
-  /** Issue #121: separate budget for frontend shutdown-window pages. */
-  shutdownGrace: PollConfig;
-  sleep: (ms: number) => Promise<void>;
-}): Promise<void> {
-  const { client, instanceName, repo, workspaceId, healthFetch, sleep } = args;
-  let instanceUrl: string | null = null;
-  for (let attempt = 1; attempt <= args.instancePoll.maxAttempts; attempt++) {
-    const info = await client.get(instanceName);
-    if (info.state === "READY" && info.url) {
-      instanceUrl = info.url;
-      break;
-    }
-    if (attempt < args.instancePoll.maxAttempts) await sleep(args.instancePoll.intervalMs);
-  }
-  if (!instanceUrl) {
-    throw new Error(
-      `instance ${instanceName} never became READY ` +
-        `(${args.instancePoll.maxAttempts} polls) — not retrying blindly`,
-    );
-  }
-  // The path MUST stay AGENT_HOST_HEALTH_PATH (never "/healthz" — Cloud Run
-  // reserves it and never forwards it to the container, issue #68). The
-  // constant is shared with the agent-host gateway; the equality is pinned
-  // by tests on both sides.
-  const healthUrl = `${instanceUrl.replace(/\/$/, "")}${AGENT_HOST_HEALTH_PATH}`;
-  // Issue #121: frontend shutdown-window pages (isFrontendShutdownResponse)
-  // are counted against the SEPARATE shutdownGrace budget, never against
-  // agentHealthPoll — they mean "no generation is serving this URL yet",
-  // not "the app is unhealthy". Both budgets are finite, so neither a
-  // broken host nor a never-appearing URL can poll forever.
-  //
-  // Loop shape: the fetch lives in its own try/catch so budget-exhaustion
-  // throws below never pass through a catch that could misclassify them.
-  const healthNote = (skipped: number): string =>
-    skipped > 0
-      ? ` (${skipped} frontend shutdown-window pages were skipped under a separate budget and are not counted above)`
-      : ``;
-  let lastFailure = "no health attempts completed";
-  let healthAttempts = 0;
-  let shutdownSkipped = 0;
-  for (;;) {
-    let res: HealthCheckResponse;
-    try {
-      res = await healthFetch(healthUrl);
-    } catch (e) {
-      // Unreachable host, aborted request, or a failing ID-token mint —
-      // keep polling within budget, but remember WHY for the final error.
-      const reason = e instanceof Error ? e.message : String(e);
-      lastFailure = `fetch failed: ${String(redactValue(reason))}`;
-      healthAttempts++;
-      if (healthAttempts >= args.agentHealthPoll.maxAttempts) {
-        throw new Error(
-          `instance ${instanceName} is READY but its agent-host never became healthy ` +
-            `(${args.agentHealthPoll.maxAttempts} polls of ${healthUrl}). ` +
-            `Last failure: ${lastFailure} — not marking READY blindly` +
-            healthNote(shutdownSkipped),
-        );
-      }
-      await sleep(args.agentHealthPoll.intervalMs);
-      continue;
-    }
-    if (res.ok) {
-      await repo.updateWorkspace(workspaceId, { instanceUrl });
-      return;
-    }
-    const body = await safeHealthBody(res);
-    if (isFrontendShutdownResponse(res.status, body)) {
-      shutdownSkipped++;
-      lastFailure =
-        `frontend shutdown-window page (NOT the agent-host — the instance URL is not serving yet): ` +
-        summarizeHealthFailure(res.status, body);
-      if (shutdownSkipped > args.shutdownGrace.maxAttempts) {
-        throw new Error(
-          `instance ${instanceName} URL kept serving the Google frontend error page ` +
-            `(${shutdownSkipped} attempts over ~${Math.round((shutdownSkipped * args.shutdownGrace.intervalMs) / 1000)}s) — ` +
-            `the instance may still be shutting down or never became reachable. ` +
-            `Last: ${lastFailure} — not marking READY blindly`,
-        );
-      }
-    } else {
-      healthAttempts++;
-      lastFailure = summarizeHealthFailure(res.status, body);
-      if (healthAttempts >= args.agentHealthPoll.maxAttempts) {
-        throw new Error(
-          `instance ${instanceName} is READY but its agent-host never became healthy ` +
-            `(${args.agentHealthPoll.maxAttempts} polls of ${healthUrl}). ` +
-            `Last failure: ${lastFailure} — not marking READY blindly` +
-            healthNote(shutdownSkipped),
-        );
-      }
-    }
-    await sleep(args.agentHealthPoll.intervalMs);
-  }
-}
-
-/**
  * Manual-checkpoint work for runManualCheckpoint (issue #75): FIRST takes a
  * real checkpoint on the agent-host via the `remote` trigger (which throws
  * when the durable snapshot was NOT written — so `checkpointed: true` is
@@ -610,29 +392,6 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
   const { config, repo, stateStore, clock } = opts;
   const basePath = buildInstancesBasePathForConfig(config);
   const checkpointStorage = new GcsCheckpointStorage(opts.gcsClient, config.checkpointBucket);
-  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  const fetchImpl = opts.fetchImpl ?? fetch;
-  const idTokenProvider = opts.idTokenProvider;
-  // Default health poll (issue #68, cause 2): Instances carry invoker IAM,
-  // so the poll mints an ID token for the Instance origin via the SAME
-  // provider the #22 forwarder uses (forwarding.ts RefreshingIdTokenProvider
-  // — metadata server `.../identity?audience=<instance-url>`, never a second
-  // copy of the mint logic). A bare fetch() here 401s on every attempt.
-  const healthFetch: HealthFetch =
-    opts.healthFetch ??
-    (async (url: string, init?: RequestInit): Promise<HealthCheckResponse> => {
-      const headers = new Headers(init?.headers);
-      if (idTokenProvider) {
-        // A failing mint throws HERE and is recorded as the attempt's
-        // failure reason by the poll loop — never silently unauthenticated.
-        const idToken = await idTokenProvider(healthPollAudience(url));
-        headers.set("authorization", `Bearer ${idToken}`);
-      }
-      return fetchImpl(url, { ...init, headers });
-    });
-  const instancePoll = opts.instancePoll ?? DEFAULT_INSTANCE_POLL;
-  const agentHealthPoll = opts.agentHealthPoll ?? DEFAULT_AGENT_HEALTH_POLL;
-  const shutdownGrace = opts.shutdownGracePoll ?? DEFAULT_AGENT_SHUTDOWN_GRACE;
 
   // Issue #60 案B: the controllerId comes from the open-established lease
   // (handlers.openWorkspace resolves it via the lease service and passes it
@@ -729,20 +488,9 @@ export function createProductionRuntimeRegistry(opts: ProductionRuntimeOptions):
       return { skipped: result.skipped };
     };
     const steps: WorkspaceLifecycleSteps = {
-      waitForInstanceHealth: () =>
-        waitForInstanceHealth({
-          client,
-          instanceName,
-          repo,
-          workspaceId: workspace.id,
-          healthFetch,
-          instancePoll,
-          agentHealthPoll,
-          shutdownGrace,
-          sleep,
-        }),
       // Executed inside the Instance by agent-host restart recovery
-      // (実装手順書 section 30); observed via the readiness poll above.
+      // (実装手順書 section 30). Issue #136: the control plane no longer
+      // observes their completion — the agent-host persists READY itself.
       cloneRepository: async () => {},
       checkoutBase: async () => {},
       restoreCheckpoint: async () => {},

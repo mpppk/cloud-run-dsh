@@ -40,6 +40,7 @@ import type { QueryExecutor } from "@cloud-run-dsh/session-persistence-postgres"
 import { listWorkspaces } from "./handlers.js";
 import type { Clock } from "@cloud-run-dsh/workspace-checkpoint";
 import { createDbReadinessProbe } from "./prod-adapters.js";
+import { STALE_STARTING_THRESHOLD_MS } from "./handlers.js";
 import {
   badRequest,
   createControlPlaneDeps,
@@ -246,6 +247,8 @@ class FakeExecutor implements QueryExecutor {
 /** Fake per-workspace runtime handle used by most route tests. */
 class FakeHandle implements WorkspaceRuntimeHandle {
   state = "STOPPED";
+  /** What open() answers (production answers STARTING, then the agent-host drives READY). */
+  openState = "READY";
   activities: ActivityKind[] = [];
   openCalls = 0;
   stopCalls = 0;
@@ -256,7 +259,7 @@ class FakeHandle implements WorkspaceRuntimeHandle {
 
   async open(): Promise<string> {
     this.openCalls++;
-    this.state = "READY";
+    this.state = this.openState;
     return this.state;
   }
 
@@ -315,6 +318,8 @@ function throwingFactory(): (workspace: Workspace) => WorkspaceRuntimeHandle {
 interface TestHarness {
   deps: ControlPlaneDeps;
   repo: SessionPersistenceRepository;
+  /** The in-memory executor behind repo — tests backdate updated_at through it. */
+  executor: FakeExecutor;
   membership: InMemoryMembershipStore;
   leases: ControllerLeaseService;
   handles: Map<string, FakeHandle>;
@@ -327,7 +332,8 @@ interface TestHarness {
 function startHarness(
   overrides: Partial<ControlPlaneDeps> = {},
 ): TestHarness {
-  const repo = new PostgresSessionPersistenceRepository(new FakeExecutor());
+  const executor = new FakeExecutor();
+  const repo = new PostgresSessionPersistenceRepository(executor);
   const leases = new ControllerLeaseService({ store: new InMemoryLeaseStore(), clock: new SystemClock() });
   const membership = new InMemoryMembershipStore();
   const handles = new Map<string, FakeHandle>();
@@ -385,6 +391,7 @@ function startHarness(
   return {
     deps,
     repo,
+    executor,
     membership,
     leases,
     handles,
@@ -1608,7 +1615,6 @@ function makeRealRuntime(workspaceId: string): {
     instanceName: "inst",
     idle: new IdleManager(baseClock),
     steps: {
-      waitForInstanceHealth: noop,
       cloneRepository: noop,
       checkoutBase: noop,
       restoreCheckpoint: noop,
@@ -1650,12 +1656,13 @@ describe("open/stop composition with the T8 runtime", () => {
         }),
       ]);
 
-      expect(r1.status).toBe(200);
-      expect(r2.status).toBe(200);
-      expect(r3.status).toBe(200);
+      expect(r1.status).toBe(202);
+      expect(r2.status).toBe(202);
+      expect(r3.status).toBe(202);
       const body = await r1.json();
       // Issue #60 案C: the control plane stops at STARTING (one shared
-      // start); the agent-host phase completes the row to READY.
+      // start); the agent-host phase completes the row to READY. Issue #136:
+      // all three opens answer 202 without waiting for that phase.
       expect(body.state).toBe("STARTING");
       expect(startCalls()).toBe(1);
       // The opener holds the controller lease, so it can message right away.
@@ -1791,7 +1798,7 @@ describe("open/stop composition with the T8 runtime", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({}),
       });
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(202);
       const body = await res.json();
       expect(body.state).toBe("STARTING");
       expect(await runtime.completeRestore()).toBe("READY");
@@ -1805,6 +1812,229 @@ describe("open/stop composition with the T8 runtime", () => {
     const clock: ControlPlaneClock = new SystemClock();
     expect(typeof clock.now).toBe("function");
     expect(typeof clock.nowMs).toBe("function");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #136 — async open (202 + GET polling, lazy stale failure 案A)
+// ---------------------------------------------------------------------------
+
+describe("async open (issue #136)", () => {
+  /** Ages the workspace row's updated_at (simulates a generation nobody advances). */
+  function backdateUpdatedAt(h: TestHarness, workspaceId: string, ageMs: number): void {
+    const row = h.executor.workspaces.get(workspaceId);
+    if (!row) throw new Error(`workspace missing: ${workspaceId}`);
+    row["updated_at"] = new Date(Date.now() - ageMs).toISOString();
+  }
+
+  function postOpen(h: TestHarness, workspaceId: string): Promise<Response> {
+    return h.fetchAs("alice", `/v1/workspaces/${workspaceId}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+  }
+
+  function pinStartingHandle(h: TestHarness, workspaceId: string): FakeHandle {
+    const handle = new FakeHandle();
+    handle.openState = "STARTING";
+    h.deps.runtimes.set(workspaceId, handle);
+    return handle;
+  }
+
+  test("open answers 202 STARTING without waiting for the agent-host phase", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      pinStartingHandle(h, ws.id);
+      const res = await postOpen(h, ws.id);
+      expect(res.status).toBe(202);
+      expect(await res.json()).toMatchObject({ workspaceId: ws.id, state: "STARTING" });
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("re-open of an already-READY workspace is a 200 no-op", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      // Default FakeHandle opens straight to READY (single-process shape).
+      const res = await postOpen(h, ws.id);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ workspaceId: ws.id, state: "READY" });
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("open while STARTING coalesces to 202 without touching the runtime", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      const handle = pinStartingHandle(h, ws.id);
+      // An in-flight generation: the row is STARTING, fresh.
+      await h.repo.updateWorkspace(ws.id, { runtimeState: "STARTING" });
+      const res = await postOpen(h, ws.id);
+      expect(res.status).toBe(202);
+      expect(await res.json()).toMatchObject({ state: "STARTING" });
+      // Coalesced at the HTTP layer — no second instance start was issued.
+      expect(handle.openCalls).toBe(0);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("fresh STARTING / RESTORING rows keep reading as preparing (never a #121 false failure)", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      // #121: stop-then-open observably takes ~3 min — far below the stale
+      // threshold, so it must read as "preparing", never as failed.
+      await h.repo.updateWorkspace(ws.id, { runtimeState: "STARTING" });
+      backdateUpdatedAt(h, ws.id, STALE_STARTING_THRESHOLD_MS - 60_000);
+      const starting = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`);
+      expect(starting.status).toBe(200);
+      expect(((await starting.json()) as { runtimeState: string }).runtimeState).toBe("STARTING");
+
+      await h.repo.updateWorkspace(ws.id, { runtimeState: "RESTORING" });
+      const restoring = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`);
+      expect((((await restoring.json()) as { runtimeState: string }).runtimeState)).toBe(
+        "RESTORING",
+      );
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("stale STARTING row reads as RESTORE_FAILED on GET (finite failure, 案A)", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      await h.repo.updateWorkspace(ws.id, { runtimeState: "STARTING" });
+      backdateUpdatedAt(h, ws.id, STALE_STARTING_THRESHOLD_MS + 60_000);
+      const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`);
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { runtimeState: string }).runtimeState).toBe("RESTORE_FAILED");
+      // Persisted: every later reader agrees, and the failure is stable
+      // (the mark bumps updated_at, so it is not re-marked in a loop).
+      expect((await h.repo.getWorkspace(ws.id))!.runtimeState).toBe("RESTORE_FAILED");
+      const again = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`);
+      expect(((await again.json()) as { runtimeState: string }).runtimeState).toBe(
+        "RESTORE_FAILED",
+      );
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("stale RESTORING row reads as RESTORE_FAILED on GET", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      await h.repo.updateWorkspace(ws.id, { runtimeState: "RESTORING" });
+      backdateUpdatedAt(h, ws.id, STALE_STARTING_THRESHOLD_MS + 60_000);
+      const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`);
+      expect(((await res.json()) as { runtimeState: string }).runtimeState).toBe("RESTORE_FAILED");
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("open on a stale STARTING row fails it first, then retries into STARTING", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      const handle = pinStartingHandle(h, ws.id);
+      await h.repo.updateWorkspace(ws.id, { runtimeState: "STARTING" });
+      backdateUpdatedAt(h, ws.id, STALE_STARTING_THRESHOLD_MS + 60_000);
+      const res = await postOpen(h, ws.id);
+      // The dead generation was failed (RESTORE_FAILED is re-openable), and
+      // this open started a fresh one — 202, not a 409 against the corpse.
+      expect(res.status).toBe(202);
+      expect(await res.json()).toMatchObject({ state: "STARTING" });
+      expect(handle.openCalls).toBe(1);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("late agent-host READY is visible via GET with no re-open (#122 shape)", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      pinStartingHandle(h, ws.id);
+      expect((await (await postOpen(h, ws.id)).json()) as { state: string }).toMatchObject({
+        state: "STARTING",
+      });
+      // The agent-host completes on the shared row (what completeRestore()
+      // persists in production); the control plane was never re-invoked.
+      await h.repo.updateWorkspace(ws.id, { runtimeState: "READY" });
+      const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}`);
+      expect(((await res.json()) as { runtimeState: string }).runtimeState).toBe("READY");
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("事実2: message after async open + late READY never 409s on a missing instance_url", async () => {
+    // The regression this pins: the old readiness poll wrote
+    // workspaces.instance_url after /readyz ok. With the poll gone, the row
+    // stays null — and message forwarding must still work once the Instance
+    // is reachable, via the live Instances API lookup (instanceUrlProvider),
+    // never 409 "open the workspace first" for a workspace that IS open.
+    const forwarder = new RecordingForwarder();
+    const h = startHarness({ messageForwarder: forwarder });
+    try {
+      const ws = await h.createWorkspace("alice");
+      const handle = pinStartingHandle(h, ws.id);
+      // FakeHandle.instanceUrl stands in for the production
+      // instanceUrlProvider live lookup; inputAllowed stands in for the T8
+      // assertAgentInputAllowed row reload.
+      handle.instanceUrl = null;
+      handle.inputAllowed = false;
+
+      // 1. open answers 202 while NO health check ran: the row has no URL.
+      expect((await (await postOpen(h, ws.id)).json()) as { state: string }).toMatchObject({
+        state: "STARTING",
+      });
+      expect((await h.repo.getWorkspace(ws.id))!.instanceUrl).toBeNull();
+
+      // 2. While STARTING, a message is refused as "preparing" (409) — the
+      // pre-existing T8 gate, unchanged by this issue.
+      const sessionRes = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(sessionRes.status).toBe(201);
+      const sessionId = ((await sessionRes.json()) as { id: string }).id;
+      const early = await h.fetchAs("alice", `/v1/sessions/${sessionId}/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ content: "too early" }),
+      });
+      expect(early.status).toBe(409);
+
+      // 3. The Instance becomes reachable (live API now reports a URL) and
+      // the agent-host persists READY — still nobody wrote instance_url.
+      handle.instanceUrl = "https://ah.test";
+      handle.inputAllowed = true;
+      await h.repo.updateWorkspace(ws.id, { runtimeState: "READY" });
+      expect((await h.repo.getWorkspace(ws.id))!.instanceUrl).toBeNull();
+
+      // 4. The message goes through (201), forwarded to the live URL.
+      const res = await h.fetchAs("alice", `/v1/sessions/${sessionId}/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ content: "hello after ready" }),
+      });
+      expect(res.status).toBe(201);
+      expect(forwarder.calls).toHaveLength(1);
+      expect(forwarder.calls[0]!.instanceUrl).toBe("https://ah.test");
+    } finally {
+      h.stop();
+    }
   });
 });
 

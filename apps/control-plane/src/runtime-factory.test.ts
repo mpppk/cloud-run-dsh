@@ -2,10 +2,10 @@
 // No real GCP: the Instances API is a FakeTransport (imported via the
 // package's `./testing` entrypoint), the DB is the shared InMemoryFakeExecutor
 // (via its `./testing` entrypoint), GCS is an in-memory GcsClient, and the
-// agent-host readiness endpoint is a stubbed HealthFetch.
+// agent-host phase runs as a second WorkspaceRuntime on the shared row.
+// Issue #136: open() is async — no readiness endpoint is polled in-request.
 
 import { describe, expect, test } from "bun:test";
-import { AGENT_HOST_HEALTH_PATH } from "@cloud-run-dsh/workspace-runtime";
 import { FakeTransport } from "@cloud-run-dsh/cloud-run-instance-client/testing";
 import {
   PostgresSessionPersistenceRepository,
@@ -28,11 +28,6 @@ import {
   buildInstancesBasePathForConfig,
   createProductionRuntimeRegistry,
   defaultInstanceName,
-  healthPollAudience,
-  isFrontendShutdownResponse,
-  summarizeHealthFailure,
-  DEFAULT_AGENT_SHUTDOWN_GRACE,
-  type HealthFetch,
 } from "./runtime-factory.js";
 import {
   AgentHostConflictError,
@@ -90,8 +85,6 @@ interface Harness {
   executor: InMemoryFakeExecutor;
   transport: FakeTransport;
   gcs: MapGcsClient;
-  healthFetch: HealthFetch;
-  healthCalls: string[];
 }
 
 function makeHarness(): Harness {
@@ -101,12 +94,7 @@ function makeHarness(): Harness {
   const repo = new PostgresSessionPersistenceRepository(executor);
   const transport = new FakeTransport();
   const gcs = new MapGcsClient();
-  const healthCalls: string[] = [];
-  const healthFetch: HealthFetch = async (url: string) => {
-    healthCalls.push(url);
-    return { ok: true, status: 200, text: async () => JSON.stringify({ status: "READY" }) };
-  };
-  return { repo, executor, transport, gcs, healthFetch, healthCalls };
+  return { repo, executor, transport, gcs };
 }
 
 async function seedWorkspace(repo: SessionPersistenceRepository, id = "ws-1") {
@@ -168,10 +156,6 @@ function makeRegistry(
     clock: new SystemClock(),
     instanceTransport: h.transport,
     gcsClient: h.gcs,
-    healthFetch: h.healthFetch,
-    instancePoll: { maxAttempts: 3, intervalMs: 0 },
-    agentHealthPoll: { maxAttempts: 3, intervalMs: 0 },
-    sleep: async () => {},
     controllerIdForWorkspace: () => "ctrl-1",
     messageForwarder: extra?.forwarder,
   });
@@ -198,7 +182,6 @@ function makeAgentRuntime(h: Harness, workspaceId = "ws-1", cloneError?: Error):
     },
     instanceName: "dsh-ws-1",
     steps: {
-      waitForInstanceHealth: noop,
       cloneRepository: cloneError
         ? async () => {
             throw cloneError;
@@ -222,25 +205,29 @@ function driveAgentRestore(h: Harness, workspaceId = "ws-1"): Promise<string> {
 }
 
 describe("createProductionRuntimeRegistry — open() drives the Instances API", () => {
-  test("first open creates, starts, waits for health (stays STARTING); the agent phase drives READY", async () => {
+  test("first open creates + starts and answers STARTING at once (issue #136: no in-request readiness wait)", async () => {
     const h = makeHarness();
     const workspace = await seedWorkspace(h.repo);
     h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
 
     const registry = makeRegistry(h);
 
-    // Issue #60 案C: the control plane stops after the health observation —
-    // it must NOT move the shared row past STARTING.
+    // Issue #60 案C: the control plane stops at STARTING (one shared
+    // start); the agent-host phase completes the row to READY.
     const handle = await registry.get(workspace);
     const state = await handle.open();
     expect(state).toBe("STARTING");
     expect((await h.repo.getWorkspace("ws-1"))!.runtimeState).toBe("STARTING");
 
     const methods = h.transport.requests.map((r) => `${r.method} ${r.url}`);
-    expect(methods[0]).toBe(`GET ${BASE_PATH}/instances/dsh-ws-1`);
-    expect(methods[1]).toBe(`POST ${BASE_PATH}/instances?instanceId=dsh-ws-1`);
-    expect(methods[2]).toBe(`POST ${BASE_PATH}/instances/dsh-ws-1:start`);
-    expect(methods[3]).toBe(`GET ${BASE_PATH}/instances/dsh-ws-1`);
+    // Exactly the fast calls: existence GET, create, start. NO readiness
+    // polling — the old 4th+ requests (instance GET loop + /readyz fetches)
+    // are gone, so open() answers within seconds (issue #136).
+    expect(methods).toEqual([
+      `GET ${BASE_PATH}/instances/dsh-ws-1`,
+      `POST ${BASE_PATH}/instances?instanceId=dsh-ws-1`,
+      `POST ${BASE_PATH}/instances/dsh-ws-1:start`,
+    ]);
 
     // create body: image + SA + Standard resources + all 13 agent-host env keys
     const createReq = h.transport.requests[1]!;
@@ -289,15 +276,17 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     const hostParam = env["DATABASE_URL"]!.split("?host=")[1]!.split("&")[0];
     expect(decodeURIComponent(hostParam!)).toBe("/cloudsql/test-proj:test-region:main");
 
-    // agent-host readiness was polled at the instance URL from GET, on the
-    // shared AGENT_HOST_HEALTH_PATH (issue #68 — never /healthz)
-    expect(h.healthCalls).toEqual([`https://dsh-ws-1.run.app${AGENT_HOST_HEALTH_PATH}`]);
-
-    // durable row carries the name + URL for #22
+    // agent-host readiness was NOT polled: no /readyz fetch happened, and
+    // the row carries the instance name but no URL yet. The URL resolves on
+    // demand through instanceUrlProvider (live Instances API GET) — this is
+    // what keeps message forwarding working after an async open (issue #136
+    // 事実2: the poll's row write is gone, the live lookup replaces it).
     const row = await h.repo.getWorkspace("ws-1");
     expect(row!.instanceName).toBe("dsh-ws-1");
-    expect(row!.instanceUrl).toBe("https://dsh-ws-1.run.app");
+    expect(row!.instanceUrl).toBeNull();
     expect(await handle.getInstanceUrl()).toBe("https://dsh-ws-1.run.app");
+    // ... and the live lookup persisted it for direct row readers.
+    expect((await h.repo.getWorkspace("ws-1"))!.instanceUrl).toBe("https://dsh-ws-1.run.app");
 
     // The agent-host phase completes the shared row: RESTORING -> READY.
     expect(await driveAgentRestore(h)).toBe("READY");
@@ -383,7 +372,7 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     h.transport.setHandler(async (req) => {
       if (req.method === "GET") {
         gets++;
-        // First GET (existence check): missing. Later GETs (health poll): ready.
+        // First GET (existence check): missing. Later GETs report ready.
         if (gets === 1) return { status: 404, body: { message: "not found" } };
         return { status: 200, body: instanceBody("dsh-ws-1", "https://dsh-ws-1.run.app") };
       }
@@ -398,325 +387,23 @@ describe("createProductionRuntimeRegistry — open() drives the Instances API", 
     await expect(driveAgentRestore(h)).resolves.toBe("READY");
   });
 
-  test("open fails honestly when the instance never becomes READY", async () => {
+  test("open records RESTORE_FAILED when the instance start fails (fail fast, in-request)", async () => {
+    // Issue #136: the request still covers the fast instance start, so a
+    // synchronous start failure rejects open() immediately and records
+    // RESTORE_FAILED — only the minutes-long readiness wait moved out.
     const h = makeHarness();
     const workspace = await seedWorkspace(h.repo);
     h.transport.setHandler(async (req) => {
-      if (req.method === "GET") {
-        return {
-          status: 200,
-          body: { name: "dsh-ws-1", terminalCondition: { state: "CONDITION_PENDING" } },
-        };
+      if (req.method === "GET") return { status: 404, body: { message: "not found" } };
+      if (req.method === "POST" && req.url.includes("/instances?instanceId=")) {
+        return { status: 200, body: { name: `${BASE_PATH}/operations/op-1`, done: true } };
       }
-      return { status: 200, body: {} };
+      return { status: 500, body: { message: "start failed: boom" } };
     });
     const registry = makeRegistry(h);
     const handle = await registry.get(workspace);
-    await expect(handle.open()).rejects.toThrow(/never became READY/);
-    expect(handle.getState()).toBe("RESTORE_FAILED");
-    // No agent-host health polling happened — there was no URL to poll.
-    expect(h.healthCalls).toEqual([]);
-  });
-
-  test("open fails honestly when the agent-host never becomes healthy", async () => {
-    const h = makeHarness();
-    const workspace = await seedWorkspace(h.repo);
-    h.transport.setHandler(async (req) => {
-      if (req.method === "GET") {
-        return { status: 200, body: instanceBody("dsh-ws-1", "https://dsh-ws-1.run.app") };
-      }
-      return { status: 200, body: {} };
-    });
-    const unhealthy: HealthFetch = async (url: string) => {
-      h.healthCalls.push(url);
-      return { ok: false, status: 503, text: async () => JSON.stringify({ status: "RESTORING" }) };
-    };
-    const registry = createProductionRuntimeRegistry({
-      config: testConfig(),
-      repo: h.repo,
-      stateStore: new SqlTransactionalStateStore(h.executor),
-      clock: new SystemClock(),
-      instanceTransport: h.transport,
-      gcsClient: h.gcs,
-      healthFetch: unhealthy,
-      instancePoll: { maxAttempts: 2, intervalMs: 0 },
-      agentHealthPoll: { maxAttempts: 2, intervalMs: 0 },
-      sleep: async () => {},
-    });
-    const handle = await registry.get(workspace);
-    await expect(handle.open()).rejects.toThrow(/never became healthy/);
-    expect(handle.getState()).toBe("RESTORE_FAILED");
-  });
-
-  test("issue #68: unhealthy answers surface status + body in the timeout error", async () => {
-    // Cause 3: the old `catch {}` + status-only error hid whether the host
-    // was unreachable, unauthenticated, or just still restoring. The last
-    // attempt's reason must travel with the timeout error.
-    const h = makeHarness();
-    const workspace = await seedWorkspace(h.repo);
-    h.transport.setHandler(async (req) => {
-      if (req.method === "GET") {
-        return { status: 200, body: instanceBody("dsh-ws-1", "https://dsh-ws-1.run.app") };
-      }
-      return { status: 200, body: {} };
-    });
-    const restoring: HealthFetch = async () => ({
-      ok: false,
-      status: 503,
-      text: async () => JSON.stringify({ status: "RESTORING", workspaceId: "ws-1" }),
-    });
-    const registry = createProductionRuntimeRegistry({
-      config: testConfig(),
-      repo: h.repo,
-      stateStore: new SqlTransactionalStateStore(h.executor),
-      clock: new SystemClock(),
-      instanceTransport: h.transport,
-      gcsClient: h.gcs,
-      healthFetch: restoring,
-      instancePoll: { maxAttempts: 2, intervalMs: 0 },
-      agentHealthPoll: { maxAttempts: 2, intervalMs: 0 },
-      sleep: async () => {},
-    });
-    const handle = await registry.get(workspace);
-    const err = await handle.open().then(
-      (): Error | null => null,
-      (e: unknown) => e as Error,
-    );
-    expect(err).not.toBeNull();
-    expect(err!.message).toMatch(/never became healthy/);
-    expect(err!.message).toMatch(/Last failure: HTTP 503/);
-    expect(err!.message).toContain("RESTORING");
-  });
-
-  test("issue #68: thrown poll failures (unreachable host) surface in the timeout error", async () => {
-    const h = makeHarness();
-    const workspace = await seedWorkspace(h.repo);
-    h.transport.setHandler(async (req) => {
-      if (req.method === "GET") {
-        return { status: 200, body: instanceBody("dsh-ws-1", "https://dsh-ws-1.run.app") };
-      }
-      return { status: 200, body: {} };
-    });
-    const unreachable: HealthFetch = async () => {
-      throw new Error("connection refused");
-    };
-    const registry = createProductionRuntimeRegistry({
-      config: testConfig(),
-      repo: h.repo,
-      stateStore: new SqlTransactionalStateStore(h.executor),
-      clock: new SystemClock(),
-      instanceTransport: h.transport,
-      gcsClient: h.gcs,
-      healthFetch: unreachable,
-      instancePoll: { maxAttempts: 2, intervalMs: 0 },
-      agentHealthPoll: { maxAttempts: 2, intervalMs: 0 },
-      sleep: async () => {},
-    });
-    const handle = await registry.get(workspace);
-    await expect(handle.open()).rejects.toThrow(/Last failure: fetch failed: connection refused/);
-  });
-
-  test("issue #68: the failure summary redacts secrets instead of embedding the body raw", async () => {
-    // An error page could echo request details — the snippet goes through
-    // the observability redactor (SECRET_PATTERNS net).
-    const leaked = "upstream blew up: sk-or-v1-abcdefghij1234567890";
-    expect(summarizeHealthFailure(503, leaked)).not.toContain("sk-or-v1-abcdefghij1234567890");
-    expect(summarizeHealthFailure(503, leaked)).toContain("[REDACTED]");
-    expect(summarizeHealthFailure(503, leaked)).toContain("HTTP 503");
-    // ... and the redaction holds end to end through open().
-    const h = makeHarness();
-    const workspace = await seedWorkspace(h.repo);
-    h.transport.setHandler(async (req) => {
-      if (req.method === "GET") {
-        return { status: 200, body: instanceBody("dsh-ws-1", "https://dsh-ws-1.run.app") };
-      }
-      return { status: 200, body: {} };
-    });
-    const leaking: HealthFetch = async () => ({
-      ok: false,
-      status: 502,
-      text: async () => leaked,
-    });
-    const registry = createProductionRuntimeRegistry({
-      config: testConfig(),
-      repo: h.repo,
-      stateStore: new SqlTransactionalStateStore(h.executor),
-      clock: new SystemClock(),
-      instanceTransport: h.transport,
-      gcsClient: h.gcs,
-      healthFetch: leaking,
-      instancePoll: { maxAttempts: 2, intervalMs: 0 },
-      agentHealthPoll: { maxAttempts: 2, intervalMs: 0 },
-      sleep: async () => {},
-    });
-    const handle = await registry.get(workspace);
-    const err = await handle.open().then(
-      (): Error | null => null,
-      (e: unknown) => e as Error,
-    );
-    expect(err!.message).not.toContain("sk-or-v1-abcdefghij1234567890");
-    expect(err!.message).toContain("[REDACTED]");
-  });
-
-  test("issue #68: long bodies are truncated in the failure summary", async () => {
-    const body = `x: ${"y".repeat(500)}`;
-    const summary = summarizeHealthFailure(500, body);
-    expect(summary.length).toBeLessThan(body.length);
-    expect(summary).toContain("…");
-  });
-
-  test("healthPollAudience is the Instance origin (the #22 audience rule)", async () => {
-    expect(healthPollAudience("https://dsh-ws-1.run.app/readyz")).toBe("https://dsh-ws-1.run.app");
-    expect(healthPollAudience("https://dsh-ws-1.run.app/")).toBe("https://dsh-ws-1.run.app");
-  });
-
-  test("issue #68: the poll hits the shared path (never /healthz), even with a trailing-slash URL", async () => {
-    expect(AGENT_HOST_HEALTH_PATH).toBe("/readyz");
-    const h = makeHarness();
-    const workspace = await seedWorkspace(h.repo);
-    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app/"));
-    const registry = makeRegistry(h);
-    const handle = await registry.get(workspace);
-    await handle.open();
-    // No doubled slash, no /healthz: the exact URL the agent-host gateway serves.
-    expect(h.healthCalls).toEqual([`https://dsh-ws-1.run.app${AGENT_HOST_HEALTH_PATH}`]);
-  });
-
-  test("issue #68: the default poll mints an ID token for the Instance origin (cause 2)", async () => {
-    // No injected healthFetch: the production default must attach
-    // `Authorization: Bearer <ID token>` minted for the Instance URL —
-    // a bare fetch() 401s behind invoker IAM on every attempt.
-    const h = makeHarness();
-    const workspace = await seedWorkspace(h.repo);
-    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
-    const audiences: string[] = [];
-    const seen: { url: string; authorization: string | null }[] = [];
-    const fetchImpl = (async (url: unknown, init?: RequestInit) => {
-      const headers = new Headers(init?.headers);
-      seen.push({ url: String(url), authorization: headers.get("authorization") });
-      return {
-        ok: true,
-        status: 200,
-        text: async () => JSON.stringify({ status: "READY" }),
-      };
-    }) as unknown as typeof fetch;
-    const registry = createProductionRuntimeRegistry({
-      config: testConfig(),
-      repo: h.repo,
-      stateStore: new SqlTransactionalStateStore(h.executor),
-      clock: new SystemClock(),
-      instanceTransport: h.transport,
-      gcsClient: h.gcs,
-      // The #22 provider shape, recording stub: audience must be the
-      // Instance origin (healthPollAudience rule, same as the forwarder).
-      idTokenProvider: async (audience: string) => {
-        audiences.push(audience);
-        return "test-id-token";
-      },
-      fetchImpl,
-      instancePoll: { maxAttempts: 3, intervalMs: 0 },
-      agentHealthPoll: { maxAttempts: 3, intervalMs: 0 },
-      sleep: async () => {},
-      controllerIdForWorkspace: () => "ctrl-1",
-    });
-    const handle = await registry.get(workspace);
-    await handle.open();
-    expect(seen).toHaveLength(1);
-    expect(seen[0]!.url).toBe(`https://dsh-ws-1.run.app${AGENT_HOST_HEALTH_PATH}`);
-    expect(seen[0]!.authorization).toBe("Bearer test-id-token");
-    expect(audiences).toEqual(["https://dsh-ws-1.run.app"]);
-  });
-
-  test("issue #68: without a provider the default poll stays unauthenticated (local dev)", async () => {
-    // Off-GCP there is no metadata server and no invoker IAM: the default
-    // must still work, just without the Authorization header.
-    const h = makeHarness();
-    const workspace = await seedWorkspace(h.repo);
-    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
-    const seen: { authorization: string | null }[] = [];
-    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
-      seen.push({ authorization: new Headers(init?.headers).get("authorization") });
-      return {
-        ok: true,
-        status: 200,
-        text: async () => JSON.stringify({ status: "READY" }),
-      };
-    }) as unknown as typeof fetch;
-    const registry = createProductionRuntimeRegistry({
-      config: testConfig(),
-      repo: h.repo,
-      stateStore: new SqlTransactionalStateStore(h.executor),
-      clock: new SystemClock(),
-      instanceTransport: h.transport,
-      gcsClient: h.gcs,
-      fetchImpl,
-      instancePoll: { maxAttempts: 3, intervalMs: 0 },
-      agentHealthPoll: { maxAttempts: 3, intervalMs: 0 },
-      sleep: async () => {},
-      controllerIdForWorkspace: () => "ctrl-1",
-    });
-    const handle = await registry.get(workspace);
-    await handle.open();
-    expect(seen).toHaveLength(1);
-    expect(seen[0]!.authorization).toBeNull();
-  });
-
-  test("issue #63: agent-host restore failure surfaces the health error, not IllegalTransitionError", async () => {
-    // Production split (issue #60) on the shared SQL row: the agent-host
-    // fails git clone and commits RESTORE_FAILED while the control plane is
-    // still polling the readiness endpoint in STARTING. open() must reject with the health
-    // observation error — the old code replaced it with
-    // "illegal state transition: STARTING -> RESTORE_FAILED", hiding the
-    // real cause.
-    const h = makeHarness();
-    const workspace = await seedWorkspace(h.repo);
-    h.transport.setHandler(openFlowHandler("dsh-ws-1", "https://dsh-ws-1.run.app"));
-    let releaseHealth!: () => void;
-    const healthGate = new Promise<void>((resolve) => {
-      releaseHealth = resolve;
-    });
-    const gatedUnhealthy: HealthFetch = async (url: string) => {
-      h.healthCalls.push(url);
-      await healthGate;
-      return { ok: false, status: 503, text: async () => JSON.stringify({ status: "RESTORING" }) };
-    };
-    const registry = createProductionRuntimeRegistry({
-      config: testConfig(),
-      repo: h.repo,
-      stateStore: new SqlTransactionalStateStore(h.executor),
-      clock: new SystemClock(),
-      instanceTransport: h.transport,
-      gcsClient: h.gcs,
-      healthFetch: gatedUnhealthy,
-      instancePoll: { maxAttempts: 3, intervalMs: 0 },
-      agentHealthPoll: { maxAttempts: 2, intervalMs: 0 },
-      sleep: async () => {},
-    });
-    const handle = await registry.get(workspace);
-    const caughtP = handle.open().then(
-      (): Error | null => null,
-      (e: unknown) => e as Error,
-    );
-    // Wait until the control plane has taken the shared row to STARTING.
-    for (let i = 0; i < 1000; i++) {
-      const current = await h.repo.getWorkspace("ws-1");
-      if (current?.runtimeState === "STARTING") break;
-      await new Promise((r) => setTimeout(r, 1));
-    }
-    expect((await h.repo.getWorkspace("ws-1"))?.runtimeState).toBe("STARTING");
-
-    // The agent-host fails git clone and records RESTORE_FAILED itself.
-    const agent = makeAgentRuntime(h, "ws-1", new Error("git clone failed: connection refused"));
-    await expect(agent.completeRestore()).rejects.toThrow("git clone failed");
-    expect((await h.repo.getWorkspace("ws-1"))?.runtimeState).toBe("RESTORE_FAILED");
-
-    // ... then the control plane's health observation fails too.
-    releaseHealth();
-    const err = await caughtP;
-    expect(err).not.toBeNull();
-    expect(err).not.toBeInstanceOf(IllegalTransitionError);
-    expect(err!.message).toMatch(/never became healthy/);
-    expect((await h.repo.getWorkspace("ws-1"))?.runtimeState).toBe("RESTORE_FAILED");
+    await expect(handle.open()).rejects.toThrow();
+    expect((await h.repo.getWorkspace("ws-1"))!.runtimeState).toBe("RESTORE_FAILED");
   });
 });
 
@@ -759,10 +446,6 @@ describe("issue #60 — one lease, split state machine", () => {
       clock: new SystemClock(),
       instanceTransport: h.transport,
       gcsClient: h.gcs,
-      healthFetch: h.healthFetch,
-      instancePoll: { maxAttempts: 3, intervalMs: 0 },
-      agentHealthPoll: { maxAttempts: 3, intervalMs: 0 },
-      sleep: async () => {},
     });
     const handle = await registry.get(workspace, "lease-ctrl-from-open");
     expect(await handle.open()).toBe("STARTING");
@@ -897,6 +580,10 @@ describe("getInstanceUrl — the #22 forwarding seam", () => {
     const registry = makeRegistry(h);
     const handle = await registry.get(workspace);
     await handle.open();
+    // Issue #136: open() no longer persists the URL (no readiness poll) —
+    // the row stays null until the first live lookup below.
+    expect((await h.repo.getWorkspace("ws-1"))!.instanceUrl).toBeNull();
+    expect(await handle.getInstanceUrl()).toBe("https://dsh-ws-1.run.app");
     expect(await h.repo.getWorkspace("ws-1")).toMatchObject({
       instanceUrl: "https://dsh-ws-1.run.app",
     });
@@ -1483,153 +1170,5 @@ describe("assertCloudSqlSocketConsistency — issue #56 mount/DATABASE_URL contr
     const registry = makeRegistry(h, { cloudSqlConnectionName: "   " });
     await expect(registry.get(workspace)).rejects.toThrow(/CLOUD_SQL_CONNECTION_NAME/);
     expect(h.transport.requests).toEqual([]);
-  });
-});
-
-describe("issue #121 — the Cloud Run shutdown window vs the readiness budget", () => {
-  /**
-   * What the Instance URL serves while Cloud Run is still shutting the old
-   * generation down (the real 2026-09-05 report): a Google-frontend HTML
-   * error page — NOT an agent-host JSON answer. The agent-host itself
-   * answers JSON (e.g. 503 {"status":"RESTORING"}) once its URL is live.
-   */
-  const FRONTEND_500_HTML =
-    `<html><head><meta http-equiv="content-type" content="text/html;charset=utf-8">` +
-    `<title>500 Server Error</title></head>` +
-    `<body text=#000000 bgcolor=#ffffff><h1>Error: Server Error</h1>` +
-    `<h2>The service you requested is not available at this time.</h2></body></html>`;
-  const HOST_RESTORING_JSON = JSON.stringify({ status: "RESTORING", workspaceId: "ws-1" });
-
-  function readyInstanceHandler() {
-    return async (req: { method: string }) => {
-      if (req.method === "GET") {
-        return { status: 200, body: instanceBody("dsh-ws-1", "https://dsh-ws-1.run.app") };
-      }
-      return { status: 200, body: {} };
-    };
-  }
-
-  function registryWithHealth(
-    h: Harness,
-    healthFetch: HealthFetch,
-    agentHealthPoll: { maxAttempts: number; intervalMs: number },
-  ) {
-    return createProductionRuntimeRegistry({
-      config: testConfig(),
-      repo: h.repo,
-      stateStore: new SqlTransactionalStateStore(h.executor),
-      clock: new SystemClock(),
-      instanceTransport: h.transport,
-      gcsClient: h.gcs,
-      healthFetch,
-      instancePoll: { maxAttempts: 3, intervalMs: 0 },
-      agentHealthPoll,
-      sleep: async () => {},
-    });
-  }
-
-  test("late recovery after a frontend-500 shutdown window succeeds (budget is not spent on 500s)", async () => {
-    // stop -> open 1s later: the first 5 polls hit the shutting-down URL
-    // (frontend 500s), then the new generation answers healthy. The health
-    // budget is only 3 — if frontend 500s consumed it, this open would fail
-    // exactly like the 2026-09-05 incident. Before the fix this rejects with
-    // "never became healthy".
-    const h = makeHarness();
-    const workspace = await seedWorkspace(h.repo);
-    h.transport.setHandler(readyInstanceHandler());
-    let calls = 0;
-    const shutdownThenHealthy: HealthFetch = async (url: string) => {
-      calls++;
-      h.healthCalls.push(url);
-      if (calls <= 5) {
-        return { ok: false, status: 500, text: async () => FRONTEND_500_HTML };
-      }
-      return { ok: true, status: 200, text: async () => JSON.stringify({ status: "READY" }) };
-    };
-    const registry = registryWithHealth(h, shutdownThenHealthy, { maxAttempts: 3, intervalMs: 0 });
-    const handle = await registry.get(workspace);
-    await expect(handle.open()).resolves.toBe("STARTING");
-    expect(h.healthCalls).toHaveLength(6);
-  });
-
-  test("a genuinely broken host still fails within budget (no unbounded waiting)", async () => {
-    // The agent-host itself keeps answering 503 JSON — that IS evidence of
-    // unhealth, so the poll must give up after maxAttempts, not wait forever.
-    const h = makeHarness();
-    const workspace = await seedWorkspace(h.repo);
-    h.transport.setHandler(readyInstanceHandler());
-    const broken: HealthFetch = async (url: string) => {
-      h.healthCalls.push(url);
-      return { ok: false, status: 503, text: async () => HOST_RESTORING_JSON };
-    };
-    const registry = registryWithHealth(h, broken, { maxAttempts: 3, intervalMs: 0 });
-    const handle = await registry.get(workspace);
-    const err = await handle.open().then(
-      (): Error | null => null,
-      (e: unknown) => e as Error,
-    );
-    expect(err).not.toBeNull();
-    expect(err!.message).toMatch(/never became healthy/);
-    // Issue #121 log distinction: a host JSON 503 is reported as the host's
-    // own answer — never labeled as a frontend shutdown page.
-    expect(err!.message).toMatch(/Last failure: HTTP 503/);
-    expect(err!.message).not.toContain("frontend");
-    // Bounded: exactly the health budget was spent — no more, no endless loop.
-    expect(h.healthCalls).toHaveLength(3);
-    expect(handle.getState()).toBe("RESTORE_FAILED");
-  });
-
-  test("an endless frontend-500 window still fails bounded (the shutdown budget is finite)", async () => {
-    // If the URL never comes alive, open() must still reject instead of
-    // polling forever — the shutdown-window allowance is a second finite
-    // budget, not an infinite pass.
-    const h = makeHarness();
-    const workspace = await seedWorkspace(h.repo);
-    h.transport.setHandler(readyInstanceHandler());
-    const alwaysFrontend: HealthFetch = async (url: string) => {
-      h.healthCalls.push(url);
-      return { ok: false, status: 500, text: async () => FRONTEND_500_HTML };
-    };
-    const registry = registryWithHealth(h, alwaysFrontend, { maxAttempts: 3, intervalMs: 0 });
-    const handle = await registry.get(workspace);
-    const err = await handle.open().then(
-      (): Error | null => null,
-      (e: unknown) => e as Error,
-    );
-    expect(err).not.toBeNull();
-    // The failure names the shutdown window, not a broken host — and the
-    // health-budget phrasing ("never became healthy") is not reused for it.
-    expect(err!.message).toMatch(/frontend error page/);
-    expect(err!.message).not.toMatch(/never became healthy/);
-    // Exactly the shutdown budget was spent, then it stopped: finite proof.
-    expect(h.healthCalls).toHaveLength(DEFAULT_AGENT_SHUTDOWN_GRACE.maxAttempts + 1);
-    expect(handle.getState()).toBe("RESTORE_FAILED");
-  });
-
-  test("isFrontendShutdownResponse: HTML 5xx is the frontend, JSON is the host", () => {
-    // The observed incident body.
-    expect(isFrontendShutdownResponse(500, FRONTEND_500_HTML)).toBe(true);
-    expect(isFrontendShutdownResponse(502, "<html><body>Bad Gateway</body></html>")).toBe(true);
-    expect(isFrontendShutdownResponse(503, "<html><body>Service Unavailable</body></html>")).toBe(
-      true,
-    );
-    // The agent-host's own answers are JSON — even a 500 from the app must
-    // count against the health budget, never the shutdown allowance.
-    expect(isFrontendShutdownResponse(503, HOST_RESTORING_JSON)).toBe(false);
-    expect(isFrontendShutdownResponse(500, JSON.stringify({ error: "boom" }))).toBe(false);
-    // The host's catch-all 500 (gateway handle()) literally contains
-    // "internal server error" — it must NOT match either, or a genuinely
-    // broken host would burn the 3-minute shutdown budget instead of
-    // failing fast on the health budget.
-    expect(
-      isFrontendShutdownResponse(
-        500,
-        JSON.stringify({ error: "internal server error", errorId: "abc123" }),
-      ),
-    ).toBe(false);
-    // Non-5xx is never the shutdown window (401 invoker-IAM, 404 no route…).
-    expect(isFrontendShutdownResponse(401, FRONTEND_500_HTML)).toBe(false);
-    expect(isFrontendShutdownResponse(200, FRONTEND_500_HTML)).toBe(false);
-    expect(isFrontendShutdownResponse(500, "")).toBe(false);
   });
 });
