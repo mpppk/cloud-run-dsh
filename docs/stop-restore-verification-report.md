@@ -9,10 +9,12 @@ workspace 復元」を実機で通した記録**である。
 [#75](https://github.com/mpppk/cloud-run-dsh/issues/75)）が正しいことを実機で確認し、
 その過程で**新たに 5 件の問題**を発見した。
 
-その後、**さらに 4 周**（環境の構築 → 確認 → 撤収）を回している。
-2周目は §6、3周目は §7、4周目は §8、5周目は §9、5 周を通した総括は §11 にある。
-**復元は 5 周とも成立した**（4周目だけは open を呼び直す必要があった — §8.3）。
-**5周目は新しいバグが 1 件も出なかった** — その読み方は §11 末尾に書いた。
+その後、**さらに 5 周**（環境の構築 → 確認 → 撤収）を回している。
+2周目は §6、3周目は §7、4周目は §8、5周目は §9、6周目は §10、6 周を通した総括は §12 にある。
+6周目だけは目的が違い、**#135（`open` の非同期化 / workspace 一覧 / product UI）と #141 の
+診断情報**を初めて実機に載せる周である。
+**復元は 6 周とも成立した**（4周目だけは open を呼び直す必要があった — §8.3）。
+**5周目は新しいバグが 1 件も出なかった** — その読み方は §12 末尾に書いた。
 
 検証後、GCP リソースはすべて削除済み（各周の撤収節）。
 
@@ -315,7 +317,7 @@ the "pg_use_reserved_connections" role
 | 同時 stop のレース | ローカルで決定論的に再現済み（#88 → PR #92）。**実機では未確認** |
 | `workspace_checkpoints` を書くか消すか | **決着。**「書く」を採用（#95 → PR #101）。2周目の実機で 3 行を確認（§6.1）。ただし全行が同じオブジェクトを指す点は [#110](https://github.com/mpppk/cloud-run-dsh/issues/110) |
 | `/readyz` の DB 到達性 | **決着。**実プローブを入れた（#97 → PR #102）。2周目の実機で ready を確認（§6.1） |
-| IAP フロントエンド | 未作成（ブランドは一度作ると削除できないため）。本検証は `--ingress=all` + `--no-allow-unauthenticated` + ID トークンで代替した。**IAP 経由の経路は依然未検証** |
+| IAP フロントエンド | 未作成（ブランドは一度作ると削除できないため）。本検証は `--ingress=all` + `--no-allow-unauthenticated` + ID トークンで代替した。**IAP 経由の経路は依然未検証**。6周目でも利用者が明示的に見送りを決めており、[#128](https://github.com/mpppk/cloud-run-dsh/issues/128) はこの 1 条件だけ未達で開いたままである（§10） |
 
 ---
 
@@ -868,7 +870,145 @@ num_backends sample 3: 0 (from 1 series)    ← 4周目は 8 サンプル必要�
 
 ---
 
-## 10. 1周目レポート（open まで）との差分
+## 10. 6周目（2026-09-07）— product UI と `open` の非同期化を実機で通す周
+
+**目的が今までと違う。** 1〜5周目は「stop → 復元」という同じ看板機能を繰り返し確かめる周だった。
+6周目は **[#135](https://github.com/mpppk/cloud-run-dsh/issues/135) の実装（`open` の非同期化 /
+workspace 一覧 / product UI）と [#141](https://github.com/mpppk/cloud-run-dsh/issues/141) の
+診断情報**を、初めて実機に載せる周である。
+
+`main` は `844b3a6`。**52 追加 → 検証 → 47 destroy、エラー 0 件、リソース 0 に復帰。**
+
+**IAP ブランドは意図的に作っていない。** 一度作るとプロジェクトから削除できないため利用者が見送りを決めた。
+`TF_VAR_iap_support_email` を未設定にすることで `google_iap_brand` / `google_iap_client` は
+`count = 0` になり、plan にも現れないことを確認した（[#128](https://github.com/mpppk/cloud-run-dsh/issues/128)
+の IAP 条件は未達のまま残る）。control-plane は IAP ではなく Cloud Run IAM
+（`--no-allow-unauthenticated` + ID トークン）で保護し、IAP ヘッダは手で付けた。
+
+### 10.1 計測値
+
+| 確認項目 | 結果 |
+|---|---|
+| `POST /v1/workspaces/:id/open`（[#136](https://github.com/mpppk/cloud-run-dsh/issues/136)） | **HTTP 202 を 1.19 秒**で返した |
+| `GET /v1/workspaces/:id` のポーリングで READY 到達 | **20 秒** |
+| `stop` → 1 秒後に `open`（[#121](https://github.com/mpppk/cloud-run-dsh/issues/121)） | `stop` 200（1 秒）→ `open` **202 を 0.62 秒** → READY **30 秒**。`RESULT #121: PASS` |
+| controller lease を 75 秒放置（[#143](https://github.com/mpppk/cloud-run-dsh/pull/143)） | `held:true` のまま。`expiresAt` が `21:03:45` → `21:05:03` に**前進**した |
+| `GET /v1/workspaces`（[#137](https://github.com/mpppk/cloud-run-dsh/issues/137)） | `{"workspaces":[]}` → 1 件 → **別の IAP identity では 0 件** |
+| IAP ヘッダ無しの `GET /v1/workspaces` | **401** |
+| product UI（[#138](https://github.com/mpppk/cloud-run-dsh/issues/138)） | `/app` `/app/app.js` `/app/app.css` `/app/sse.js` が Cloud Run から 200 |
+| `/app/<uuid>`（動的パス） | **404** — 完全一致 allowlist が本番でも効いている |
+| product UI の語彙 | 配信された HTML に `controllerId` / `approvalId` / `lease` / `RESTORE_FAILED` は 0 件 |
+| debug UI（`/`、`/ui/*`） | 200。共存が壊れていない |
+| workspace DTO | `lastError` を**含まない**（[#141](https://github.com/mpppk/cloud-run-dsh/issues/141) の設計どおり） |
+
+**`open` が 1.19 秒で返ったことが、この周の主結果である。** 同期実装では通常 60 秒、
+#121 の shutdown 猶予が効くと約 3 分かかっていた（§9 の 36.9 秒はその「成功した方」の値である）。
+製品 UI が「3 分回るボタン」を持たずに済むという #136 の前提が、実機で成立した。
+
+### 10.2 今回のビルドで実機を通し直した 3 件
+
+いずれも過去の周で実機に触れてはいる。**「初めて」なのは各項目に書いた差分だけである**ことを
+先に断っておく。先行する実機確認は `docs/e2e-verification-report.md` の §1.2（実 LLM ターン）・
+#25（実 Cloud SQL への実 runner）・ #26（実 GCS での保存・復元）、および本レポート §1 の
+`checkpoint.bin` の記録である。
+
+**(1) 追加マイグレーション `0002_last_error.sql` の初回適用。**
+ランナー自体の実機走行は #25 で済んでいる。今回初めてなのは、#141 が足した
+**このリポジトリで最初の追加マイグレーション**の適用であり、その初回適用がいきなり本番だったことである。
+冪等性も同じ実行で確認している:
+
+```
+Applied 2 migration(s): 0001_init.sql, 0002_last_error.sql
+--- second run must be a no-op (idempotence) ---
+No pending migrations.
+tables: controller_leases, schema_migrations, session_events, sessions, workspace_checkpoints, workspaces
+workspaces.last_error: {"column_name":"last_error","is_nullable":"YES"}
+schema_migrations: 0001_init.sql, 0002_last_error.sql
+```
+
+初回適用がいきなり本番だったからこそ、冪等性の同時確認に意味がある。
+
+**(2) `edit` ツールによる既存ファイルの書き換え。**
+実機での LLM ターン自体は 1〜5 周目も回っている（e2e レポート §1.2 の `read`、
+2〜5周目のマーカー書き込みの `write` / `read` / `glob`）。
+今回初めてなのは、clone 済みリポジトリの既存ファイルに対する `read` → `edit` の往復であり、
+`tool/result` の成功（`isError: false`）まで確認している。
+「README.md の先頭に挨拶を1行だけ足してください。」を送ったところ、1 ターンが最後まで回った:
+
+```
+turn/start → step 1: tool/call read  {"file_path": "/workspace/README.md"}
+           → step 2: tool/call edit  {"old_string": "TODO app built with TanStack Start, ...",
+                                      "new_string": "こんにちは！よろしくお願いします。\n\n..."}
+           → assistant/chunk ×51 → assistant/message ×3
+turn/end   {"reason":{"kind":"completed"}}
+model: deepseek/deepseek-v4-flash（provider: deepseek-official）
+usage: inputTokens 178 / outputTokens 64 / cacheReadTokens 4096（最終ステップの値。ターン累計 totalTokens は 4338）
+```
+
+**エージェントは実際に clone 済みリポジトリのファイルを読んで書き換えている。**
+SSE は 41,213 バイト、`user_message` / `turn/*` / `step/*` / `tool/call` / `tool/result` /
+`assistant/*` が揃っていた。
+
+**(3) 現行ビルドのチェックポイントが実バケットに書かれることの再確認。**
+実バケットへの書き込み自体は 1 周目から毎周起きている（§1 の `checkpoint.bin`、#26 の保存・復元）。
+今回の記録は「#135 / #141 後のビルドでも書かれている」の再確認であり、撤収時に消す対象として現れた:
+
+```
+Removing gs://cloud-run-dsh-dev-checkpoints/workspaces/9491e741-.../checkpoint.bin#1788728724905170...
+```
+
+### 10.3 実機では新しいバグが 0 件だった。ただしそれは偶然ではない
+
+**課金を始める前に、本番と同じ構成をローカルで先に踏んだ**。その段階で 2 件見つけている。
+
+1. **bring-up スクリプトの env キーが 2 箇所間違っていた** — `SQL_CONNECTION_NAME`（正しくは
+   `CLOUD_SQL_CONNECTION_NAME`）と、そもそも書き忘れていた `AGENT_HOST_DATABASE_URL`。
+   本番イメージを実 Postgres につないで起動して初めて分かった（`MissingRequiredEnvError`）。
+   気付かずに走らせていれば、Cloud SQL を作ってから control-plane が起動しない形で止まっていた
+2. **`RESTORE_FAILED` なのに `last_error` が NULL のままだった** — 認証失敗のように
+   **リクエスト内で `open` が投げる**経路（bring-up 直後に最も出やすい形）に理由が残らなかった。
+   runbook は「`last_error` を読め」と書いているのに空振りする。
+   [#145](https://github.com/mpppk/cloud-run-dsh/pull/145) で塞ぎ、同じ手順で
+   `before: NULL` / `after: 理由あり` を確認してから本番に載せた
+
+加えて、仕様書 §29 が「**毎回デプロイ前に確認せよ**」と定める Cloud Run Instances Preview API の
+ドリフト確認も、課金前に読み取りだけで行った。`validateOnly=true` にクライアントが組み立てる
+body をそのまま投げると `403`（サービスアカウント未作成）まで到達し、対照実験（未知フィールド →
+`400 Cannot find field`、不正 enum → `400 Invalid value`）で「形は受理された」ことを確定させている。
+
+**「実機で 0 件」は「バグが無い」ではなく、「実機に載せる前に踏んだ」である。**
+
+### 10.4 撤収
+
+[#123](https://github.com/mpppk/cloud-run-dsh/issues/123) の修正（v2 REST で列挙 → 削除 →
+0 になるまでポーリング）が、5周目に続いて今回も効いた:
+
+```
+found: [dsh-9491e741-e427-438d-88fb-bf90c7a54ea5]
+deleting instance: dsh-9491e741-e427-438d-88fb-bf90c7a54ea5
+instances remaining: 1 (check 1/30) … 0 (check 4/30)
+num_backends sample 1: 2 → sample 2: 3 → sample 3: 1 → sample 4: 0
+Destroy complete! Resources: 47 destroyed.
+```
+
+エラー 0 件。[#73](https://github.com/mpppk/cloud-run-dsh/issues/73)（マイグレーション後に
+`dsh_app` ロールを落とせない）は再発しなかった。撤収後に独立して数え直し、
+Cloud Run サービス / Cloud SQL / シークレット / バケット / Artifact Registry /
+Cloud Run Instance がすべて 0 であることを確認した（Step 8.7 の記録）。
+サービスアカウントとネットワークは `terraform destroy`（47 件、エラーなし）の管理下で削除され、
+IAP ブランドは `count = 0` で作られていない（ログに `google_iap_brand` /
+`google_iap_client` の作成記録は無い）。
+ローカルの秘密（DB パスワード、LLM キー、`DATABASE_URL`）と `terraform.tfstate` は削除した。
+
+> 数字の出どころ: `52 added` とマイグレーションは `g1-bringup.log`、
+> 202 の 1.19 秒 / READY 20 秒 / lease の `expiresAt` 前進 / `RESULT #121: PASS` /
+> 静的配信の応答コードは `g1-verify.log`、ターンの中身は `g1-sse.txt`、
+> Step 8.1 の 4 回・ゲートの 4 サンプル・`47 destroyed` は `g1-teardown.log`
+> （いずれもコーディネータの scratchpad）。
+
+---
+
+## 11. 1周目レポート（open まで）との差分
 
 | | 前回（open まで） | 今回（stop → 復元） |
 |---|---|---|
@@ -883,23 +1023,26 @@ num_backends sample 3: 0 (from 1 series)    ← 4周目は 8 サンプル必要�
 
 ---
 
-## 11. 5 周を通しての総括
+## 12. 6 周を通しての総括
 
-環境を 5 回作って壊した（1〜3周目は同じ日、4〜5周目は翌日にまたがった）。
+環境を 6 回作って壊した（1〜3周目は同じ日、4・5周目は翌日、6周目はその翌日）。
+**6周目だけは目的が違う** — stop → 復元をもう一度なぞる周ではなく、
+#135 と #141 の新しい実装を初めて実機に載せる周である（§10）。
 
-| | 1周目 | 2周目 | 3周目 | 4周目 | 5周目 |
-|---|---|---|---|---|---|
-| 新しく見つかったバグ | 5 件（#93 / #94 / #95 / #96 / #97 ほか） | 3 件（#107 / #109 / #110） | 1 件（#115） | 3 件（#121 / #122 / #123） | **0 件** |
-| デプロイの revision | 00003（2 回失敗） | **00001** | **00001** | **00001** | **00001** |
-| `terraform destroy` | 1 回（事前に `DROP OWNED BY`） | 1 回 | 2 回（#115） | 1 回（ゲートが効いた） | **1 回** |
-| Terraform リソース | 50 | 52 | 52 | 52 適用 / 47 destroy | 52 適用 / 47 destroy |
-| `num_backends` ピーク | — | 23 | 10 | 10 | **10** |
-| 復元 | 39 秒 | 58 秒 | 18 秒 | 失敗 → 再 open で成功（#121） | **stop 直後の open が 36.9 秒で成功** |
+| | 1周目 | 2周目 | 3周目 | 4周目 | 5周目 | 6周目 |
+|---|---|---|---|---|---|---|
+| 新しく見つかったバグ | 5 件（#93 / #94 / #95 / #96 / #97 ほか） | 3 件（#107 / #109 / #110） | 1 件（#115） | 3 件（#121 / #122 / #123） | **0 件** | **実機 0 件**（課金前のローカル検証で 2 件 — §10.3） |
+| デプロイの revision | 00003（2 回失敗） | **00001** | **00001** | **00001** | **00001** | **00001** |
+| `terraform destroy` | 1 回（事前に `DROP OWNED BY`） | 1 回 | 2 回（#115） | 1 回（ゲートが効いた） | **1 回** | **1 回** |
+| Terraform リソース | 50 | 52 | 52 | 52 適用 / 47 destroy | 52 適用 / 47 destroy | 52 適用 / 47 destroy |
+| `num_backends` ピーク | — | 23 | 10 | 10 | **10** | 3（ゲートの観測値） |
+| 復元 | 39 秒 | 58 秒 | 18 秒 | 失敗 → 再 open で成功（#121） | **stop 直後の open が 36.9 秒で成功** | **stop 直後の open が 202 を 0.62 秒で返し、30 秒で READY** |
+| `open` の応答 | 同期（完了まで待つ） | 同期 | 同期 | 同期（失敗時 63.6 秒） | 同期（36.9 秒） | **非同期 202 を 1.19 秒**（#136） |
 
 **「周を追うごとにバグが減る」は 3周目までの話だった。** 4周目で 3 件に戻っている。
 減っていたのではなく、**まだ触っていない経路が残っていただけ**である。
 そして 5周目は **0 件**だった — ただしこれは「もう無い」ではなく、
-**5周目が 4周目と同じ叩き方をした**ことの帰結でもある（§11 末尾）。
+**5周目が 4周目と同じ叩き方をした**ことの帰結でもある（§12 末尾）。
 
 ### 何が変わると新しいバグが出るか
 
@@ -916,10 +1059,10 @@ num_backends sample 3: 0 (from 1 series)    ← 4周目は 8 サンプル必要�
 
 **「手順書を読んで、書いてあるとおりに実行する」ことそれ自体が検証だった。**
 
-### バグの型は 4 周を通して変わっていない
+### バグの型は 6 周を通して変わっていない
 
 前回のレポート（open まで）は「バグ 14 件のすべてがテストダブルかコメントと
-実物の乖離だった」と結論した。**5 周を通しても、この形が大半である。**
+実物の乖離だった」と結論した。**6 周を通しても、この形が大半である。**
 
 - 1周目: `idleTimeout`、シークレットの権限、Cloud SQL のソケット形式 —
   「手元では緑」のまま実機の直前で落ちるもの
@@ -968,7 +1111,7 @@ num_backends sample 3: 0 (from 1 series)    ← 4周目は 8 サンプル必要�
 **5周目の 0 件が意味するのは、「4周目までに見つけた経路については
 直っている」ということだけである。**
 
-### 5 周を通して残った未確認事項
+### 6 周を通して残った未確認事項
 
 | 項目 | 状態 |
 |---|---|
