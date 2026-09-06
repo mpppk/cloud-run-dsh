@@ -35,6 +35,7 @@ const routes: Route[] = [
   { method: "POST", segments: ["v1", "workspaces", ":id", "controller", "acquire"], handler: handlers.acquireController },
   { method: "POST", segments: ["v1", "workspaces", ":id", "controller", "heartbeat"], handler: handlers.heartbeatController },
   { method: "POST", segments: ["v1", "workspaces", ":id", "controller", "release"], handler: handlers.releaseController },
+  { method: "GET", segments: ["v1", "workspaces", ":id", "controller"], handler: handlers.getControllerStatus },
   { method: "POST", segments: ["v1", "sessions", ":id", "messages"], handler: handlers.postMessage },
   { method: "GET", segments: ["v1", "sessions", ":id", "events"], handler: routeSessionEvents },
   { method: "POST", segments: ["v1", "sessions", ":id", "approvals", ":approvalId"], handler: handlers.postApproval },

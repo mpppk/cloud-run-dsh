@@ -23,8 +23,8 @@ import {
 } from "@cloud-run-dsh/workspace-runtime";
 import type { ActivityKind } from "@cloud-run-dsh/workspace-runtime";
 import type { InstanceRuntime } from "@cloud-run-dsh/cloud-run-instance-client";
-import { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
-import { InMemoryLeaseStore } from "@cloud-run-dsh/controller-lease/testing";
+import { ControllerLeaseService, LEASE_EXPIRY_MS } from "@cloud-run-dsh/controller-lease";
+import { FakeClock, InMemoryLeaseStore } from "@cloud-run-dsh/controller-lease/testing";
 import {
   PostgresSessionPersistenceRepository,
   type SessionPersistenceRepository,
@@ -584,6 +584,7 @@ describe("membership authorization (仕様書 sections 21/26 item 7)", () => {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ controllerId: "c1" }),
         }),
+      () => h.fetchAs("carol", `/v1/workspaces/${workspaceId}/controller`, { method: "GET" }),
       () =>
         h.fetchAs("carol", `/v1/sessions/${sessionId}/messages`, {
           method: "POST",
@@ -1152,6 +1153,140 @@ describe("controller lease routes", () => {
     expect(res.status).toBe(409);
     const body = await res.json();
     expect(body.error.message).toContain("no active controller");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Controller status read route (issue #133)
+// ---------------------------------------------------------------------------
+
+describe("controller status read route", () => {
+  let h: TestHarness;
+  beforeAll(() => {
+    h = startHarness();
+  });
+  afterAll(() => h.stop());
+
+  async function acquireAsAlice(workspaceId: string): Promise<string> {
+    const res = await h.fetchAs("alice", `/v1/workspaces/${workspaceId}/controller/acquire`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(200);
+    return ((await res.json()) as { controllerId: string }).controllerId;
+  }
+
+  test("no lease -> {held:false, mine:false, expiresAt:null}", async () => {
+    const ws = await h.createWorkspace("alice");
+    const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/controller`, { method: "GET" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ held: false, mine: false, expiresAt: null });
+  });
+
+  test("own lease -> {held:true, mine:true, expiresAt:<ISO>}", async () => {
+    const ws = await h.createWorkspace("alice");
+    await acquireAsAlice(ws.id);
+    const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/controller`, { method: "GET" });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { held: boolean; mine: boolean; expiresAt: string };
+    expect(body.held).toBe(true);
+    expect(body.mine).toBe(true);
+    expect(Number.isNaN(Date.parse(body.expiresAt))).toBe(false);
+  });
+
+  test("another member's lease -> held:true, mine:false; controllerId and userIds never leak", async () => {
+    const ws = await h.createWorkspace("alice");
+    await h.membership.addMember(ws.id, "bob");
+    const controllerId = await acquireAsAlice(ws.id);
+    const res = await h.fetchAs("bob", `/v1/workspaces/${ws.id}/controller`, { method: "GET" });
+    expect(res.status).toBe(200);
+    const raw = await res.text();
+    const body = JSON.parse(raw) as Record<string, unknown>;
+    expect(body["held"]).toBe(true);
+    expect(body["mine"]).toBe(false);
+    expect(typeof body["expiresAt"]).toBe("string");
+    // The capability (controllerId) and both user ids must not appear —
+    // not as values, not as substrings anywhere in the body.
+    expect(body).not.toHaveProperty("controllerId");
+    expect(body).not.toHaveProperty("userId");
+    expect(raw).not.toContain(controllerId);
+    expect(raw).not.toContain("alice");
+    expect(raw).not.toContain("bob");
+  });
+
+  test("expired lease reads as unheld (fake clock past LEASE_EXPIRY_MS)", async () => {
+    const leaseClock = new FakeClock(new Date("2026-09-06T00:00:00.000Z"));
+    const h2 = startHarness({
+      leases: new ControllerLeaseService({ store: new InMemoryLeaseStore(), clock: leaseClock }),
+    });
+    try {
+      const ws = await h2.createWorkspace("alice");
+      const acquire = await h2.fetchAs("alice", `/v1/workspaces/${ws.id}/controller/acquire`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(acquire.status).toBe(200);
+      const before = await h2.fetchAs("alice", `/v1/workspaces/${ws.id}/controller`, {
+        method: "GET",
+      });
+      expect(((await before.json()) as { held: boolean }).held).toBe(true);
+      leaseClock.advance(LEASE_EXPIRY_MS + 1_000);
+      const after = await h2.fetchAs("alice", `/v1/workspaces/${ws.id}/controller`, {
+        method: "GET",
+      });
+      expect(after.status).toBe(200);
+      expect(await after.json()).toEqual({ held: false, mine: false, expiresAt: null });
+    } finally {
+      h2.stop();
+    }
+  });
+
+  test("non-member -> 403; unknown workspace -> 404", async () => {
+    const ws = await h.createWorkspace("alice");
+    const forbidden = await h.fetchAs("carol", `/v1/workspaces/${ws.id}/controller`, {
+      method: "GET",
+    });
+    expect(forbidden.status).toBe(403);
+    expect(((await forbidden.json()) as { error: { code: string } }).error.code).toBe("forbidden");
+    const missing = await h.fetchAs("alice", `/v1/workspaces/00000000-0000-0000-0000-000000000000/controller`, {
+      method: "GET",
+    });
+    expect(missing.status).toBe(404);
+  });
+
+  test("reading status never calls recordActivity (仕様書 section 11)", async () => {
+    const ws = await h.createWorkspace("alice");
+    await h.fetchAs("alice", `/v1/workspaces/${ws.id}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const handle = h.handles.get(ws.id)!;
+    const seeded = handle.activities.length;
+    const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/controller`, { method: "GET" });
+    expect(res.status).toBe(200);
+    expect(handle.activities.length).toBe(seeded);
+  });
+
+  test("open's implicit lease reads as mine:true without any acquire (issue #133本体)", async () => {
+    const ws = await h.createWorkspace("alice");
+    const open = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(open.status).toBe(200);
+    // ensureControllerLeaseForOpen took the lease for the opener — the
+    // badge must agree with requireController without an explicit acquire.
+    expect((await h.deps.leases.getActive(ws.id))?.userId).toBe("alice");
+    const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/controller`, { method: "GET" });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { held: boolean; mine: boolean; expiresAt: string };
+    expect(body.held).toBe(true);
+    expect(body.mine).toBe(true);
+    expect(Number.isNaN(Date.parse(body.expiresAt))).toBe(false);
   });
 });
 

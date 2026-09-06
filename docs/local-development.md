@@ -94,6 +94,19 @@ curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" -H 'content-type: application/json' \
 # {"workspaceId":"…","controllerId":"…","expiresAt":"…"}
 ```
 
+### 4b. Check controller status (200)
+
+`open` implicitly takes the controller lease for the opener, so this reads
+`mine: true` even before any `acquire`. It returns only your relationship
+to the lease (`held` / `mine` / `expiresAt`) — never `controllerId` or user
+ids — and never extends the idle timer, so the debug UI polls it freely:
+
+```bash
+curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" \
+  "$BASE/v1/workspaces/$WS_ID/controller"
+# {"held":true,"mine":true,"expiresAt":"…"}
+```
+
 ### 5. Post a message (201)
 
 The message field is **`content`**, not `text`:
