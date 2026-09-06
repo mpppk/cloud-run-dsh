@@ -74,6 +74,7 @@ export {
   type RouteContext,
 } from "./handlers.js";
 export { handleSessionEvents } from "./sse.js";
+export { serveStaticFile } from "./static.js";
 export {
   createFetchHandler,
   describeError,

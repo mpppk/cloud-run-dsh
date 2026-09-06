@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>control-plane debug UI</title>
+<link rel="stylesheet" href="/ui/app.css" />
+</head>
+<body>
+<h1>control-plane debug UI</h1>
+<p class="hint">Same-origin debug screen for the local walkthrough in <code>docs/local-development.md</code>.
+No build step, no dependencies. Opening this page never extends the idle timer.</p>
+
+<section id="headers">
+<h2>Auth headers (local only)</h2>
+<p class="hint">Sent as <code>x-goog-authenticated-user-id</code> /
+<code>x-goog-authenticated-user-email</code> on every API call.
+Leave both empty under IAP — the proxy injects the headers, so no code change is needed.</p>
+<label>user id <input id="in-user-id" data-testid="user-id" placeholder="accounts.google.com:alice" /></label>
+<label>email <input id="in-user-email" data-testid="user-email" placeholder="alice@example.com" /></label>
+<button id="btn-save-headers" data-testid="save-headers">save</button>
+<span id="headers-state"></span>
+</section>
+
+<section id="workspaces">
+<h2>Workspaces</h2>
+<p class="hint">There is no <code>GET /v1/workspaces</code> list API, so created ids are kept in localStorage.</p>
+<div>
+<label>owner <input id="in-repo-owner" value="mpppk" size="12" /></label>
+<label>repo <input id="in-repo-name" value="demo" size="12" /></label>
+<label>branch <input id="in-base-branch" value="main" size="10" /></label>
+<button id="btn-create-ws" data-testid="create-workspace">create</button>
+</div>
+<div>
+<label>existing id <input id="in-add-ws" data-testid="add-workspace-id" size="36" placeholder="paste a workspace id" /></label>
+<button id="btn-add-ws" data-testid="add-workspace">add</button>
+</div>
+<ul id="ws-list"></ul>
+<div id="ws-detail"></div>
+<div>
+<button id="btn-refresh-ws" data-testid="refresh-workspace">refresh (GET workspace)</button>
+<button id="btn-open-ws" data-testid="open-workspace">open</button>
+<button id="btn-stop-ws" data-testid="stop-workspace">stop</button>
+<button id="btn-delete-ws" data-testid="delete-workspace">delete</button>
+<button id="btn-checkpoint" data-testid="checkpoint">manual checkpoint</button>
+<span id="checkpoint-result"></span>
+</div>
+</section>
+
+<section id="lease">
+<h2>Controller lease</h2>
+<div id="role-badge" data-testid="role-badge">role: observer</div>
+<div>
+<button id="btn-acquire" data-testid="acquire">acquire</button>
+<button id="btn-heartbeat" data-testid="heartbeat">heartbeat</button>
+<button id="btn-release" data-testid="release">release</button>
+</div>
+<div id="lease-detail">controllerId: - / expiresAt: -</div>
+</section>
+
+<section id="sessions">
+<h2>Sessions</h2>
+<div>
+<button id="btn-create-session" data-testid="create-session">create session</button>
+<button id="btn-list-sessions" data-testid="list-sessions">list sessions</button>
+</div>
+<ul id="session-list"></ul>
+<div id="session-detail">session: -</div>
+</section>
+
+<section id="turn">
+<h2>Turn</h2>
+<div>
+<label>message <input id="in-message" data-testid="message-content" size="48" placeholder="fix the flaky test" /></label>
+<button id="btn-send-message" data-testid="send-message">post message</button>
+</div>
+<div>
+<label>approvalId <input id="in-approval-id" data-testid="approval-id" size="36" placeholder="filled automatically on approval/asked" /></label>
+<button id="btn-approve" data-testid="approve">approved</button>
+<button id="btn-reject" data-testid="reject">rejected</button>
+<button id="btn-cancel" data-testid="cancel">cancel turn</button>
+</div>
+</section>
+
+<section id="sse-section">
+<h2>Event stream (SSE)</h2>
+<div>
+<button id="btn-sse-connect" data-testid="sse-connect">connect</button>
+<button id="btn-sse-disconnect" data-testid="sse-disconnect">disconnect</button>
+<span id="sse-state">disconnected</span>
+</div>
+<div id="sse-gap" class="gap-ok">no gaps</div>
+<ul id="sse-events"></ul>
+</section>
+
+<section id="reqlog-section">
+<h2>Request log</h2>
+<ul id="req-log"></ul>
+</section>
+
+<script type="module" src="/ui/app.js"></script>
+</body>
+</html>

@@ -135,6 +135,21 @@ and watch it appear.
 
 State is entirely in memory — restarting the server wipes everything.
 
+## Web UI
+
+`bun run dev:control-plane`, then open `http://127.0.0.1:8787/` — the
+control-plane serves a dependency-free debug screen (workspace / lease /
+session / turn / SSE / request log) from the same origin, so no CORS setup
+is needed.
+
+- The header box at the top fills `x-goog-authenticated-user-id` /
+  `x-goog-authenticated-user-email` for every API call (saved to
+  localStorage, omitted when empty).
+- Under IAP leave both boxes empty: the proxy injects the headers, so the
+  same screen works in production with no code change.
+- There is no workspace list API — created ids are kept in the browser's
+  localStorage (an "existing id" box imports ids made via curl).
+
 ---
 
 ## Docker dev environment
