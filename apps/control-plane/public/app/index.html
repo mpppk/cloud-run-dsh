@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ワークスペース</title>
+<link rel="stylesheet" href="/app/app.css" />
+</head>
+<body>
+<h1>ワークスペース</h1>
+<p class="hint">この画面を開いているだけでは何も動き続けません。メッセージを送ると、止まっている作業場は自動で再開します。</p>
+
+<section id="home-view">
+<h2>作業場の一覧</h2>
+<div>
+<button id="btn-refresh-list" data-testid="refresh-list">更新する</button>
+<span id="list-state" data-testid="list-state"></span>
+</div>
+<ul id="ws-list" data-testid="ws-list"></ul>
+<h2>リポジトリから始める</h2>
+<div>
+<label>オーナー <input id="in-repo-owner" data-testid="repo-owner" value="mpppk" size="12" /></label>
+<label>リポジトリ <input id="in-repo-name" data-testid="repo-name" value="demo" size="12" /></label>
+<label>ブランチ <input id="in-base-branch" data-testid="base-branch" value="main" size="10" /></label>
+<button id="btn-start" data-testid="start-workspace">リポジトリを開く</button>
+<span id="start-state" data-testid="start-state"></span>
+</div>
+</section>
+
+<section id="ws-view" hidden>
+<div>
+<a id="link-home" href="/app">一覧に戻る</a>
+<span id="ws-title" data-testid="ws-title"></span>
+</div>
+<div id="status-banner" data-testid="status-banner" class="banner banner-hidden"></div>
+<div id="readonly-banner" data-testid="readonly-banner" class="banner banner-readonly" hidden></div>
+<ul id="messages" data-testid="message-list"></ul>
+<div id="composer">
+<label>メッセージ <input id="in-message" data-testid="message-input" size="48" placeholder="やってほしいことを書いてください" /></label>
+<button id="btn-send" data-testid="send-message">送信</button>
+<button id="btn-stop" data-testid="stop-workspace">停止する</button>
+<span id="send-state" data-testid="send-state"></span>
+</div>
+<div id="stream-state" data-testid="stream-state" class="hint"></div>
+</section>
+
+<script type="module" src="/app/app.js"></script>
+</body>
+</html>

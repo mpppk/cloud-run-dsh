@@ -192,6 +192,35 @@ is needed.
   created ids are also kept in the browser's
   localStorage (an "existing id" box imports ids made via curl).
 
+### Product UI (`/app`, issue #138)
+
+`http://127.0.0.1:8787/app` serves the user-facing screen next to the debug
+UI (`/` stays as-is). No build step, no npm dependencies — plain ES modules
+(`/app/app.js` + the shared `/app/sse.js` parser).
+
+- **Home (`/app`)**: workspace list from `GET /v1/workspaces` plus a
+  "リポジトリを開く" form that runs create → prepare → session as one
+  action, then moves to the conversation screen.
+- **Conversation (`/app?ws=<id>`)**: chat + Japanese status banner +
+  inline approval cards (approve / reject in place) + a two-tap stop
+  button. The screen switches on the `?ws=<id>` query string — the pathname
+  stays `/app` because the static allowlist serves exact paths only
+  (dynamic `/app/<id>` pathnames answer 404).
+- **Transparent resume**: sending while stopped prepares behind the
+  "再開しています…" banner, waits for readiness via `GET` polling, then
+  retries the send on the same session. A failed prepare shows
+  "準備に失敗しました" with a retry button.
+- **No auth inputs**: the page sends no auth headers. Locally the dev
+  server's fake IAP stands in (headerless requests run as
+  `dev@example.com`; any explicit header wins; disable with
+  `DSH_DEV_FAKE_IAP=0`). Under production IAP the same page works
+  untouched. The fake IAP lives only in `apps/control-plane/src/dev.ts` —
+  `main.ts` never imports it.
+- **Idle-timer discipline**: the screen's timers only hit `GET` workspace /
+  controller plus the SSE stream (all `recordActivity`-free), so leaving it
+  open never extends the idle timer. Message / approval sends are the only
+  writes, and they come from clicks.
+
 ---
 
 ## Docker dev environment

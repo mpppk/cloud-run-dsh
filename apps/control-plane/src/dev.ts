@@ -22,7 +22,9 @@ import type {
   Workspace,
 } from "@cloud-run-dsh/session-persistence-postgres";
 import type { ActivityKind } from "@cloud-run-dsh/workspace-runtime";
-import { createControlPlaneDeps, startControlPlane } from "./index.js";
+import { createControlPlaneDeps, createFetchHandler } from "./index.js";
+import { SERVER_IDLE_TIMEOUT_SECONDS } from "./server.js";
+import type { RunningControlPlane } from "./index.js";
 import {
   InMemoryMembershipStore,
   RuntimeRegistry,
@@ -178,6 +180,72 @@ export function createDevControlPlaneDeps(): ControlPlaneDeps {
   });
 }
 
+/**
+ * Dev-only fake IAP (issue #138).
+ *
+ * In production IAP always injects `x-goog-authenticated-user-id` /
+ * `x-goog-authenticated-user-email` before the container, so the browser
+ * sends nothing. The local dev server has no IAP, and the product UI
+ * (`/app`) deliberately has no header input box (showing IAP internals to
+ * users would defeat its "no open / lease words" acceptance rule), so the
+ * dev server injects a default development identity when — and only when —
+ * the request carries NEITHER header. Any explicit header disables the
+ * injection for that request, so the debug UI's per-user switching keeps
+ * working untouched.
+ *
+ * Lives ONLY in this dev entrypoint: production (main.ts) composes
+ * createFetchHandler directly and never imports this module.
+ */
+export const DEV_FAKE_IAP_USER_ID_HEADER = "accounts.google.com:dev";
+export const DEV_FAKE_IAP_USER_EMAIL_HEADER = "dev@example.com";
+
+/** `DSH_DEV_FAKE_IAP=0` (also `false` / `no`) disables the fake IAP. Default: enabled. */
+export function isDevFakeIapEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env["DSH_DEV_FAKE_IAP"];
+  if (raw === undefined) return true;
+  const lowered = raw.trim().toLowerCase();
+  return lowered !== "0" && lowered !== "false" && lowered !== "no";
+}
+
+/**
+ * Dev fetch handler: the production handler wrapped with fake-IAP header
+ * injection. Same routing, same auth order (static before auth), same
+ * idleTimeout as startControlPlane — the only difference is the default
+ * identity for headerless browser navigations and fetches.
+ */
+export function createDevFetchHandler(
+  deps: ControlPlaneDeps,
+): (request: Request) => Promise<Response> {
+  const base = createFetchHandler(deps);
+  return (request: Request): Promise<Response> => {
+    if (
+      isDevFakeIapEnabled() &&
+      !request.headers.get("x-goog-authenticated-user-id") &&
+      !request.headers.get("x-goog-authenticated-user-email")
+    ) {
+      const headers = new Headers(request.headers);
+      headers.set("x-goog-authenticated-user-id", DEV_FAKE_IAP_USER_ID_HEADER);
+      headers.set("x-goog-authenticated-user-email", DEV_FAKE_IAP_USER_EMAIL_HEADER);
+      request = new Request(request, { headers });
+    }
+    return base(request);
+  };
+}
+
+/** Starts the dev server: production socket options, dev fetch handler. */
+export function startDevControlPlane(deps: ControlPlaneDeps, port: number): RunningControlPlane {
+  const server = Bun.serve({
+    hostname: "0.0.0.0",
+    port,
+    idleTimeout: SERVER_IDLE_TIMEOUT_SECONDS,
+    fetch: createDevFetchHandler(deps),
+  });
+  return {
+    port: server.port as number,
+    stop: () => server.stop(true),
+  };
+}
+
 function main(): void {
   const port = Number(process.env.PORT ?? DEFAULT_PORT);
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
@@ -185,9 +253,17 @@ function main(): void {
     process.exit(1);
   }
   const deps = createDevControlPlaneDeps();
-  const server = startControlPlane(deps, port);
+  const server = startDevControlPlane(deps, port);
   const url = `http://127.0.0.1:${server.port}`;
   console.log(`[dev] control plane listening on ${url}`);
+  if (isDevFakeIapEnabled()) {
+    console.log(
+      `[dev] fake IAP enabled: requests without IAP headers run as ${DEV_FAKE_IAP_USER_EMAIL_HEADER} ` +
+        `(explicit headers still win; disable with DSH_DEV_FAKE_IAP=0)`,
+    );
+  } else {
+    console.log("[dev] fake IAP disabled (DSH_DEV_FAKE_IAP=0): requests without IAP headers get 401");
+  }
   console.log("[dev] IAP headers: x-goog-authenticated-user-id / x-goog-authenticated-user-email");
   console.log(`[dev] e.g. curl -H 'x-goog-authenticated-user-id: accounts.google.com:me' \\`);
   console.log(`[dev]        -H 'x-goog-authenticated-user-email: me@example.com' ${url}/livez`);
