@@ -105,6 +105,27 @@ export function parseSseChunks(parser, chunk) {
 }
 
 // ---------------------------------------------------------------------------
+// Lease role (pure: no DOM, no fetch). Tested from bun test via static.test.ts.
+// ---------------------------------------------------------------------------
+
+/**
+ * Decides the badge role from the locally held lease and the local clock
+ * only (issue #130). Never fetches, so re-rendering on a timer cannot
+ * extend the server idle timer (spec section 11).
+ *
+ * Boundary matches T6 `ControllerLeaseService` (`expiresAt <= now` counts
+ * as expired): `expiresAt === nowMs` returns "expired", not "controller".
+ * A held lease whose expiresAt is missing or unparseable is also "expired"
+ * — failing toward the warning, never toward a false green CONTROLLER.
+ */
+export function leaseRole(lease, nowMs) {
+  if (!lease) return "observer";
+  const expiresMs = Date.parse(lease.expiresAt);
+  if (Number.isNaN(expiresMs)) return "expired";
+  return expiresMs > nowMs ? "controller" : "expired";
+}
+
+// ---------------------------------------------------------------------------
 // UI state + boot (DOM only below this line)
 // ---------------------------------------------------------------------------
 
@@ -252,9 +273,13 @@ function renderWsDetail(ws) {
 function renderRole() {
   const badge = $("role-badge");
   const lease = state.workspaceId ? state.leases[state.workspaceId] : null;
-  if (lease) {
+  const role = leaseRole(lease, Date.now());
+  if (role === "controller") {
     badge.textContent = `role: CONTROLLER (you hold ${lease.controllerId})`;
     badge.className = "role-controller";
+  } else if (role === "expired") {
+    badge.textContent = `role: CONTROLLER — lease EXPIRED at ${lease.expiresAt} (press heartbeat)`;
+    badge.className = "role-expired";
   } else {
     badge.textContent = "role: observer (no controllerId held from acquire)";
     badge.className = "role-observer";
@@ -524,6 +549,11 @@ function boot() {
 
   // lease
   renderRole();
+  // Issue #130: re-render the badge from the local clock once a second so
+  // a held lease visibly flips to EXPIRED when its expiresAt passes.
+  // renderRole touches only the DOM — no fetch — so merely having the page
+  // open cannot extend the server idle timer (spec section 11).
+  setInterval(renderRole, 1000);
   $("btn-acquire").onclick = async () => {
     if (!state.workspaceId) return;
     const r = await apiFetch(
