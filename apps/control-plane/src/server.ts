@@ -9,6 +9,7 @@ import type { Logger } from "@cloud-run-dsh/observability";
 import { describeError, newErrorId } from "@cloud-run-dsh/observability";
 import * as handlers from "./handlers.js";
 import { handleSessionEvents } from "./sse.js";
+import { serveStaticFile } from "./static.js";
 import {
   AgentInputRefusedError,
   IllegalTransitionError,
@@ -249,6 +250,20 @@ export function createFetchHandler(deps: ControlPlaneDeps): (request: Request) =
       }
 
       const pathSegments = url.pathname.split("/").filter((s) => s.length > 0);
+
+      // Debug Web UI (issue #128): static files served BEFORE authentication,
+      // next to /livez and /readyz. A browser navigation cannot attach custom
+      // headers, so requiring IAP headers on the HTML itself would make the
+      // screen unopenable locally. In production IAP in front of Cloud Run
+      // protects the HTML together with the API. The files are an empty
+      // screen with no data; /v1/* authentication is unchanged. The
+      // allowlist (static.ts) only matches exact UI paths, so unknown routes
+      // still fall through to authenticate() and keep their 401/404 behavior.
+      // Serving these files never calls recordActivity (仕様書 section 11).
+      if (request.method === "GET" || request.method === "HEAD") {
+        const staticResponse = await serveStaticFile(request.method, url.pathname);
+        if (staticResponse) return staticResponse;
+      }
 
       // 1. Authentication: IAP identity -> internal user (仕様書 section 21).
       user = await authenticate(request.headers, deps);

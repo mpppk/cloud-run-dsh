@@ -1,0 +1,37 @@
+body { font-family: system-ui, sans-serif; max-width: 960px; margin: 0 auto; padding: 1rem; }
+section { border: 1px solid #ccc; border-radius: 8px; padding: 0.75rem 1rem; margin: 1rem 0; }
+.hint { color: #555; font-size: 0.9em; }
+code.selected { background: #dff0d8; padding: 0 4px; }
+button { margin: 2px; }
+
+/* workspace state badges */
+.badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.85em; margin-left: 6px; }
+.badge-unknown { background: #eee; color: #555; }
+.badge-ready { background: #d4edda; color: #155724; }
+.badge-stopped { background: #f8d7da; color: #721c24; }
+.badge-starting, .badge-restoring, .badge-stopping { background: #fff3cd; color: #856404; }
+
+/* controller / observer role */
+#role-badge { display: inline-block; padding: 4px 12px; border-radius: 6px; font-weight: bold; margin-bottom: 6px; }
+.role-controller { background: #d4edda; color: #155724; }
+.role-observer { background: #f8d7da; color: #721c24; }
+
+/* SSE events, one color per kind */
+#sse-events, #req-log, #ws-list, #session-list { list-style: none; padding-left: 0; }
+#sse-events li, #req-log li { font-family: monospace; font-size: 0.85em; border-bottom: 1px solid #eee; padding: 2px 4px; word-break: break-all; }
+.ev-assistant { background: #e8f4fd; }
+.ev-tool-call { background: #fff8e1; }
+.ev-tool-result { background: #f3e5f5; }
+.ev-turn { background: #e0f2f1; font-weight: bold; }
+.ev-approval-asked { background: #fce4ec; font-weight: bold; }
+.ev-user { background: #e8f5e9; }
+.ev-approval { background: #fce4ec; }
+.ev-cancel { background: #efebe9; }
+.ev-unknown { background: #fafafa; color: #333; }
+
+/* seq gap warning */
+.gap-ok { color: #2e7d32; }
+.gap-warn, li.gap-warn { background: #ffebee; color: #b71c1c; font-weight: bold; }
+
+/* request log: 409 conflicts stand out */
+#req-log li.conflict { background: #ffebee; border-left: 4px solid #c62828; font-weight: bold; }
