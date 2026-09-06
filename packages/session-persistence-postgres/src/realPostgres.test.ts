@@ -10,10 +10,11 @@ import { defineRepositorySuite } from "./repository.suite.js";
 // PostgreSQL rejects passed every test. This file runs the SAME behavior
 // suite against a real database so such SQL fails in tests, not in prod.
 //
-// Usage:
-//   docker compose up -d postgres
-//   DATABASE_URL=postgres://dsh:dsh@localhost:5432/dsh bun run db:migrate
-//   TEST_POSTGRES_URL=postgres://dsh:dsh@localhost:5432/dsh bun test packages/session-persistence-postgres
+// Usage (this repo has no docker-compose file — start Postgres directly):
+//   docker run -d --rm --name pg-dsh -e POSTGRES_PASSWORD=devpw -e POSTGRES_DB=dsh \
+//     -e POSTGRES_USER=dsh -p 55434:5432 postgres:16-alpine
+//   DATABASE_URL=postgres://dsh:devpw@127.0.0.1:55434/dsh bun run db:migrate
+//   TEST_POSTGRES_URL=postgres://dsh:devpw@127.0.0.1:55434/dsh bun test packages/session-persistence-postgres
 //
 // Without TEST_POSTGRES_URL the suite self-skips (local `bun test` and
 // environments without Postgres keep working exactly as before).

@@ -19,6 +19,19 @@ export interface Workspace {
   readonly instanceName: string | null;
   readonly instanceUrl: string | null;
   readonly runtimeState: WorkspaceRuntimeState;
+  /**
+   * Issue #141: operator-visible restore failure reason (workspaces.last_error,
+   * infra/migrations/0002_last_error.sql). Sanitized at write time by
+   * summarizeRestoreError() — never tokens, passwords, PEM, or internal URLs.
+   * Set when a generation fails (control-plane fast/stale mark, agent-host
+   * recovery catch), cleared when a generation reaches READY. NULL means "no
+   * recorded failure" — NOT "never failed".
+   *
+   * Deliberately NOT part of the public workspace DTO: the product UI must
+   * never render the raw technical reason (#138); operators read it from the
+   * row (runbook) or the structured logs.
+   */
+  readonly lastError: string | null;
   readonly lastActivityAt: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -40,6 +53,12 @@ export interface UpdateWorkspacePatch {
   readonly lastActivityAt?: string | null;
   readonly instanceName?: string | null;
   readonly instanceUrl?: string | null;
+  /**
+   * Issue #141: set to a summarizeRestoreError() summary when recording a
+   * failure, or to null to clear on READY. `undefined` leaves the column
+   * untouched (all pre-existing call sites keep their behavior).
+   */
+  readonly lastError?: string | null;
 }
 
 export interface Session {

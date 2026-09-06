@@ -623,7 +623,12 @@ for _ in $(seq 1 60); do
 done
 # A STARTING / RESTORING row older than 10 min reads as RESTORE_FAILED
 # (lazy judgment at GET time, STALE_STARTING_THRESHOLD_MS) — finite failure,
-# no background waiter. Then open again (retry from RESTORE_FAILED).
+# no background waiter. Faster: past ~2 min the same GET fails the row as
+# soon as the Instance is definitively gone or FAILED (single Instances API
+# GET per read, FAST_FAIL_INSTANCE_GRACE_MS — issue #141). Either way the
+# WHY is on the row (workspaces.last_error) and in the control-plane /
+# agent-host structured logs — see "Recovery: restore-failed" below. Then
+# open again (retry from RESTORE_FAILED).
 
 # 4. Instance came up in Cloud Run:
 gcloud run instances list --location="$REGION"   # if the Preview command exists
@@ -638,13 +643,51 @@ printf '127.0.0.1:5433:dsh:dsh_app:%s\n' "$DB_PASSWORD" > "$PGPASSF"
 
 PGPASSFILE="$PGPASSF" psql "postgresql://dsh_app@127.0.0.1:5433/dsh" \
   -v ws="$WORKSPACE_ID" \
-  -c "SELECT id, runtime_state FROM workspaces WHERE id = :'ws';"
+  -c "SELECT id, runtime_state, last_error FROM workspaces WHERE id = :'ws';"
 
 # 6. Checkpoint bucket exists and is reachable by the agent-host SA:
 gcloud storage ls "gs://$(terraform -chdir=infra/terraform output -raw checkpoint_bucket_name)"
 ```
 
 Pass criteria: `/livez` 200; workspace created (201, server-generated UUID `id`) + opened; an Instance exists for the workspace; the `workspaces` row shows the expected state; no 403 from IAP.
+
+### Recovery: diagnosing `RESTORE_FAILED` (issue #141)
+
+A `RESTORE_FAILED` row now carries its reason in `workspaces.last_error`
+(additive nullable column, migration `0002_last_error.sql`) and in the
+structured logs. Triage in this order:
+
+```bash
+# 1. The row's recorded reason (pgpass setup as in step 5 above).
+PGPASSFILE="$PGPASSF" psql "postgresql://dsh_app@127.0.0.1:5433/dsh" \
+  -v ws="$WORKSPACE_ID" \
+  -c "SELECT runtime_state, last_error, updated_at FROM workspaces WHERE id = :'ws';"
+```
+
+| `last_error` says | Meaning | Next step |
+|---|---|---|
+| `instance dsh-… not found …` | Past ~2 min (`FAST_FAIL_INSTANCE_GRACE_MS`) the Instance does not exist: never created, or deleted out-of-band. The control-plane failed the row on a read-triggered single GET instead of waiting 10 min. | Check how the Instance went missing (`gcloud run instances` / Step 5.4 GET); then re-open. |
+| `instance dsh-… is FAILED` | The Instance itself reports terminal failure (`terminalCondition CONDITION_FAILED`) — e.g. a crash-loop the restart policy gave up on, or a bad image/config. | `GET .../instances/dsh-…` for the terminal condition + Cloud Logging for the container logs; fix the cause; re-open. |
+| `no progress for 10m while …` | The Instance exists (or the lookup flaked) but nobody advanced the row for 10 min (`STALE_STARTING_THRESHOLD_MS`): the agent-host died silently or never booted. | Check the agent-host logs for `workspace.restore.failed` (its `reason` field holds the host-side detail); if the Instance never booted, check its container logs. Then re-open. |
+| anything else (e.g. `git clone failed …`) | Written by the agent-host itself (`RestartRecovery`): the restore step that threw. | Fix the named cause (repo access, checkpoint bucket, sandbox); re-open. |
+
+Notes the operator needs, not guesses:
+
+- `last_error` is pre-sanitized (`summarizeRestoreError`): tokens,
+  passwords, PEM blocks, connection strings and internal URLs are stripped
+  before persisting — but treat the value as still internal (debug use, never
+  paste into tickets verbatim if unsure).
+- The public API DTO carries NO reason (the product UI `/app` never shows
+  raw technical text per #138) — query the row or the logs, not the UI.
+- A successful open clears the reason (NULL on READY); a re-open from
+  `RESTORE_FAILED` keeps the previous generation's reason until the new
+  generation succeeds or fails anew.
+- The control-plane mark is compare-and-set: a late agent-host READY that
+  lands between the read and the mark wins and is served — if GET says
+  READY while you expected failure, the restore actually completed.
+- Control-plane log events: `control-plane.open.fast-fail-starting`
+  (2-min probe verdict) and `control-plane.open.stale-starting-failed`
+  (10-min verdict), both with `workspaceId` + `reason`.
 
 ### Recovery: `restore-failed` on a row stuck in `STOPPING`
 

@@ -107,7 +107,30 @@ export interface WorkspaceRuntimeHandle {
    * live lookup survives Instance recreation (which changes the URL).
    */
   getInstanceUrl(): Promise<string | null>;
+  /**
+   * Issue #141 案2 fast-fail probe: exactly ONE Instances API GET describing
+   * whether this workspace's Instance exists and what state it reports.
+   *
+   * Optional so existing fakes (and the dev handle) keep working: when
+   * absent, failStaleStartingWorkspace skips the fast path and defers to the
+   * 10-minute stale rule. When present it MUST NOT poll or retry — one GET
+   * per call, throwing on transient lookup failure (the caller treats that
+   * as "unknown" and defers; a failed probe must never fail the workspace).
+   */
+  describeInstance?(): Promise<InstanceDiagnostic>;
 }
+
+/**
+ * Issue #141 案2: the single-GET Instance probe result.
+ *
+ * `state` is the client's parsed state string (READY / FAILED / PENDING /
+ * UNKNOWN — see CloudRunInstanceClient.parseInstanceState). Only FAILED
+ * fails fast; every other present state defers to the stale rule (an
+ * Instance can be READY while its agent-host is still restoring).
+ */
+export type InstanceDiagnostic =
+  | { readonly exists: false }
+  | { readonly exists: true; readonly state: string };
 
 /**
  * Wraps a real T8 WorkspaceRuntime into the gateway handle.
@@ -151,7 +174,18 @@ export class WorkspaceRuntimeHandleAdapter implements WorkspaceRuntimeHandle {
      * supplies it. Defaults to a no-op.
      */
     private readonly deleteInstanceFn?: () => Promise<void>,
-  ) {}
+    /**
+     * Issue #141 案2: the single-GET Instance probe (see describeInstance
+     * above). Optional; defaults to absent (fast path skipped).
+     */
+    private readonly instanceDiagnosticProvider?: () => Promise<InstanceDiagnostic>,
+  ) {
+    // The public seam stays ABSENT (not throwing) when no provider was
+    // wired, so callers can feature-detect with `handle.describeInstance`.
+    if (instanceDiagnosticProvider) {
+      this.describeInstance = instanceDiagnosticProvider;
+    }
+  }
 
   /**
    * Issue #60 案C: the control plane drives ONLY the instance lifecycle and
@@ -196,6 +230,13 @@ export class WorkspaceRuntimeHandleAdapter implements WorkspaceRuntimeHandle {
   getInstanceUrl(): Promise<string | null> {
     return this.instanceUrlProvider?.() ?? Promise.resolve(null);
   }
+
+  /**
+   * Present only when the factory wired an instanceDiagnosticProvider
+   * (production). Test stubs and the dev handle omit it, which the
+   * failStaleStartingWorkspace fast path reads as "no probe available".
+   */
+  readonly describeInstance?: () => Promise<InstanceDiagnostic>;
 }
 
 /**

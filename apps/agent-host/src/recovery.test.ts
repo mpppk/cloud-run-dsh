@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { LeaseAlreadyHeldError } from "@cloud-run-dsh/controller-lease";
 import { InMemoryLogger } from "@cloud-run-dsh/observability";
+import {
+  PostgresSessionPersistenceRepository,
+} from "@cloud-run-dsh/session-persistence-postgres";
+import { InMemoryFakeExecutor } from "@cloud-run-dsh/session-persistence-postgres/testing";
 import { InvalidOperationError } from "@cloud-run-dsh/workspace-runtime";
+import { SqlTransactionalStateStore } from "./adapters.js";
 import { composeTestHost, seedWorkspace } from "./fakes.js";
 import type { AgentTurnInput, TurnStarter } from "./gateway.js";
 
@@ -85,8 +90,7 @@ describe("RestartRecovery (実装手順書 section 30)", () => {
     ).rejects.toThrow(LeaseAlreadyHeldError);
   });
 
-  test("restore failure -> RESTORE_FAILED, health failed, token discarded", async () => {
-    const th = await composeTestHost();
+  test("restore failure -> RESTORE_FAILED, health failed, token discarded", async () => {    const th = await composeTestHost();
     await seedWorkspace(th);
     // Issue #60: instance health is the control plane's job now — the host
     // fails in its OWN restore steps (here: git clone fails; the clone argv
@@ -101,6 +105,70 @@ describe("RestartRecovery (実装手順書 section 30)", () => {
     expect(th.host.health.snapshot().status).toBe("RESTORE_FAILED");
     expect(th.host.bootstrapper.isTokenDiscarded).toBe(true);
     expect(th.host.runtime.getState()).toBe("RESTORE_FAILED");
+  });
+
+  describe("restore failure reason on the row (issue #141 案1)", () => {
+    /**
+     * Production shape: ONE database behind both the repository and the
+     * state store (the default test host splits them, so the repo row never
+     * moves and the write guard below would never trigger).
+     */
+    async function composeSharedStoreHost() {
+      const executor = new InMemoryFakeExecutor();
+      const repository = new PostgresSessionPersistenceRepository(executor);
+      const th = await composeTestHost(
+        {},
+        { repository, stateStore: new SqlTransactionalStateStore(executor) },
+      );
+      await seedWorkspace(th);
+      return th;
+    }
+
+    test("restore failure records a sanitized reason on the row", async () => {
+      const th = await composeSharedStoreHost();
+      const originalRun = th.git.run.bind(th.git);
+      th.git.run = async (args, opts) => {
+        if (args.includes("clone")) throw new Error("git clone failed: connection refused");
+        return originalRun(args, opts);
+      };
+
+      await expect(th.host.recover()).rejects.toThrow(/clone failed/);
+      const row = (await th.repository.getWorkspace("ws-1"))!;
+      expect(row.runtimeState).toBe("RESTORE_FAILED");
+      expect(row.lastError).toBe("git clone failed: connection refused");
+      expect(row.lastError).toContain("clone failed");
+    });
+
+    test("secret-bearing failures are redacted before reaching the row", async () => {
+      const th = await composeSharedStoreHost();
+      const originalRun = th.git.run.bind(th.git);
+      th.git.run = async (args, opts) => {
+        if (args.includes("clone")) {
+          throw new Error(
+            "git clone failed for https://x-access-token:ghp_testsecrettoken1234567890@github.com/o/r: Bearer ya29.test-secret-token-abc123",
+          );
+        }
+        return originalRun(args, opts);
+      };
+
+      await expect(th.host.recover()).rejects.toThrow(/clone failed/);
+      const row = (await th.repository.getWorkspace("ws-1"))!;
+      expect(row.runtimeState).toBe("RESTORE_FAILED");
+      expect(row.lastError).not.toContain("ghp_testsecrettoken1234567890");
+      expect(row.lastError).not.toContain("ya29.test-secret-token-abc123");
+      expect(row.lastError).toContain("clone failed");
+    });
+
+    test("a successful restore clears a previous generation's reason", async () => {
+      const th = await composeSharedStoreHost();
+      await th.repository.updateWorkspace("ws-1", { lastError: "stale reason from gen-1" });
+
+      const result = await th.host.recover();
+      expect(result.state).toBe("READY");
+      const row = (await th.repository.getWorkspace("ws-1"))!;
+      expect(row.runtimeState).toBe("READY");
+      expect(row.lastError).toBeNull();
+    });
   });
 
   test("health reports READY only after restore succeeds", async () => {

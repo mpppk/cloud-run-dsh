@@ -35,6 +35,9 @@ function rowToWorkspace(row: Record<string, unknown>): Workspace {
     instanceName: (row["instance_name"] as string | null) ?? null,
     instanceUrl: (row["instance_url"] as string | null) ?? null,
     runtimeState: row["runtime_state"] as Workspace["runtimeState"],
+    // Pre-0002 databases have no last_error column: SELECT * returns no such
+    // key, which reads as "no recorded failure" — never as an error.
+    lastError: (row["last_error"] as string | null) ?? null,
     lastActivityAt: toIsoStringOrNull(row["last_activity_at"]),
     createdAt: toIsoString(row["created_at"]),
     updatedAt: toIsoString(row["updated_at"]),
@@ -89,6 +92,19 @@ export interface SessionPersistenceRepository {
   updateWorkspace(id: string, patch: UpdateWorkspacePatch): Promise<Workspace>;
   updateRuntimeState(id: string, runtimeState: Workspace["runtimeState"]): Promise<Workspace>;
   updateLastActivityAt(id: string, lastActivityAt: string): Promise<Workspace>;
+  /**
+   * Issue #141: compare-and-set fail of a STARTING / RESTORING row.
+   *
+   * Atomically moves the row to RESTORE_FAILED with a pre-sanitized
+   * (summarizeRestoreError) reason ONLY while its current state is still
+   * STARTING or RESTORING. Returns the post-write row, or null when the row
+   * had already moved (e.g. a late agent-host READY landed between the
+   * caller's read and this write): the caller must then re-read and serve
+   * the winner's state — never blind-write over it. This is the CAS the
+   * control-plane stale/fast fail path was missing (the old updateWorkspace
+   * blind write could clobber a legitimate >10min restore's READY).
+   */
+  markRestoreFailedIfStarting(id: string, lastError: string): Promise<Workspace | null>;
   /**
    * Deletes a workspace and everything under it (sessions, session events,
    * checkpoints, controller lease) in one transaction (issue #85 案B: the
@@ -198,6 +214,13 @@ export class PostgresSessionPersistenceRepository implements SessionPersistenceR
       sets.push(`instance_url = $${idx++}`);
       params.push(patch.instanceUrl);
     }
+    // `null` clears the recorded reason (READY arrival); `undefined` leaves
+    // the column untouched. No ANY-array binding here — a single scalar like
+    // every other patch field (cf. the IN (...) note in listWorkspacesByIds).
+    if (patch.lastError !== undefined) {
+      sets.push(`last_error = $${idx++}`);
+      params.push(patch.lastError);
+    }
     if (sets.length === 0) {
       const w = await this.getWorkspace(id);
       if (!w) throw new Error(`workspace not found: ${id}`);
@@ -213,6 +236,34 @@ export class PostgresSessionPersistenceRepository implements SessionPersistenceR
 
   async updateRuntimeState(id: string, runtimeState: Workspace["runtimeState"]): Promise<Workspace> {
     return this.updateWorkspace(id, { runtimeState });
+  }
+
+  async markRestoreFailedIfStarting(id: string, lastError: string): Promise<Workspace | null> {
+    // Compare-and-set inside one transaction (same SELECT ... FOR UPDATE
+    // pattern as the SQL state stores): concurrent transitions serialize on
+    // the row lock, so a READY committed between the caller's read and this
+    // write is observed here and left alone instead of clobbered.
+    const marked = await this.executor.transaction(async (tx) => {
+      const rows = await tx.query<Record<string, unknown>>(
+        "SELECT runtime_state FROM workspaces WHERE id = $1 FOR UPDATE",
+        [id],
+      );
+      if (rows.length === 0) return false;
+      const current = rows[0]!["runtime_state"];
+      if (current !== "STARTING" && current !== "RESTORING") return false;
+      // Column order follows updateWorkspace above (id LAST): the
+      // control-plane route fake resolves the target row from the final
+      // param, and keeping one convention avoids exactly this drift.
+      await tx.exec(
+        "UPDATE workspaces SET runtime_state = $1, last_error = $2, updated_at = now() WHERE id = $3",
+        ["RESTORE_FAILED", lastError, id],
+      );
+      return true;
+    });
+    if (!marked) return null;
+    const updated = await this.getWorkspace(id);
+    if (!updated) throw new Error(`workspace not found after update: ${id}`);
+    return updated;
   }
 
   async updateLastActivityAt(id: string, lastActivityAt: string): Promise<Workspace> {

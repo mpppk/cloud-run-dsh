@@ -20,6 +20,8 @@ import type { Logger, Metrics } from "@cloud-run-dsh/observability";
 import { METRIC_NAMES } from "@cloud-run-dsh/observability";
 import type { SessionEvent } from "@cloud-run-dsh/session-persistence-postgres";
 import type { SessionPersistenceRepository } from "@cloud-run-dsh/session-persistence-postgres";
+import { summarizeRestoreError } from "@cloud-run-dsh/session-persistence-postgres";
+import { IllegalTransitionError } from "@cloud-run-dsh/workspace-runtime";
 import type {
   WorkspaceLifecycleSteps,
   WorkspaceRuntime,
@@ -195,16 +197,61 @@ export class RestartRecovery {
         workspaceId: config.workspaceId,
         instanceName: workspace.instanceName ?? config.instanceName,
       });
+      // Issue #141: a previous generation's reason must not linger on a
+      // healthy row. Conditional (one read, write only when needed) so the
+      // common no-failure path costs no extra write.
+      await this.clearRestoreErrorBestEffort();
       return { state, instanceName: config.instanceName };
     } catch (e) {
       this.deps.health.setRestoreFailed();
       // The token must never outlive a failed bootstrap.
       this.deps.bootstrapper.discardToken();
+      // Issue #141 案1: the host owns the restore, so it records WHY it
+      // failed into workspaces.last_error (pre-sanitized — never secrets).
+      // Best-effort and guarded: only while the row is still RESTORE_FAILED
+      // (a re-open may already own it), and never for an
+      // IllegalTransitionError — that error means someone ELSE moved the row
+      // (typically the control plane's concurrent mark), so overwriting their
+      // reason with bookkeeping noise would destroy the real diagnosis.
+      const reason = summarizeRestoreError(e);
+      if (!(e instanceof IllegalTransitionError)) {
+        try {
+          const current = await this.deps.repository.getWorkspace(config.workspaceId);
+          if (current && current.runtimeState === "RESTORE_FAILED") {
+            await this.deps.repository.updateWorkspace(config.workspaceId, { lastError: reason });
+          }
+        } catch (persistError) {
+          this.deps.logger.warn("workspace.restore.record-error-failed", {
+            workspaceId: config.workspaceId,
+            error: persistError instanceof Error ? persistError.message : String(persistError),
+          });
+        }
+      }
       this.deps.logger.error("workspace.restore.failed", {
         workspaceId: config.workspaceId,
         error: e instanceof Error ? e.message : String(e),
+        reason,
       });
       throw e;
+    }
+  }
+
+  /**
+   * Clears a previous generation's last_error after a successful restore.
+   * Never throws: a failed clear must not fail a healthy recovery.
+   */
+  private async clearRestoreErrorBestEffort(): Promise<void> {
+    const { config } = this.deps;
+    try {
+      const current = await this.deps.repository.getWorkspace(config.workspaceId);
+      if (current?.lastError) {
+        await this.deps.repository.updateWorkspace(config.workspaceId, { lastError: null });
+      }
+    } catch (e) {
+      this.deps.logger.warn("workspace.restore.clear-error-failed", {
+        workspaceId: config.workspaceId,
+        error: e instanceof Error ? e.message : String(e),
+      });
     }
   }
 }
