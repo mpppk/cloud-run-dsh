@@ -34,6 +34,17 @@ import {
 const DEFAULT_PORT = 8787;
 
 /**
+ * Issue #136: delay between the dev server's STARTING write and its READY
+ * write below. In production the agent-host performs this leg (instance
+ * boot + restore, seconds to ~3 min after a stop-then-open per #121); the
+ * dev server has no agent-host, so it plays that role with a short timer.
+ * This keeps the local open path async-shaped (202 STARTING -> GET polls ->
+ * READY) exactly like production, so the #138 product UI is verifiable
+ * locally. A constant — not inline — so the stand-in delay is visible.
+ */
+export const DEV_OPEN_READY_DELAY_MS = 3000;
+
+/**
  * Minimal in-memory runtime handle for local development: open/stop flip the
  * state, agent input is always allowed, and every activity kind is logged so
  * a developer can see what the control plane thinks is happening.
@@ -46,6 +57,7 @@ const DEFAULT_PORT = 8787;
  */
 export class LoggingWorkspaceRuntimeHandle implements WorkspaceRuntimeHandle {
   private state = "STOPPED";
+  private readyTimer: ReturnType<typeof setTimeout> | null = null;
   readonly activities: ActivityKind[] = [];
 
   constructor(
@@ -54,13 +66,37 @@ export class LoggingWorkspaceRuntimeHandle implements WorkspaceRuntimeHandle {
   ) {}
 
   async open(): Promise<string> {
-    await this.repo.updateWorkspace(this.workspaceId, { runtimeState: "READY" });
-    this.state = "READY";
-    console.log(`[dev] workspace ${this.workspaceId}: open -> READY`);
+    // Issue #136: answer STARTING now and become READY on a timer, standing
+    // in for the production agent-host (see DEV_OPEN_READY_DELAY_MS). A
+    // re-open or stop cancels the pending timer so a STOPPED row can never
+    // be flipped to READY behind the caller's back.
+    if (this.readyTimer) {
+      clearTimeout(this.readyTimer);
+      this.readyTimer = null;
+    }
+    await this.repo.updateWorkspace(this.workspaceId, { runtimeState: "STARTING" });
+    this.state = "STARTING";
+    console.log(`[dev] workspace ${this.workspaceId}: open -> STARTING (READY in ~${DEV_OPEN_READY_DELAY_MS}ms)`);
+    this.readyTimer = setTimeout(() => {
+      this.readyTimer = null;
+      void this.repo
+        .updateWorkspace(this.workspaceId, { runtimeState: "READY" })
+        .then(() => {
+          this.state = "READY";
+          console.log(`[dev] workspace ${this.workspaceId}: STARTING -> READY`);
+        })
+        .catch((e) => {
+          console.log(`[dev] workspace ${this.workspaceId}: READY transition failed: ${String(e)}`);
+        });
+    }, DEV_OPEN_READY_DELAY_MS);
     return this.state;
   }
 
   async stop(): Promise<string> {
+    if (this.readyTimer) {
+      clearTimeout(this.readyTimer);
+      this.readyTimer = null;
+    }
     await this.repo.updateWorkspace(this.workspaceId, { runtimeState: "STOPPED" });
     this.state = "STOPPED";
     console.log(`[dev] workspace ${this.workspaceId}: stop -> STOPPED`);

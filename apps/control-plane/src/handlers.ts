@@ -125,7 +125,11 @@ export const getWorkspace: RouteHandler = async (ctx) => {
   const id = requireSegment(ctx.params.id, "id");
   const workspace = await loadWorkspace(ctx.deps, id);
   await assertMember(ctx.deps, workspace.id, ctx.user.id);
-  return json(toWorkspaceDto(workspace));
+  // Issue #136 案A: READY arrival is polled here, so staleness is judged
+  // here too — a STARTING row nobody advances must read as failed, not
+  // "preparing" forever.
+  const fresh = await failStaleStartingWorkspace(ctx.deps, workspace);
+  return json(toWorkspaceDto(fresh));
 };
 
 /**
@@ -149,6 +153,67 @@ export const listWorkspaces: RouteHandler = async (ctx) => {
   return json({ workspaces: workspaces.map(toWorkspaceDto) });
 };
 
+/**
+ * Stale-starting threshold for the issue #136 案A lazy failure judgment.
+ *
+ * A STARTING / RESTORING row older than this is treated as failed
+ * (RESTORE_FAILED): no process is advancing it anymore. The value must
+ * exceed every LEGITIMATE restore duration with margin:
+ * - the removed sync poll's measured budgets were ~2 min (Instance READY:
+ *   60 polls x 2s) + ~1 min (agent-host health: 30 x 2s) + ~3 min (#121
+ *   shutdown grace: 90 x 2s) = ~6 min worst case;
+ * - issue #121 (stop immediately followed by open) observably takes ~3 min
+ *   and MUST still read as "preparing", never as failed;
+ * - every state transition bumps workspaces.updated_at (control-plane
+ *   prod-adapters.ts SqlTransactionalStateStore, agent-host adapters.ts),
+ *   so an untouched-for-10-minutes row means no progress anywhere.
+ *
+ * 10 minutes clears the ~6-minute legitimate worst case with margin while
+ * keeping "an Instance that never becomes healthy" finite. Deliberately a
+ * constant with this rationale attached — not derived from the deleted poll
+ * configs — so a future reader can re-derive it from measurements.
+ */
+export const STALE_STARTING_THRESHOLD_MS = 10 * 60 * 1000;
+
+const STALE_STARTING_STATES: readonly Workspace["runtimeState"][] = ["STARTING", "RESTORING"];
+
+/**
+ * Issue #136 案A: fails a STARTING / RESTORING workspace whose row has not
+ * moved for longer than STALE_STARTING_THRESHOLD_MS.
+ *
+ * Why HERE and not in a background waiter: the control plane runs on Cloud
+ * Run WITHOUT --no-cpu-throttling, so anything running after the response
+ * is throttled (案C was rejected for exactly this). Judging staleness at
+ * read time needs no background CPU at all.
+ *
+ * Returns the workspace to serve (the failed row when marked, the input
+ * otherwise). Never fails on an unreadable updated_at — unknown freshness
+ * reads as "still preparing", never as failed.
+ *
+ * Race note: updateWorkspace is a blind write, so an agent-host persisting
+ * READY between our read and this write would be clobbered back to
+ * RESTORE_FAILED. That requires a legitimate restore to take >10 minutes
+ * AND land in that instant — accepted as negligible, and the next GET would
+ * then let a retry re-open from RESTORE_FAILED anyway.
+ */
+export async function failStaleStartingWorkspace(
+  deps: ControlPlaneDeps,
+  workspace: Workspace,
+): Promise<Workspace> {
+  if (!STALE_STARTING_STATES.includes(workspace.runtimeState)) return workspace;
+  const updatedMs = Date.parse(workspace.updatedAt);
+  if (Number.isNaN(updatedMs)) return workspace;
+  if (deps.clock.now().getTime() - updatedMs <= STALE_STARTING_THRESHOLD_MS) {
+    return workspace;
+  }
+  deps.logger?.info("control-plane.open.stale-starting-failed", {
+    workspaceId: workspace.id,
+    runtimeState: workspace.runtimeState,
+    updatedAt: workspace.updatedAt,
+  });
+  return deps.repo.updateWorkspace(workspace.id, { runtimeState: "RESTORE_FAILED" });
+}
+
 export const openWorkspace: RouteHandler = async (ctx) => {
   const id = requireSegment(ctx.params.id, "id");
   await parseOptionalJsonBody(ctx.request);
@@ -167,10 +232,25 @@ export const openWorkspace: RouteHandler = async (ctx) => {
     workspace.id,
     ctx.user.id,
   );
+  // Issue #136 案A: a stale STARTING / RESTORING row is failed FIRST, so
+  // this open retries from RESTORE_FAILED instead of coalescing onto a dead
+  // generation (or 409ing against it).
+  const current = await failStaleStartingWorkspace(ctx.deps, workspace);
+  // An open already in flight coalesces at the HTTP layer: a client polling
+  // open (instead of GET) gets 202 + the live state, not a 409
+  // ("open is not allowed in state STARTING") for asking twice.
+  if (current.runtimeState === "STARTING" || current.runtimeState === "RESTORING") {
+    return json({ workspaceId: current.id, state: current.runtimeState }, 202);
+  }
   // 実装手順書 section 27: concurrent opens coalesce inside the T8 runtime.
-  const handle = await ctx.deps.runtimes.get(workspace, controllerId);
+  // Issue #136: the request covers only the fast instance start (lease ->
+  // STARTING) and answers 202; the agent-host persists READY on the shared
+  // row, which the client observes by polling GET /v1/workspaces/:id.
+  const handle = await ctx.deps.runtimes.get(current, controllerId);
   const state = await handle.open();
-  return json({ workspaceId: workspace.id, state });
+  // 202 while the agent-host phase is still outstanding; 200 when the open
+  // was an idempotent no-op on an already-READY workspace.
+  return json({ workspaceId: current.id, state }, state === "READY" ? 200 : 202);
 };
 
 /**

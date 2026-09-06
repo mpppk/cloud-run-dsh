@@ -71,10 +71,13 @@ curl -s http://localhost:8080/livez   # {"status":"ok"}
 This image composes the Postgres-backed session persistence (T4), controller
 leases (T6), owner-based membership, and the **production `RuntimeRegistry`**
 (`src/runtime-factory.ts`): workspace `open` creates-or-starts the Cloud Run
-Instance (with the full agent-host environment), waits for the Instance to
-report READY and the agent-host readiness endpoint (`/readyz` — never
-`/healthz`: Cloud Run reserves that path, issue #68) to turn healthy, then marks the
-workspace READY. `stop` runs the graceful path and calls the Instance `:stop`
+Instance (with the full agent-host environment) and answers **202** `STARTING`
+within seconds (issue #136: no in-request readiness wait). The agent-host
+persists `READY` on the shared row when its recovery completes; clients poll
+`GET /v1/workspaces/:id` for it, and a `STARTING` / `RESTORING` row older
+than 10 minutes reads as `RESTORE_FAILED` (lazy judgment at read time,
+`STALE_STARTING_THRESHOLD_MS` — no background waiter). `stop` runs the
+graceful path and calls the Instance `:stop`
 API. Manual checkpoints record a timestamped request marker in the checkpoint
 bucket (`workspaces/<id>/manual-checkpoints/`).
 
@@ -89,7 +92,9 @@ Honest and observable behavior — never silent:
 - The Instance URL of an opened workspace is available two ways for the
   #22 forwarding work: `WorkspaceRuntimeHandle.getInstanceUrl()` (live
   Instances API lookup, falls back to the durable row) and the
-  `workspaces.instance_url` column (written on every successful open).
+  `workspaces.instance_url` column (persisted by the live lookup whenever
+  the API reports a URL — issue #136: the removed readiness poll used to be
+  the writer; the lookup replaced it, so forwarding survives an async open).
 - Membership in this milestone is **owner-only** (derived from
   `workspaces.owner_id`; the schema has no members table — see
   `src/membership.ts`). Adding non-owner members requires a members table.

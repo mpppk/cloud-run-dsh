@@ -263,6 +263,24 @@ async function refreshWorkspace(id) {
   return r;
 }
 
+/**
+ * Issue #136: follows an async open to its conclusion. Polls GET every 2s
+ * (bounded: 60 attempts ~= the stale-starting threshold's order) until the
+ * row leaves STARTING/RESTORING, refreshing the badge each time. Stops early
+ * if the user selects another workspace. Debug UI only — the product UI
+ * (#138) owns the real polling UX.
+ */
+async function pollWorkspaceUntilSettled(id, initialState) {
+  if (initialState !== "STARTING" && initialState !== "RESTORING") return;
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    if (state.workspaceId !== id) return;
+    const r = await refreshWorkspace(id);
+    const s = r.json?.runtimeState;
+    if (s !== "STARTING" && s !== "RESTORING") return;
+  }
+}
+
 function selectWorkspace(id) {
   state.workspaceId = id;
   renderWsList();
@@ -558,10 +576,14 @@ function boot() {
   $("btn-open-ws").onclick = () => {
     if (state.workspaceId) {
       const id = state.workspaceId;
-      // open implicitly takes the controller lease for the opener (issue
-      // #133), so the badge must re-read the server view afterwards.
-      void apiFetch("POST", `/v1/workspaces/${encodeURIComponent(id)}/open`, {}).then(() =>
-        Promise.all([refreshWorkspace(id), refreshController(id)]),
+      // Issue #136: open is async — 202 STARTING now, READY later via the
+      // agent-host. Refresh the badge/role, then poll GET until the row
+      // settles so the debug UI shows the whole STARTING -> READY arc
+      // without further clicks. Raw state names are fine here (debug UI).
+      void apiFetch("POST", `/v1/workspaces/${encodeURIComponent(id)}/open`, {}).then((r) =>
+        Promise.all([refreshWorkspace(id), refreshController(id)]).then(() =>
+          pollWorkspaceUntilSettled(id, r.json?.state),
+        ),
       );
     }
   };

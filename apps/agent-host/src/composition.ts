@@ -194,7 +194,6 @@ export function composeAgentHost(deps: AgentHostDependencies): AgentHost {
     instanceName: config.instanceName,
     steps: buildLifecycleSteps({
       config,
-      instanceRuntime: deps.instanceRuntime,
       bootstrapper,
       checkpointScheduler,
       sandboxManager,

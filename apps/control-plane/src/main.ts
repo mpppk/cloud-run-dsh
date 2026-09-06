@@ -46,11 +46,9 @@ async function main(): Promise<void> {
   // Issue #76: the shared metadata → ADC → env chain with caching. The
   // logger records WHICH source minted each token, never the token itself.
   const tokenProvider = createGcpAccessTokenProvider(undefined, undefined, { logger });
-  // Issue #68: ONE ID-token provider shared by the #22 forwarder AND the
-  // agent-host health poll. Tokens are audience-bound per Instance URL, so
-  // sharing one RefreshingIdTokenProvider shares its per-audience cache
-  // instead of minting twice per open. The poll needs it because Instances
-  // carry invoker IAM — a bare fetch() 401s on every attempt.
+  // Issue #68: the ID-token provider belongs to the #22 forwarder only.
+  // Issue #136 removed the agent-host health poll from the registry, so the
+  // registry no longer mints tokens — one consumer, one mint path.
   const idTokenProvider = createIdTokenProvider();
   // Issue #72/#75: ONE forwarder shared by the message handlers AND the
   // runtime registry's remote lifecycle steps (stop preparation, manual
@@ -71,7 +69,6 @@ async function main(): Promise<void> {
     clock,
     instanceTransport: createAuthenticatedInstanceTransport(tokenProvider),
     gcsClient: new FetchGcsClient({ tokenProvider }),
-    idTokenProvider,
     messageForwarder,
   });
   const deps = createControlPlaneDeps({

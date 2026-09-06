@@ -604,10 +604,26 @@ echo "$CREATE_RESPONSE"
 # (jq is a Step 0 prerequisite; without jq, paste the id manually into WS_ID):
 WORKSPACE_ID="$(echo "$CREATE_RESPONSE" | jq -r '.id')"
 
-# 3. Open it — this is what triggers instance creation via the adapter:
+# 3. Open it — async (issue #136): 202 + STARTING within seconds. The
+#    request only establishes the controller lease and starts the Instance;
+#    the agent-host persists READY on the shared row when its recovery
+#    completes (minutes on a cold boot, ~3 min for stop-then-open per #121).
+#    NEVER wait on this call — poll GET until runtime_state reads READY:
 curl -s -X POST "https://<control-plane-host>/v1/workspaces/${WORKSPACE_ID}/open" \
   -H "$IAP_ID" \
   -H "$IAP_EMAIL"
+# → 202 {"workspaceId":"…","state":"STARTING"}
+
+for _ in $(seq 1 60); do
+  STATE="$(curl -s -H "$IAP_ID" -H "$IAP_EMAIL" \
+    "https://<control-plane-host>/v1/workspaces/${WORKSPACE_ID}" | jq -r '.runtimeState')"
+  echo "runtimeState=$STATE"
+  [ "$STATE" = "READY" ] && break
+  sleep 10
+done
+# A STARTING / RESTORING row older than 10 min reads as RESTORE_FAILED
+# (lazy judgment at GET time, STALE_STARTING_THRESHOLD_MS) — finite failure,
+# no background waiter. Then open again (retry from RESTORE_FAILED).
 
 # 4. Instance came up in Cloud Run:
 gcloud run instances list --location="$REGION"   # if the Preview command exists

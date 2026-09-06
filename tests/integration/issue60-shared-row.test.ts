@@ -25,7 +25,6 @@ import type {
   TransactionalStateStore,
   WorkspaceStateTransaction,
 } from "../../packages/workspace-runtime/src/index.js";
-import { IllegalTransitionError } from "../../packages/workspace-runtime/src/index.js";
 import { PostgresSessionPersistenceRepository } from "../../packages/session-persistence-postgres/src/index.js";
 import { InMemoryFakeExecutor } from "../../packages/session-persistence-postgres/src/testing.js";
 import { SqlTransactionalStateStore } from "../../apps/control-plane/src/prod-adapters.js";
@@ -41,7 +40,6 @@ import {
 } from "../../apps/control-plane/src/index.js";
 import {
   createProductionRuntimeRegistry,
-  type HealthFetch,
 } from "../../apps/control-plane/src/runtime-factory.js";
 import type { ControlPlaneConfig } from "../../apps/control-plane/src/config.js";
 import { ensureControllerLeaseForOpen } from "../../apps/control-plane/src/handlers.js";
@@ -163,7 +161,6 @@ interface SharedWorld {
   cpLeases: ControllerLeaseService;
   transport: FakeTransport;
   deps: ControlPlaneDeps;
-  agentHealthCalls: string[];
   agent: TestHost | null;
   agentStateStore: TransactionalStateStore;
 }
@@ -216,21 +213,14 @@ async function buildSharedWorld(workspaceId: string): Promise<SharedWorld> {
     cpLeases,
     transport,
     deps: null as unknown as ControlPlaneDeps,
-    agentHealthCalls: [],
     agent: null,
     agentStateStore,
   };
 
-  // The agent-health poll observes the REAL agent health: the control-plane
-  // open only completes once the host's recovery reports READY — the
-  // production ordering, not a stubbed one.
-  const healthFetch: HealthFetch = async (url: string) => {
-    world.agentHealthCalls.push(url);
-    return world.agent?.host.health.snapshot().status === "READY"
-      ? { ok: true, status: 200 }
-      : { ok: false, status: 503 };
-  };
-
+  // Issue #136: the control-plane open performs NO readiness polling
+  // in-request — it establishes the lease, starts the instance and answers
+  // 202 STARTING. Completion is the agent-host's recover() persisting READY,
+  // observed by polling the shared row (the GET handler in production).
   const runtimes = createProductionRuntimeRegistry({
     config: testConfig(),
     repo,
@@ -238,12 +228,6 @@ async function buildSharedWorld(workspaceId: string): Promise<SharedWorld> {
     clock: new SystemClock(),
     instanceTransport: transport,
     gcsClient: gcs,
-    healthFetch,
-    instancePoll: { maxAttempts: 5, intervalMs: 0 },
-    agentHealthPoll: { maxAttempts: 500, intervalMs: 0 },
-    // Macrotask sleeps so the concurrently-running host recovery interleaves
-    // with the health poll, exactly as two processes would.
-    sleep: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
   });
   world.deps = createControlPlaneDeps({
     repo,
@@ -296,11 +280,11 @@ function openCtx(
 }
 
 /**
- * Production ordering: the host process cannot run before the platform
- * starts its instance, and the control plane moves STOPPED -> STARTING
- * before that start. So the test boots the host only after the control
- * plane has taken the shared row to STARTING — otherwise the host's
- * completeRestore correctly refuses a STOPPED row it must never resurrect.
+ * Production ordering under async open (issue #136): the control-plane open
+ * answers 202 STARTING without waiting; the host boots after the instance
+ * start and persists READY on the shared row. The test drives both sides in
+ * that order — otherwise the host's completeRestore correctly refuses a
+ * STOPPED row it must never resurrect.
  */
 async function openAndRecover(
   world: SharedWorld,
@@ -308,14 +292,12 @@ async function openAndRecover(
   user: { id: string; email: string },
   agent: TestHost,
 ): Promise<Response> {
-  const openP = openWorkspace(openCtx(world, workspaceId, user));
-  for (let i = 0; i < 1000; i++) {
-    const history = world.transitions.map((r) => `${r.from}->${r.to}`);
-    if (history.includes("STOPPED->STARTING")) break;
-    await new Promise((r) => setTimeout(r, 1));
-  }
-  const recoverP = agent.host.recover();
-  const [openRes] = await Promise.all([openP, recoverP]);
+  const openRes = await openWorkspace(openCtx(world, workspaceId, user));
+  expect(openRes.status).toBe(202);
+  // clone(): the callers below read the body themselves for their own
+  // assertions — a Response body can only be consumed once.
+  expect(((await openRes.clone().json()) as { state: string }).state).toBe("STARTING");
+  await agent.host.recover();
   return openRes;
 }
 
@@ -343,11 +325,12 @@ describe("issue #60 — shared-row open, end to end", () => {
     const agent = await composeAgent(world, "ws-1", established);
 
     // Both sides run on the shared rows, host booting after the instance
-    // start (production ordering), as in production.
+    // start (production ordering), as in production. Issue #136: open
+    // answers 202 STARTING at once; READY arrives when the host recovers.
     const openRes = await openAndRecover(world, "ws-1", ALICE, agent);
 
-    expect(openRes.status).toBe(200);
-    expect((await openRes.json()).state).toBe("READY");
+    expect(openRes.status).toBe(202);
+    expect((await openRes.json()).state).toBe("STARTING");
     expect(agent.host.runtime.getState()).toBe("READY");
     expect((await world.repo.getWorkspace("ws-1"))!.runtimeState).toBe("READY");
 
@@ -358,8 +341,6 @@ describe("issue #60 — shared-row open, end to end", () => {
     expect(env["CONTROLLER_ID"]).toBe(established);
     expect(active?.controllerId).toBe(established);
     expect(active?.userId).toBe("alice");
-    // The agent-health poll actually observed the host (not a stubbed 200).
-    expect(world.agentHealthCalls.length).toBeGreaterThan(0);
 
     // Collision 2 proof: the control plane never moved the row past STARTING
     // itself — the only RESTORING->READY edge came from the host phase.
@@ -383,7 +364,7 @@ describe("issue #60 — shared-row open, end to end", () => {
     const established = await ensureControllerLeaseForOpen(world.cpLeases, "ws-1", "alice");
     const agent = await composeAgent(world, "ws-1", established);
     const openRes = await openAndRecover(world, "ws-1", ALICE, agent);
-    expect(openRes.status).toBe(200);
+    expect(openRes.status).toBe(202);
 
     const session = await world.repo.createSession({ id: "sess-1", workspaceId: "ws-1" });
     const messageCtx = (user: { id: string; email: string }) => ({
@@ -450,14 +431,12 @@ describe("issue #60 — shared-row open, end to end", () => {
     expect(b).toBe(first);
   });
 
-  test("issue #63: agent git-clone failure surfaces the health error, not IllegalTransitionError", async () => {
-    // The GCP incident, end to end on the shared rows: the agent-host fails
-    // git clone and commits RESTORE_FAILED while the control-plane open is
-    // still polling the readiness endpoint in STARTING. open() must reject with the health
-    // observation error (downstream of the clone failure) — the old code
-    // replaced it with
-    // "illegal state transition: STARTING -> RESTORE_FAILED", hiding the
-    // real cause behind a state-machine error.
+  test("issue #63: agent git-clone failure records RESTORE_FAILED while the control-plane open already answered", async () => {
+    // The GCP incident, end to end on the shared rows — under async open
+    // (issue #136) the control-plane open answers 202 STARTING without
+    // waiting, so the agent-host's later clone failure is the failure the
+    // row records. GET (the row read) then serves RESTORE_FAILED; a later
+    // retry re-opens from it.
     const world = await buildSharedWorld("ws-1");
     const established = await ensureControllerLeaseForOpen(world.cpLeases, "ws-1", "alice");
     const agent = await composeAgent(world, "ws-1", established);
@@ -467,27 +446,14 @@ describe("issue #60 — shared-row open, end to end", () => {
       return originalRun(args, opts);
     };
 
-    const openP = openWorkspace(openCtx(world, "ws-1", ALICE));
-    for (let i = 0; i < 1000; i++) {
-      const history = world.transitions.map((r) => `${r.from}->${r.to}`);
-      if (history.includes("STOPPED->STARTING")) break;
-      await new Promise((r) => setTimeout(r, 1));
-    }
-    const recoverP = agent.host.recover();
-    const [openSettled, recoverSettled] = await Promise.allSettled([openP, recoverP]);
+    const openRes = await openWorkspace(openCtx(world, "ws-1", ALICE));
+    expect(openRes.status).toBe(202);
 
-    // The agent-host surfaces the clone failure and records RESTORE_FAILED.
-    expect(recoverSettled.status).toBe("rejected");
-    expect(String((recoverSettled as PromiseRejectedResult).reason)).toMatch(/clone failed/);
+    // The agent-host fails git clone and commits RESTORE_FAILED.
+    await expect(agent.host.recover()).rejects.toThrow(/clone failed/);
     expect(agent.host.health.snapshot().status).toBe("RESTORE_FAILED");
 
-    // The control-plane open rejects with the health observation error —
-    // never the bookkeeping IllegalTransitionError — and the row the
-    // agent-host recorded is left untouched.
-    expect(openSettled.status).toBe("rejected");
-    const openErr = (openSettled as PromiseRejectedResult).reason as Error;
-    expect(openErr).not.toBeInstanceOf(IllegalTransitionError);
-    expect(openErr.message).toMatch(/never became healthy/);
+    // The row the agent-host recorded is what every reader sees.
     expect((await world.repo.getWorkspace("ws-1"))!.runtimeState).toBe("RESTORE_FAILED");
     expect(world.transitions.map((r) => `${r.from}->${r.to}`)).toEqual([
       "STOPPED->STARTING",
