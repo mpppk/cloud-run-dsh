@@ -2893,3 +2893,152 @@ describe("unexpected error observability (issue #48)", () => {
     }
   });
 });
+
+describe("in-request open failure reason (follow-up to #141)", () => {
+  function postOpen(h: TestHarness, workspaceId: string): Promise<Response> {
+    return h.fetchAs("alice", `/v1/workspaces/${workspaceId}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+  }
+
+  /** Production-shaped stub: T8 moves the row to RESTORE_FAILED (state only), then open() rejects. */
+  function pinFailingOpenAfterT8Move(
+    h: TestHarness,
+    workspaceId: string,
+    error: unknown,
+    moveTo: "RESTORE_FAILED" | "STARTING" = "RESTORE_FAILED",
+  ): void {
+    h.deps.runtimes.set(workspaceId, {
+      open: async () => {
+        if (moveTo === "RESTORE_FAILED") {
+          // T8 recordFailureStateBestEffort writes state only — no reason.
+          await h.repo.updateWorkspace(workspaceId, { runtimeState: "RESTORE_FAILED" });
+          expect((await h.repo.getWorkspace(workspaceId))!.lastError).toBeNull();
+        } else {
+          await h.repo.updateWorkspace(workspaceId, { runtimeState: "STARTING" });
+        }
+        throw error;
+      },
+      stop: async () => "STOPPED",
+      getState: () => "STOPPED",
+      recordActivity: () => {},
+      assertAgentInputAllowed: async () => {},
+      runManualCheckpoint: async () => ({ skipped: false }),
+      getInstanceUrl: async () => null,
+      deleteInstance: async () => {},
+    });
+  }
+
+  test("handle.open() throws after T8 move -> row is RESTORE_FAILED with a summarized reason", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      pinFailingOpenAfterT8Move(h, ws.id, new Error("Instance start failed: credentials missing"));
+      const res = await postOpen(h, ws.id);
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as { error: { code: string; message: string; errorId: string } };
+      expect(body.error.code).toBe("internal");
+      // The response body never carries the reason (internals stay in the row + log).
+      expect(JSON.stringify(body)).not.toContain("Instance start failed");
+      expect(body.error.errorId).toMatch(ERROR_ID_RE);
+      const row = (await h.repo.getWorkspace(ws.id))!;
+      expect(row.runtimeState).toBe("RESTORE_FAILED");
+      expect(row.lastError).not.toBeNull();
+      expect(row.lastError).toContain("Instance start failed");
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("STARTING row + throwing open() moves to RESTORE_FAILED with reason (T8 lost-race branch)", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      pinFailingOpenAfterT8Move(h, ws.id, new Error("Instances API error: quota exceeded"), "STARTING");
+      const res = await postOpen(h, ws.id);
+      expect(res.status).toBe(500);
+      const row = (await h.repo.getWorkspace(ws.id))!;
+      expect(row.runtimeState).toBe("RESTORE_FAILED");
+      expect(row.lastError).toContain("quota exceeded");
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("secrets in the open error never reach the row or the response", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      const pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----";
+      const dsn = "postgres://dsh_app:S3cretDbPass@10.0.0.2:5432/dsh";
+      const token = "ghp_testsecrettoken1234567890abcdef";
+      const apiKey = "sk-or-v1-abcdefghijklmnopqrstuvwx";
+      pinFailingOpenAfterT8Move(
+        h,
+        ws.id,
+        new Error(`start failed: ${pem} ${dsn} ${token} ${apiKey} password=hunter2`),
+      );
+      const res = await postOpen(h, ws.id);
+      expect(res.status).toBe(500);
+      const rawBody = await res.text();
+      expect(rawBody).not.toContain("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC");
+      expect(rawBody).not.toContain("S3cretDbPass");
+      expect(rawBody).not.toContain(token);
+      expect(rawBody).not.toContain(apiKey);
+      expect(rawBody).not.toContain("hunter2");
+      const row = (await h.repo.getWorkspace(ws.id))!;
+      expect(row.runtimeState).toBe("RESTORE_FAILED");
+      expect(row.lastError).not.toBeNull();
+      expect(row.lastError!).not.toContain("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC");
+      expect(row.lastError!).not.toContain("S3cretDbPass");
+      expect(row.lastError!).not.toContain(token);
+      expect(row.lastError!).not.toContain(apiKey);
+      expect(row.lastError!).not.toContain("hunter2");
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("late READY between T8 move and reason write is never clobbered (CAS)", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      pinFailingOpenAfterT8Move(h, ws.id, new Error("Instance start failed: late race"));
+      // Stage the race: a late agent-host READY lands after the T8 move but
+      // before the handler's reason CAS — the CAS must leave it alone.
+      const realRecord = h.deps.repo.recordRestoreErrorIfFailed.bind(h.deps.repo);
+      h.deps.repo.recordRestoreErrorIfFailed = (async (id: string, reason: string) => {
+        await h.repo.updateWorkspace(id, { runtimeState: "READY" });
+        return realRecord(id, reason);
+      }) as typeof h.deps.repo.recordRestoreErrorIfFailed;
+      const res = await postOpen(h, ws.id);
+      // The original failure still answers 500 — only the row is preserved.
+      expect(res.status).toBe(500);
+      const row = (await h.repo.getWorkspace(ws.id))!;
+      expect(row.runtimeState).toBe("READY");
+      expect(row.lastError).toBeNull();
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("reason-record failure still answers the original 500 (best-effort)", async () => {
+    const h = startHarness();
+    try {
+      const ws = await h.createWorkspace("alice");
+      pinFailingOpenAfterT8Move(h, ws.id, new Error("Instance start failed: boom"));
+      h.deps.repo.recordRestoreErrorIfFailed = async () => {
+        throw new Error("database unavailable");
+      };
+      const res = await postOpen(h, ws.id);
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as { error: { code: string; errorId: string } };
+      expect(body.error.code).toBe("internal");
+      expect(body.error.errorId).toMatch(ERROR_ID_RE);
+    } finally {
+      h.stop();
+    }
+  });
+});

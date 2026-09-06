@@ -669,6 +669,7 @@ PGPASSFILE="$PGPASSF" psql "postgresql://dsh_app@127.0.0.1:5433/dsh" \
 | `instance dsh-… not found …` | Past ~2 min (`FAST_FAIL_INSTANCE_GRACE_MS`) the Instance does not exist: never created, or deleted out-of-band. The control-plane failed the row on a read-triggered single GET instead of waiting 10 min. | Check how the Instance went missing (`gcloud run instances` / Step 5.4 GET); then re-open. |
 | `instance dsh-… is FAILED` | The Instance itself reports terminal failure (`terminalCondition CONDITION_FAILED`) — e.g. a crash-loop the restart policy gave up on, or a bad image/config. | `GET .../instances/dsh-…` for the terminal condition + Cloud Logging for the container logs; fix the cause; re-open. |
 | `no progress for 10m while …` | The Instance exists (or the lookup flaked) but nobody advanced the row for 10 min (`STALE_STARTING_THRESHOLD_MS`): the agent-host died silently or never booted. | Check the agent-host logs for `workspace.restore.failed` (its `reason` field holds the host-side detail); if the Instance never booted, check its container logs. Then re-open. |
+| summarized instance-start error (e.g. `credentials missing`, `Instances API error …`, `quota exceeded`) | The `POST /v1/workspaces/:id/open` request itself failed (`handle.open()` threw — auth, Instances API error, permission, quota: the most common bring-up failure) and answered 500. The control plane records the sanitized reason on the row in the same failure path (CAS `recordRestoreErrorIfFailed`; previously this path left `last_error` NULL). | Fix the named cause (credentials, IAM, quota); then re-open. Correlate with the 500's `errorId` via the `http.unexpected_error` log (same `workspaceId` + timestamp) — the `errorId` itself is NOT stored in the row (see below). |
 | anything else (e.g. `git clone failed …`) | Written by the agent-host itself (`RestartRecovery`): the restore step that threw. | Fix the named cause (repo access, checkpoint bucket, sandbox); re-open. |
 
 Notes the operator needs, not guesses:
@@ -686,8 +687,17 @@ Notes the operator needs, not guesses:
   lands between the read and the mark wins and is served — if GET says
   READY while you expected failure, the restore actually completed.
 - Control-plane log events: `control-plane.open.fast-fail-starting`
-  (2-min probe verdict) and `control-plane.open.stale-starting-failed`
-  (10-min verdict), both with `workspaceId` + `reason`.
+  (2-min probe verdict), `control-plane.open.stale-starting-failed`
+  (10-min verdict), and `control-plane.open.in-request-failed`
+  (the `POST /open` request itself threw — `recorded: true` means the row
+  carries the same sanitized `reason`), all with `workspaceId` + `reason`.
+- The 500 `errorId` is deliberately NOT stored in `last_error`: it is
+  minted in the HTTP layer (`toErrorResponse`) after the handler throws,
+  so threading it into the row would couple the persistence path to the
+  HTTP error contract for no triage gain — the `http.unexpected_error`
+  log already carries both `workspaceId` and `errorId`, which is the
+  correlation key (`gcloud logging read ... workspaceId="…"` finds the
+  `errorId`). The row keeps only the sanitized failure summary.
 
 ### Recovery: `restore-failed` on a row stuck in `STOPPING`
 
