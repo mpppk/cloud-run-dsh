@@ -238,6 +238,25 @@ describe("product UI vocabulary (issue #138 acceptance)", () => {
     expect(js).toContain("/events");
     expect(js).toContain("/sessions");
   });
+
+  test("product JS retries a 409 send with one prepare + one retry (no double-send)", async () => {
+    // Static pin for the sendFlow 409 branch: the API-level recovery test
+    // below proves the server answers 409 before appending and that a
+    // re-open recovers at seq 0, but nothing executes this JS — deleting the
+    // branch would keep every API test green while the screen dead-ends on
+    // a lapsed lease again. So pin the shape: inside sendFlow a 409
+    // re-prepares via prepareAndWait and posts the same message once more,
+    // documented as append-free (hence retry-safe).
+    const js = await (await fetch(`${base}/app/app.js`)).text();
+    expect(js.indexOf("async function sendFlow")).toBeGreaterThan(-1);
+    const sendFlow = js.slice(js.indexOf("async function sendFlow"));
+    expect(sendFlow.indexOf("sent.status === 409")).toBeGreaterThan(-1);
+    const branch = sendFlow.slice(sendFlow.indexOf("sent.status === 409"));
+    const prepareAt = branch.indexOf("prepareAndWait(false)");
+    expect(prepareAt).toBeGreaterThan(-1);
+    expect(branch.slice(prepareAt)).toContain("/messages");
+    expect(branch).toContain("409 before appending");
+  });
 });
 
 describe("product UI polling never extends the idle timer", () => {
