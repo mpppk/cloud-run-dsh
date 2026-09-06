@@ -117,4 +117,57 @@ describe("dev composition (src/dev.ts)", () => {
     const body = await res.json();
     expect(body.error.code).toBe("conflict");
   });
+
+  test("open persists READY: GET and repo.getWorkspace agree (issue #131)", async () => {
+    const created = await fetch(`${base}/v1/workspaces`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...iap("alice") },
+      body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
+    });
+    expect(created.status).toBe(201);
+    const ws = (await created.json()) as { id: string };
+
+    const opened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...iap("alice") },
+      body: JSON.stringify({}),
+    });
+    expect(opened.status).toBe(200);
+    expect((await opened.json()).state).toBe("READY");
+
+    const read = await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: iap("alice") });
+    expect(read.status).toBe(200);
+    expect((await read.json()).runtimeState).toBe("READY");
+    expect((await deps.repo.getWorkspace(ws.id))?.runtimeState).toBe("READY");
+  });
+
+  test("stop persists STOPPED: GET and repo.getWorkspace agree (issue #131)", async () => {
+    const created = await fetch(`${base}/v1/workspaces`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...iap("alice") },
+      body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
+    });
+    expect(created.status).toBe(201);
+    const ws = (await created.json()) as { id: string };
+
+    const opened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...iap("alice") },
+      body: JSON.stringify({}),
+    });
+    expect(opened.status).toBe(200);
+
+    const stopped = await fetch(`${base}/v1/workspaces/${ws.id}/stop`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...iap("alice") },
+      body: JSON.stringify({}),
+    });
+    expect(stopped.status).toBe(200);
+    expect((await stopped.json()).state).toBe("STOPPED");
+
+    const read = await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: iap("alice") });
+    expect(read.status).toBe(200);
+    expect((await read.json()).runtimeState).toBe("STOPPED");
+    expect((await deps.repo.getWorkspace(ws.id))?.runtimeState).toBe("STOPPED");
+  });
 });

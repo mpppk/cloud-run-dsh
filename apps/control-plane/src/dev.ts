@@ -17,7 +17,10 @@ import { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
 import { InMemoryLeaseStore } from "@cloud-run-dsh/controller-lease/testing";
 import { PostgresSessionPersistenceRepository } from "@cloud-run-dsh/session-persistence-postgres";
 import { InMemoryFakeExecutor } from "@cloud-run-dsh/session-persistence-postgres/testing";
-import type { Workspace } from "@cloud-run-dsh/session-persistence-postgres";
+import type {
+  SessionPersistenceRepository,
+  Workspace,
+} from "@cloud-run-dsh/session-persistence-postgres";
 import type { ActivityKind } from "@cloud-run-dsh/workspace-runtime";
 import { createControlPlaneDeps, startControlPlane } from "./index.js";
 import {
@@ -34,20 +37,31 @@ const DEFAULT_PORT = 8787;
  * Minimal in-memory runtime handle for local development: open/stop flip the
  * state, agent input is always allowed, and every activity kind is logged so
  * a developer can see what the control plane thinks is happening.
+ *
+ * Issue #131: open/stop also persist the new state to the workspace row via
+ * repo.updateWorkspace, so GET /v1/workspaces/:id (which reads the same row)
+ * agrees with the open/stop response — exactly what the production T8
+ * runtime does through SqlTransactionalStateStore. Without this the dev
+ * server answered open -> READY while the row stayed STOPPED forever.
  */
 export class LoggingWorkspaceRuntimeHandle implements WorkspaceRuntimeHandle {
   private state = "STOPPED";
   readonly activities: ActivityKind[] = [];
 
-  constructor(private readonly workspaceId: string) {}
+  constructor(
+    private readonly workspaceId: string,
+    private readonly repo: SessionPersistenceRepository,
+  ) {}
 
   async open(): Promise<string> {
+    await this.repo.updateWorkspace(this.workspaceId, { runtimeState: "READY" });
     this.state = "READY";
     console.log(`[dev] workspace ${this.workspaceId}: open -> READY`);
     return this.state;
   }
 
   async stop(): Promise<string> {
+    await this.repo.updateWorkspace(this.workspaceId, { runtimeState: "STOPPED" });
     this.state = "STOPPED";
     console.log(`[dev] workspace ${this.workspaceId}: stop -> STOPPED`);
     return this.state;
@@ -94,7 +108,7 @@ export function createDevControlPlaneDeps(): ControlPlaneDeps {
   const membership = new InMemoryMembershipStore();
   const runtimes = new RuntimeRegistry((workspace: Workspace) => {
     console.log(`[dev] creating runtime handle for workspace ${workspace.id}`);
-    return new LoggingWorkspaceRuntimeHandle(workspace.id);
+    return new LoggingWorkspaceRuntimeHandle(workspace.id, repo);
   });
 
   return createControlPlaneDeps({

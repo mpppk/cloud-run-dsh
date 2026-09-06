@@ -12,7 +12,7 @@ import type { ActivityKind } from "@cloud-run-dsh/workspace-runtime";
 import { createDevControlPlaneDeps } from "./dev.js";
 import { startControlPlane, type RunningControlPlane } from "./server.js";
 import type { ControlPlaneDeps, WorkspaceRuntimeHandle } from "./index.js";
-import { createSseParser, parseSseChunks } from "../public/app.js";
+import { createSseParser, leaseRole, parseSseChunks } from "../public/app.js";
 
 let deps: ControlPlaneDeps;
 let server: RunningControlPlane;
@@ -176,6 +176,45 @@ describe("static UI delivery (issue #128)", () => {
       200,
     );
     expect(spy.activities).toEqual([]);
+  });
+});
+
+describe("leaseRole in public/app.js (issue #130)", () => {
+  const NOW = Date.parse("2026-09-06T02:19:24.939Z");
+  const iso = (ms: number) => new Date(ms).toISOString();
+
+  test("no held lease -> observer", () => {
+    expect(leaseRole(null, NOW)).toBe("observer");
+    expect(leaseRole(undefined, NOW)).toBe("observer");
+  });
+
+  test("expiresAt in the future -> controller", () => {
+    const lease = { controllerId: "ctrl-1", expiresAt: iso(NOW + 10_000) };
+    expect(leaseRole(lease, NOW)).toBe("controller");
+  });
+
+  test("expiresAt === now -> expired (matches T6 <= boundary)", () => {
+    const lease = { controllerId: "ctrl-1", expiresAt: iso(NOW) };
+    expect(leaseRole(lease, NOW)).toBe("expired");
+  });
+
+  test("expiresAt in the past -> expired", () => {
+    const lease = { controllerId: "ctrl-1", expiresAt: iso(NOW - 35_000) };
+    expect(leaseRole(lease, NOW)).toBe("expired");
+  });
+
+  test("unparseable expiresAt -> expired (never a false green)", () => {
+    const lease = { controllerId: "ctrl-1", expiresAt: "not-a-date" };
+    expect(leaseRole(lease, NOW)).toBe("expired");
+  });
+
+  test("re-rendering never fetches: app.js only polls the workspace list on the 15s stream timer", async () => {
+    const js = await Bun.file(join(import.meta.dir, "..", "public", "app.js")).text();
+    // The only setInterval in the page is the 1s role-badge re-render
+    // (pure DOM) plus the 15s workspace refresh while streaming.
+    const intervals = js.match(/setInterval\(/g) ?? [];
+    expect(intervals.length).toBe(2);
+    expect(js).toContain("setInterval(renderRole, 1000)");
   });
 });
 
