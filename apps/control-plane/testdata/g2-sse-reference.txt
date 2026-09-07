@@ -1,0 +1,292 @@
+id: 0
+event: user_message
+data: {"content":"README.md の先頭に挨拶を1行だけ足してください。"}
+
+id: 1
+event: agent/inbox/spliced
+data: {"target":"next-turn","start":0,"inserted":[{"content":[{"type":"text","text":"README.md の先頭に挨拶を1行だけ足してください。"}],"source":{"kind":"user"},"role":"user","id":"e2dc92b6-6043-40e4-a2d3-2656ca276889"}]}
+
+id: 2
+event: turn/start
+data: {"turn":1}
+
+id: 3
+event: agent/inbox/spliced
+data: {"target":"next-turn","start":0,"removedCount":1,"inserted":[]}
+
+id: 4
+event: step/start
+data: {"turn":1,"step":1}
+
+id: 5
+event: request/header
+data: {"header":{"config":{"provider":"deepseek-official","model":"deepseek/deepseek-v4-flash","maxTokens":256000,"reasoningEffort":"off"},"adapterDefaults":{"reasoningEffort":true,"maxTokens":true},"system":"Use the read tool — not shell commands like cat — to inspect text files. Results include line numbers. Use offset and limit to continue reading large files.\n\nUse the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first (the default fs-observation-policy requires it) and prefer edit for targeted changes.\n\nUse the edit tool for targeted changes to existing UTF-8 text files. It replaces literal old_string with new_string; by default old_string must appear exactly once. If old_string appears multiple times, provide a more specific old_string or set replace_all to true. Read the file first (the default fs-observation-policy requires it), unless you just created or edited it in this session.\n\nUse the glob tool — not shell find — to discover files by path pattern. A pattern with no \"/\" matches basenames at any depth, so \"*\" matches every file in the tree rather than its top level. Results are files only, never directories, and include hidden and ignored files: a result that fits comes back in modification-time order, while a larger one keeps the modification-time-ordered head.\n\nUse the grep tool — not shell grep or rg — to search file contents. Use read on a matched file when you need surrounding context.","tools":[{"name":"edit","description":"Edit an existing UTF-8 text file by replacing literal text.","parameters":{"type":"object","properties":{"file_path":{"type":"string","description":"Path to edit, resolved by the filesystem backend."},"old_string":{"type":"string","description":"Literal text to replace. Must match exactly."},"new_string":{"type":"string","description":"Literal replacement text. Use an empty string to delete the match."},"replace_all":{"type":"boolean","description":"Replace all matches. Defaults to false; when false, old_string must appear exactly once."},"sandbox_permissions":{"type":"string","description":"The wider sandbox mode this file operation needs. Only valid as a one-shot retry of an operation the sandbox just denied; requires justification and user approval.","enum":["workspace-write","danger-full-access"]},"justification":{"type":"string","description":"Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access."}},"required":["file_path","old_string","new_string"]}},{"name":"glob","description":"Find files whose paths match a glob pattern. Returns matching file paths — never directories — including hidden and ignored files (VCS metadata directories are excluded). Up to 100 paths come back in modification-time order; a larger result returns the first 100 paths in modification-time order, says so, and reports where the complete sorted list was saved. This tool does not enumerate directory entries.","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern to match file paths against (e.g. \"**/*.ts\", \"src/**/*.test.js\"). A pattern with no \"/\" matches the basename at any depth, so \"*\" and \"*.ts\" both search the whole tree; include a separator to anchor the depth."},"path":{"type":"string","description":"Directory to search in. Defaults to the session workspace; a relative path resolves against it."}},"required":["pattern"]}},{"name":"grep","description":"Search file contents with a ripgrep regular expression. Returns matching lines with line numbers, grouped by file. Returns the first 250 matches inline; a capped result reports where the complete match list was saved. Use read on a matched file for surrounding context.","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for (ripgrep syntax)."},"path":{"type":"string","description":"File or directory to search. Defaults to the session workspace; a relative path resolves against it."},"include":{"type":"string","description":"One glob filter for which files to search (e.g. \"*.ts\", \"*.{js,jsx}\"). Not a list; negation is not supported."}},"required":["pattern"]}},{"name":"read","description":"Read a UTF-8 text file and return line-numbered content.","parameters":{"type":"object","properties":{"file_path":{"type":"string","description":"Path to read, resolved by the filesystem backend."},"offset":{"type":"number","description":"1-based first line to return. Defaults to 1."},"limit":{"type":"number","description":"Maximum number of lines to return. Defaults to 2000."}},"required":["file_path"]}},{"name":"write","description":"Create or fully replace a UTF-8 text file.","parameters":{"type":"object","properties":{"file_path":{"type":"string","description":"Path to write, resolved by the filesystem backend."},"content":{"type":"string","description":"Full UTF-8 text content to write."},"sandbox_permissions":{"type":"string","description":"The wider sandbox mode this file operation needs. Only valid as a one-shot retry of an operation the sandbox just denied; requires justification and user approval.","enum":["workspace-write","danger-full-access"]},"justification":{"type":"string","description":"Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access."}},"required":["file_path","content"]}}]},"reason":"initial"}
+
+: stream open
+
+id: 6
+event: request/context
+data: {"provider":"deepseek-official","model":"deepseek/deepseek-v4-flash","contextWindow":1000000}
+
+id: 7
+event: assistant/chunk
+data: {"turn":1,"step":1,"chunk":{"type":"block-start","index":0,"blockType":"tool-call"}}
+
+id: 8
+event: assistant/chunk
+data: {"turn":1,"step":1,"chunk":{"type":"tool-call-delta","index":0,"id":"call_c30210a431894256ab962549","name":"read","argumentsDelta":""}}
+
+id: 9
+event: assistant/chunk
+data: {"turn":1,"step":1,"chunk":{"type":"tool-call-delta","index":0,"id":"call_c30210a431894256ab962549","name":"read","argumentsDelta":""}}
+
+id: 10
+event: assistant/chunk
+data: {"turn":1,"step":1,"chunk":{"type":"tool-call-delta","index":0,"id":"call_c30210a431894256ab962549","name":"read","argumentsDelta":"{"}}
+
+id: 11
+event: assistant/chunk
+data: {"turn":1,"step":1,"chunk":{"type":"tool-call-delta","index":0,"id":"call_c30210a431894256ab962549","name":"read","argumentsDelta":"\"file_path\": \"/workspace/README"}}
+
+id: 12
+event: assistant/chunk
+data: {"turn":1,"step":1,"chunk":{"type":"tool-call-delta","index":0,"id":"call_c30210a431894256ab962549","name":"read","argumentsDelta":".md\"}"}}
+
+id: 13
+event: assistant/chunk
+data: {"turn":1,"step":1,"chunk":{"type":"block-end","index":0,"block":{"type":"tool-call","id":"call_c30210a431894256ab962549","name":"read","arguments":"{\"file_path\": \"/workspace/README.md\"}"}}}
+
+id: 14
+event: assistant/chunk
+data: {"turn":1,"step":1,"chunk":{"type":"usage","usage":{"inputTokens":1593,"outputTokens":80,"totalTokens":1673,"cacheReadTokens":0,"reasoningTokens":30}}}
+
+id: 15
+event: assistant/chunk
+data: {"turn":1,"step":1,"chunk":{"type":"finish","reason":{"kind":"tool-calls"}}}
+
+id: 16
+event: assistant/message
+data: {"turn":1,"step":1,"message":{"role":"assistant","content":[{"type":"tool-call","id":"call_c30210a431894256ab962549","name":"read","arguments":"{\"file_path\": \"/workspace/README.md\"}"}],"source":{"kind":"model","provider":"deepseek-official","model":"deepseek/deepseek-v4-flash"},"id":"d17f784d-d1f2-4dc4-8a96-c725506e44fc"},"usage":{"inputTokens":1593,"outputTokens":80,"totalTokens":1673,"cacheReadTokens":0,"reasoningTokens":30}}
+
+id: 17
+event: tool/call
+data: {"turn":1,"step":1,"callId":"call_c30210a431894256ab962549","name":"read","arguments":"{\"file_path\": \"/workspace/README.md\"}"}
+
+id: 18
+event: tool/result
+data: {"turn":1,"step":1,"message":{"source":{"kind":"tool","callId":"call_c30210a431894256ab962549"},"content":[{"type":"tool-result","toolCallId":"call_c30210a431894256ab962549","content":[{"type":"text","text":"<path>/workspace/README.md</path>\n<type>file</type>\n<content>\n1: TODO app built with TanStack Start, Drizzle, and Cloudflare D1.\n2: \n3: # Getting Started\n4: \n5: To run this application:\n6: \n7: ```bash\n8: bun install\n9: bun --bun run dev\n10: ```\n11: \n12: # Building For Production\n13: \n14: To build this application for production:\n15: \n16: ```bash\n17: bun --bun run build\n18: ```\n19: \n20: ## Testing\n21: \n22: This project uses [Vitest](https://vitest.dev/) for testing. You can run the tests with:\n23: \n24: ```bash\n25: bun --bun run test\n26: ```\n27: \n28: ## Setting up Cloudflare D1\n29: \n30: The Drizzle demo at `/demo/drizzle` uses Cloudflare D1 through the `DB` binding in `wrangler.jsonc`.\n31: \n32: Create the D1 database:\n33: \n34: ```bash\n35: bunx --bun wrangler d1 create todo-app2026-db\n36: ```\n37: \n38: Copy the generated `database_id` into `wrangler.jsonc`, replacing `00000000-0000-0000-0000-000000000000`, then regenerate Worker binding types:\n39: \n40: ```bash\n41: bun run cf-typegen\n42: ```\n43: \n44: For Drizzle Kit remote operations, set these values in `.env.local`:\n45: \n46: ```bash\n47: CLOUDFLARE_ACCOUNT_ID=your-account-id\n48: CLOUDFLARE_DATABASE_ID=your-d1-database-id\n49: CLOUDFLARE_D1_TOKEN=your-api-token\n50: ```\n51: \n52: Generate and apply local D1 migrations:\n53: \n54: ```bash\n55: bun run db:generate\n56: bun run db:migrate:local\n57: ```\n58: \n59: Apply migrations to the remote D1 database after the real `database_id` is configured:\n60: \n61: ```bash\n62: bun run db:migrate:remote\n63: ```\n64: \n65: ## Styling\n66: \n67: This project uses [Tailwind CSS](https://tailwindcss.com/) for styling.\n68: \n69: ### Removing Tailwind CSS\n70: \n71: If you prefer not to use Tailwind CSS:\n72: \n73: 1. Remove the demo pages in `src/routes/demo/`\n74: 2. Replace the Tailwind import in `src/styles.css` with your own styles\n75: 3. Remove `tailwindcss()` from the plugins array in `vite.config.ts`\n76: 4. Uninstall the packages: `bun install @tailwindcss/vite tailwindcss -D`\n77: \n78: ## Linting & Formatting\n79: \n80: This project uses [Biome](https://biomejs.dev/) for linting and formatting. The following scripts are available:\n81: \n82: \n83: ```bash\n84: bun --bun run lint\n85: bun --bun run format\n86: bun --bun run check\n87: ```\n88: \n89: \n90: ## Shadcn\n91: \n92: Add components using the latest version of [Shadcn](https://ui.shadcn.com/).\n93: \n94: ```bash\n95: pnpm dlx shadcn@latest add button\n96: ```\n97: \n98: \n99: ## Setting up Better Auth\n100: \n101: 1. Generate and set the `BETTER_AUTH_SECRET` environment variable in your `.env.local`:\n102: \n103:    ```bash\n104:    bunx --bun @better-auth/cli secret\n105:    ```\n106: \n107: 2. Visit the [Better Auth documentation](https://www.better-auth.com) to unlock the full potential of authentication in your app.\n108: \n109: ### Adding a Database (Optional)\n110: \n111: Better Auth can work in stateless mode, but to persist user data, add a database:\n112: \n113: ```typescript\n114: // src/lib/auth.ts\n115: import { betterAuth } from \"better-auth\";\n116: import { Pool } from \"pg\";\n117: \n118: export const auth = betterAuth({\n119:   database: new Pool({\n120:     connectionString: process.env.DATABASE_URL,\n121:   }),\n122:   // ... rest of config\n123: });\n124: ```\n125: \n126: Then run migrations:\n127: \n128: ```bash\n129: bunx --bun @better-auth/cli migrate\n130: ```\n131: \n132: \n133: \n134: ## Routing\n135: \n136: This project uses [TanStack Router](https://tanstack.com/router) with file-based routing. Routes are managed as files in `src/routes`.\n137: \n138: ### Adding A Route\n139: \n140: To add a new route to your application just add a new file in the `./src/routes` directory.\n141: \n142: TanStack will automatically generate the content of the route file for you.\n143: \n144: Now that you have two routes you can use a `Link` component to navigate between them.\n145: \n146: ### Adding Links\n147: \n148: To use SPA (Single Page Application) navigation you will need to import the `Link` component from `@tanstack/react-router`.\n149: \n150: ```tsx\n151: import { Link } from \"@tanstack/react-router\";\n152: ```\n153: \n154: Then anywhere in your JSX you can use it like so:\n155: \n156: ```tsx\n157: <Link to=\"/about\">About</Link>\n158: ```\n159: \n160: This will create a link that will navigate to the `/about` route.\n161: \n162: More information on the `Link` component can be found in the [Link documentation](https://tanstack.com/router/v1/docs/framework/react/api/router/linkComponent).\n163: \n164: ### Using A Layout\n165: \n166: In the File Based Routing setup the layout is located in `src/routes/__root.tsx`. Anything you add to the root route will appear in all the routes. The route content will appear in the JSX where you render `{children}` in the `shellComponent`.\n167: \n168: Here is an example layout that includes a header:\n169: \n170: ```tsx\n171: import { HeadContent, Scripts, createRootRoute } from '@tanstack/react-router'\n172: \n173: export const Route = createRootRoute({\n174:   head: () => ({\n175:     meta: [\n176:       { charSet: 'utf-8' },\n177:       { name: 'viewport', content: 'width=device-width, initial-scale=1' },\n178:       { title: 'My App' },\n179:     ],\n180:   }),\n181:   shellComponent: ({ children }) => (\n182:     <html lang=\"en\">\n183:       <head>\n184:         <HeadContent />\n185:       </head>\n186:       <body>\n187:         <header>\n188:           <nav>\n189:             <Link to=\"/\">Home</Link>\n190:             <Link to=\"/about\">About</Link>\n191:           </nav>\n192:         </header>\n193:         {children}\n194:         <Scripts />\n195:       </body>\n196:     </html>\n197:   ),\n198: })\n199: ```\n200: \n201: More information on layouts can be found in the [Layouts documentation](https://tanstack.com/router/latest/docs/framework/react/guide/routing-concepts#layouts).\n202: \n203: ## Server Functions\n204: \n205: TanStack Start provides server functions that allow you to write server-side code that seamlessly integrates with your client components.\n206: \n207: ```tsx\n208: import { createServerFn } from '@tanstack/react-start'\n209: \n210: const getServerTime = createServerFn({\n211:   method: 'GET',\n212: }).handler(async () => {\n213:   return new Date().toISOString()\n214: })\n215: \n216: // Use in a component\n217: function MyComponent() {\n218:   const [time, setTime] = useState('')\n219:   \n220:   useEffect(() => {\n221:     getServerTime().then(setTime)\n222:   }, [])\n223:   \n224:   return <div>Server time: {time}</div>\n225: }\n226: ```\n227: \n228: ## API Routes\n229: \n230: You can create API routes by using the `server` property in your route definitions:\n231: \n232: ```tsx\n233: import { createFileRoute } from '@tanstack/react-router'\n234: import { json } from '@tanstack/react-start'\n235: \n236: export const Route = createFileRoute('/api/hello')({\n237:   server: {\n238:     handlers: {\n239:       GET: () => json({ message: 'Hello, World!' }),\n240:     },\n241:   },\n242: })\n243: ```\n244: \n245: ## Data Fetching\n246: \n247: There are multiple ways to fetch data in your application. You can use TanStack Query to fetch data from a server. But you can also use the `loader` functionality built into TanStack Router to load the data for a route before it's rendered.\n248: \n249: For example:\n250: \n251: ```tsx\n252: import { createFileRoute } from '@tanstack/react-router'\n253: \n254: export const Route = createFileRoute('/people')({\n255:   loader: async () => {\n256:     const response = await fetch('https://swapi.dev/api/people')\n257:     return response.json()\n258:   },\n259:   component: PeopleComponent,\n260: })\n261: \n262: function PeopleComponent() {\n263:   const data = Route.useLoaderData()\n264:   return (\n265:     <ul>\n266:       {data.results.map((person) => (\n267:         <li key={person.name}>{person.name}</li>\n268:       ))}\n269:     </ul>\n270:   )\n271: }\n272: ```\n273: \n274: Loaders simplify your data fetching logic dramatically. Check out more information in the [Loader documentation](https://tanstack.com/router/latest/docs/framework/react/guide/data-loading#loader-parameters).\n275: \n276: # Demo files\n277: \n278: Files prefixed with `demo` can be safely deleted. They are there to provide a starting point for you to play around with the features you've installed.\n279: \n280: # Learn More\n281: \n282: You can learn more about all of the offerings from TanStack in the [TanStack documentation](https://tanstack.com).\n283: \n284: For TanStack Start specific documentation, visit [TanStack Start](https://tanstack.com/start).\n\n(End of file - total 284 lines)\n</content>"}],"isError":false}],"role":"user","id":"dde71ce6-4e7f-4f35-b46a-8486530eb5fc"},"meta":{"path":"/workspace/README.md","offset":1,"lines":[{"number":1,"text":"TODO app built with TanStack Start, Drizzle, and Cloudflare D1."},{"number":2,"text":""},{"number":3,"text":"# Getting Started"},{"number":4,"text":""},{"number":5,"text":"To run this application:"},{"number":6,"text":""},{"number":7,"text":"```bash"},{"number":8,"text":"bun install"},{"number":9,"text":"bun --bun run dev"},{"number":10,"text":"```"},{"number":11,"text":""},{"number":12,"text":"# Building For Production"},{"number":13,"text":""},{"number":14,"text":"To build this application for production:"},{"number":15,"text":""},{"number":16,"text":"```bash"},{"number":17,"text":"bun --bun run build"},{"number":18,"text":"```"},{"number":19,"text":""},{"number":20,"text":"## Testing"},{"number":21,"text":""},{"number":22,"text":"This project uses [Vitest](https://vitest.dev/) for testing. You can run the tests with:"},{"number":23,"text":""},{"number":24,"text":"```bash"},{"number":25,"text":"bun --bun run test"},{"number":26,"text":"```"},{"number":27,"text":""},{"number":28,"text":"## Setting up Cloudflare D1"},{"number":29,"text":""},{"number":30,"text":"The Drizzle demo at `/demo/drizzle` uses Cloudflare D1 through the `DB` binding in `wrangler.jsonc`."},{"number":31,"text":""},{"number":32,"text":"Create the D1 database:"},{"number":33,"text":""},{"number":34,"text":"```bash"},{"number":35,"text":"bunx --bun wrangler d1 create todo-app2026-db"},{"number":36,"text":"```"},{"number":37,"text":""},{"number":38,"text":"Copy the generated `database_id` into `wrangler.jsonc`, replacing `00000000-0000-0000-0000-000000000000`, then regenerate Worker binding types:"},{"number":39,"text":""},{"number":40,"text":"```bash"},{"number":41,"text":"bun run cf-typegen"},{"number":42,"text":"```"},{"number":43,"text":""},{"number":44,"text":"For Drizzle Kit remote operations, set these values in `.env.local`:"},{"number":45,"text":""},{"number":46,"text":"```bash"},{"number":47,"text":"CLOUDFLARE_ACCOUNT_ID=your-account-id"},{"number":48,"text":"CLOUDFLARE_DATABASE_ID=your-d1-database-id"},{"number":49,"text":"CLOUDFLARE_D1_TOKEN=your-api-token"},{"number":50,"text":"```"},{"number":51,"text":""},{"number":52,"text":"Generate and apply local D1 migrations:"},{"number":53,"text":""},{"number":54,"text":"```bash"},{"number":55,"text":"bun run db:generate"},{"number":56,"text":"bun run db:migrate:local"},{"number":57,"text":"```"},{"number":58,"text":""},{"number":59,"text":"Apply migrations to the remote D1 database after the real `database_id` is configured:"},{"number":60,"text":""},{"number":61,"text":"```bash"},{"number":62,"text":"bun run db:migrate:remote"},{"number":63,"text":"```"},{"number":64,"text":""},{"number":65,"text":"## Styling"},{"number":66,"text":""},{"number":67,"text":"This project uses [Tailwind CSS](https://tailwindcss.com/) for styling."},{"number":68,"text":""},{"number":69,"text":"### Removing Tailwind CSS"},{"number":70,"text":""},{"number":71,"text":"If you prefer not to use Tailwind CSS:"},{"number":72,"text":""},{"number":73,"text":"1. Remove the demo pages in `src/routes/demo/`"},{"number":74,"text":"2. Replace the Tailwind import in `src/styles.css` with your own styles"},{"number":75,"text":"3. Remove `tailwindcss()` from the plugins array in `vite.config.ts`"},{"number":76,"text":"4. Uninstall the packages: `bun install @tailwindcss/vite tailwindcss -D`"},{"number":77,"text":""},{"number":78,"text":"## Linting & Formatting"},{"number":79,"text":""},{"number":80,"text":"This project uses [Biome](https://biomejs.dev/) for linting and formatting. The following scripts are available:"},{"number":81,"text":""},{"number":82,"text":""},{"number":83,"text":"```bash"},{"number":84,"text":"bun --bun run lint"},{"number":85,"text":"bun --bun run format"},{"number":86,"text":"bun --bun run check"},{"number":87,"text":"```"},{"number":88,"text":""},{"number":89,"text":""},{"number":90,"text":"## Shadcn"},{"number":91,"text":""},{"number":92,"text":"Add components using the latest version of [Shadcn](https://ui.shadcn.com/)."},{"number":93,"text":""},{"number":94,"text":"```bash"},{"number":95,"text":"pnpm dlx shadcn@latest add button"},{"number":96,"text":"```"},{"number":97,"text":""},{"number":98,"text":""},{"number":99,"text":"## Setting up Better Auth"},{"number":100,"text":""},{"number":101,"text":"1. Generate and set the `BETTER_AUTH_SECRET` environment variable in your `.env.local`:"},{"number":102,"text":""},{"number":103,"text":"   ```bash"},{"number":104,"text":"   bunx --bun @better-auth/cli secret"},{"number":105,"text":"   ```"},{"number":106,"text":""},{"number":107,"text":"2. Visit the [Better Auth documentation](https://www.better-auth.com) to unlock the full potential of authentication in your app."},{"number":108,"text":""},{"number":109,"text":"### Adding a Database (Optional)"},{"number":110,"text":""},{"number":111,"text":"Better Auth can work in stateless mode, but to persist user data, add a database:"},{"number":112,"text":""},{"number":113,"text":"```typescript"},{"number":114,"text":"// src/lib/auth.ts"},{"number":115,"text":"import { betterAuth } from \"better-auth\";"},{"number":116,"text":"import { Pool } from \"pg\";"},{"number":117,"text":""},{"number":118,"text":"export const auth = betterAuth({"},{"number":119,"text":"  database: new Pool({"},{"number":120,"text":"    connectionString: process.env.DATABASE_URL,"},{"number":121,"text":"  }),"},{"number":122,"text":"  // ... rest of config"},{"number":123,"text":"});"},{"number":124,"text":"```"},{"number":125,"text":""},{"number":126,"text":"Then run migrations:"},{"number":127,"text":""},{"number":128,"text":"```bash"},{"number":129,"text":"bunx --bun @better-auth/cli migrate"},{"number":130,"text":"```"},{"number":131,"text":""},{"number":132,"text":""},{"number":133,"text":""},{"number":134,"text":"## Routing"},{"number":135,"text":""},{"number":136,"text":"This project uses [TanStack Router](https://tanstack.com/router) with file-based routing. Routes are managed as files in `src/routes`."},{"number":137,"text":""},{"number":138,"text":"### Adding A Route"},{"number":139,"text":""},{"number":140,"text":"To add a new route to your application just add a new file in the `./src/routes` directory."},{"number":141,"text":""},{"number":142,"text":"TanStack will automatically generate the content of the route file for you."},{"number":143,"text":""},{"number":144,"text":"Now that you have two routes you can use a `Link` component to navigate between them."},{"number":145,"text":""},{"number":146,"text":"### Adding Links"},{"number":147,"text":""},{"number":148,"text":"To use SPA (Single Page Application) navigation you will need to import the `Link` component from `@tanstack/react-router`."},{"number":149,"text":""},{"number":150,"text":"```tsx"},{"number":151,"text":"import { Link } from \"@tanstack/react-router\";"},{"number":152,"text":"```"},{"number":153,"text":""},{"number":154,"text":"Then anywhere in your JSX you can use it like so:"},{"number":155,"text":""},{"number":156,"text":"```tsx"},{"number":157,"text":"<Link to=\"/about\">About</Link>"},{"number":158,"text":"```"},{"number":159,"text":""},{"number":160,"text":"This will create a link that will navigate to the `/about` route."},{"number":161,"text":""},{"number":162,"text":"More information on the `Link` component can be found in the [Link documentation](https://tanstack.com/router/v1/docs/framework/react/api/router/linkComponent)."},{"number":163,"text":""},{"number":164,"text":"### Using A Layout"},{"number":165,"text":""},{"number":166,"text":"In the File Based Routing setup the layout is located in `src/routes/__root.tsx`. Anything you add to the root route will appear in all the routes. The route content will appear in the JSX where you render `{children}` in the `shellComponent`."},{"number":167,"text":""},{"number":168,"text":"Here is an example layout that includes a header:"},{"number":169,"text":""},{"number":170,"text":"```tsx"},{"number":171,"text":"import { HeadContent, Scripts, createRootRoute } from '@tanstack/react-router'"},{"number":172,"text":""},{"number":173,"text":"export const Route = createRootRoute({"},{"number":174,"text":"  head: () => ({"},{"number":175,"text":"    meta: ["},{"number":176,"text":"      { charSet: 'utf-8' },"},{"number":177,"text":"      { name: 'viewport', content: 'width=device-width, initial-scale=1' },"},{"number":178,"text":"      { title: 'My App' },"},{"number":179,"text":"    ],"},{"number":180,"text":"  }),"},{"number":181,"text":"  shellComponent: ({ children }) => ("},{"number":182,"text":"    <html lang=\"en\">"},{"number":183,"text":"      <head>"},{"number":184,"text":"        <HeadContent />"},{"number":185,"text":"      </head>"},{"number":186,"text":"      <body>"},{"number":187,"text":"        <header>"},{"number":188,"text":"          <nav>"},{"number":189,"text":"            <Link to=\"/\">Home</Link>"},{"number":190,"text":"            <Link to=\"/about\">About</Link>"},{"number":191,"text":"          </nav>"},{"number":192,"text":"        </header>"},{"number":193,"text":"        {children}"},{"number":194,"text":"        <Scripts />"},{"number":195,"text":"      </body>"},{"number":196,"text":"    </html>"},{"number":197,"text":"  ),"},{"number":198,"text":"})"},{"number":199,"text":"```"},{"number":200,"text":""},{"number":201,"text":"More information on layouts can be found in the [Layouts documentation](https://tanstack.com/router/latest/docs/framework/react/guide/routing-concepts#layouts)."},{"number":202,"text":""},{"number":203,"text":"## Server Functions"},{"number":204,"text":""},{"number":205,"text":"TanStack Start provides server functions that allow you to write server-side code that seamlessly integrates with your client components."},{"number":206,"text":""},{"number":207,"text":"```tsx"},{"number":208,"text":"import { createServerFn } from '@tanstack/react-start'"},{"number":209,"text":""},{"number":210,"text":"const getServerTime = createServerFn({"},{"number":211,"text":"  method: 'GET',"},{"number":212,"text":"}).handler(async () => {"},{"number":213,"text":"  return new Date().toISOString()"},{"number":214,"text":"})"},{"number":215,"text":""},{"number":216,"text":"// Use in a component"},{"number":217,"text":"function MyComponent() {"},{"number":218,"text":"  const [time, setTime] = useState('')"},{"number":219,"text":"  "},{"number":220,"text":"  useEffect(() => {"},{"number":221,"text":"    getServerTime().then(setTime)"},{"number":222,"text":"  }, [])"},{"number":223,"text":"  "},{"number":224,"text":"  return <div>Server time: {time}</div>"},{"number":225,"text":"}"},{"number":226,"text":"```"},{"number":227,"text":""},{"number":228,"text":"## API Routes"},{"number":229,"text":""},{"number":230,"text":"You can create API routes by using the `server` property in your route definitions:"},{"number":231,"text":""},{"number":232,"text":"```tsx"},{"number":233,"text":"import { createFileRoute } from '@tanstack/react-router'"},{"number":234,"text":"import { json } from '@tanstack/react-start'"},{"number":235,"text":""},{"number":236,"text":"export const Route = createFileRoute('/api/hello')({"},{"number":237,"text":"  server: {"},{"number":238,"text":"    handlers: {"},{"number":239,"text":"      GET: () => json({ message: 'Hello, World!' }),"},{"number":240,"text":"    },"},{"number":241,"text":"  },"},{"number":242,"text":"})"},{"number":243,"text":"```"},{"number":244,"text":""},{"number":245,"text":"## Data Fetching"},{"number":246,"text":""},{"number":247,"text":"There are multiple ways to fetch data in your application. You can use TanStack Query to fetch data from a server. But you can also use the `loader` functionality built into TanStack Router to load the data for a route before it's rendered."},{"number":248,"text":""},{"number":249,"text":"For example:"},{"number":250,"text":""},{"number":251,"text":"```tsx"},{"number":252,"text":"import { createFileRoute } from '@tanstack/react-router'"},{"number":253,"text":""},{"number":254,"text":"export const Route = createFileRoute('/people')({"},{"number":255,"text":"  loader: async () => {"},{"number":256,"text":"    const response = await fetch('https://swapi.dev/api/people')"},{"number":257,"text":"    return response.json()"},{"number":258,"text":"  },"},{"number":259,"text":"  component: PeopleComponent,"},{"number":260,"text":"})"},{"number":261,"text":""},{"number":262,"text":"function PeopleComponent() {"},{"number":263,"text":"  const data = Route.useLoaderData()"},{"number":264,"text":"  return ("},{"number":265,"text":"    <ul>"},{"number":266,"text":"      {data.results.map((person) => ("},{"number":267,"text":"        <li key={person.name}>{person.name}</li>"},{"number":268,"text":"      ))}"},{"number":269,"text":"    </ul>"},{"number":270,"text":"  )"},{"number":271,"text":"}"},{"number":272,"text":"```"},{"number":273,"text":""},{"number":274,"text":"Loaders simplify your data fetching logic dramatically. Check out more information in the [Loader documentation](https://tanstack.com/router/latest/docs/framework/react/guide/data-loading#loader-parameters)."},{"number":275,"text":""},{"number":276,"text":"# Demo files"},{"number":277,"text":""},{"number":278,"text":"Files prefixed with `demo` can be safely deleted. They are there to provide a starting point for you to play around with the features you've installed."},{"number":279,"text":""},{"number":280,"text":"# Learn More"},{"number":281,"text":""},{"number":282,"text":"You can learn more about all of the offerings from TanStack in the [TanStack documentation](https://tanstack.com)."},{"number":283,"text":""},{"number":284,"text":"For TanStack Start specific documentation, visit [TanStack Start](https://tanstack.com/start)."}],"totalLines":284,"lang":"md"}}
+
+id: 19
+event: step/end
+data: {"turn":1,"step":1}
+
+id: 20
+event: step/start
+data: {"turn":1,"step":2}
+
+id: 21
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"block-start","index":0,"blockType":"tool-call"}}
+
+id: 22
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":""}}
+
+id: 23
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":""}}
+
+id: 24
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":"{"}}
+
+id: 25
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":"\"file_path\": \"/works"}}
+
+id: 26
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":"pace/README.md\""}}
+
+id: 27
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":", \"old_string\": \"TODO app buil"}}
+
+id: 28
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":"t with Tan"}}
+
+id: 29
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":"Stack"}}
+
+id: 30
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":" Start, Drizzl"}}
+
+id: 31
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":"e, and"}}
+
+id: 32
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":" Cloudflare"}}
+
+id: 33
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":" D1.\""}}
+
+id: 34
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":", \"new_string\": \"こ"}}
+
+id: 35
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":"んに"}}
+
+id: 36
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":"ちは！"}}
+
+id: 37
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":"よ"}}
+
+id: 38
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":"ろしく"}}
+
+id: 39
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":"お願いします"}}
+
+id: 40
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":"。\\n\\nTODO"}}
+
+id: 41
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":" app built with Tan"}}
+
+id: 42
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":"Stack Start,"}}
+
+id: 43
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":" Drizzle, and"}}
+
+id: 44
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":" Cloudflare"}}
+
+id: 45
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"tool-call-delta","index":0,"id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","argumentsDelta":" D1.\"}"}}
+
+id: 46
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"block-end","index":0,"block":{"type":"tool-call","id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","arguments":"{\"file_path\": \"/workspace/README.md\", \"old_string\": \"TODO app built with TanStack Start, Drizzle, and Cloudflare D1.\", \"new_string\": \"こんにちは！よろしくお願いします。\\n\\nTODO app built with TanStack Start, Drizzle, and Cloudflare D1.\"}"}}}
+
+id: 47
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"usage","usage":{"inputTokens":2588,"outputTokens":148,"totalTokens":4272,"cacheReadTokens":1536,"reasoningTokens":20}}}
+
+id: 48
+event: assistant/chunk
+data: {"turn":1,"step":2,"chunk":{"type":"finish","reason":{"kind":"tool-calls"}}}
+
+id: 49
+event: assistant/message
+data: {"turn":1,"step":2,"message":{"role":"assistant","content":[{"type":"tool-call","id":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","arguments":"{\"file_path\": \"/workspace/README.md\", \"old_string\": \"TODO app built with TanStack Start, Drizzle, and Cloudflare D1.\", \"new_string\": \"こんにちは！よろしくお願いします。\\n\\nTODO app built with TanStack Start, Drizzle, and Cloudflare D1.\"}"}],"source":{"kind":"model","provider":"deepseek-official","model":"deepseek/deepseek-v4-flash"},"id":"804b8ce1-f0e2-4a40-ae72-65a5725d549a"},"usage":{"inputTokens":2588,"outputTokens":148,"totalTokens":4272,"cacheReadTokens":1536,"reasoningTokens":20}}
+
+id: 50
+event: tool/call
+data: {"turn":1,"step":2,"callId":"call_445eb6d9a06d4d8d9dadc11b","name":"edit","arguments":"{\"file_path\": \"/workspace/README.md\", \"old_string\": \"TODO app built with TanStack Start, Drizzle, and Cloudflare D1.\", \"new_string\": \"こんにちは！よろしくお願いします。\\n\\nTODO app built with TanStack Start, Drizzle, and Cloudflare D1.\"}"}
+
+id: 51
+event: tool/result
+data: {"turn":1,"step":2,"message":{"source":{"kind":"tool","callId":"call_445eb6d9a06d4d8d9dadc11b"},"content":[{"type":"tool-result","toolCallId":"call_445eb6d9a06d4d8d9dadc11b","content":[{"type":"text","text":"The file /workspace/README.md has been updated successfully."}],"isError":false}],"role":"user","id":"dfcc0c98-5ac3-4460-bdaf-b97788f7fbc8"},"meta":{"diffs":[{"path":"/workspace/README.md","oldText":"TODO app built with TanStack Start, Drizzle, and Cloudflare D1.\n\n# Getting Started","newText":"こんにちは！よろしくお願いします。\n\nTODO app built with TanStack Start, Drizzle, and Cloudflare D1.\n\n# Getting Started"}]}}
+
+id: 52
+event: step/end
+data: {"turn":1,"step":2}
+
+id: 53
+event: step/start
+data: {"turn":1,"step":3}
+
+id: 54
+event: assistant/chunk
+data: {"turn":1,"step":3,"chunk":{"type":"block-start","index":0,"blockType":"text"}}
+
+id: 55
+event: assistant/chunk
+data: {"turn":1,"step":3,"chunk":{"type":"text-delta","index":0,"text":"README.md "}}
+
+id: 56
+event: assistant/chunk
+data: {"turn":1,"step":3,"chunk":{"type":"text-delta","index":0,"text":"の先頭に"}}
+
+id: 57
+event: assistant/chunk
+data: {"turn":1,"step":3,"chunk":{"type":"text-delta","index":0,"text":"「こんに"}}
+
+id: 58
+event: assistant/chunk
+data: {"turn":1,"step":3,"chunk":{"type":"text-delta","index":0,"text":"ちは"}}
+
+id: 59
+event: assistant/chunk
+data: {"turn":1,"step":3,"chunk":{"type":"text-delta","index":0,"text":"！よろしく"}}
+
+id: 60
+event: assistant/chunk
+data: {"turn":1,"step":3,"chunk":{"type":"text-delta","index":0,"text":"お願いします"}}
+
+id: 61
+event: assistant/chunk
+data: {"turn":1,"step":3,"chunk":{"type":"text-delta","index":0,"text":"。」の"}}
+
+id: 62
+event: assistant/chunk
+data: {"turn":1,"step":3,"chunk":{"type":"text-delta","index":0,"text":"挨拶"}}
+
+id: 63
+event: assistant/chunk
+data: {"turn":1,"step":3,"chunk":{"type":"text-delta","index":0,"text":"を1行"}}
+
+id: 64
+event: assistant/chunk
+data: {"turn":1,"step":3,"chunk":{"type":"text-delta","index":0,"text":"追加しました。"}}
+
+id: 65
+event: assistant/chunk
+data: {"turn":1,"step":3,"chunk":{"type":"block-end","index":0,"block":{"type":"text","text":"README.md の先頭に「こんにちは！よろしくお願いします。」の挨拶を1行追加しました。"}}}
+
+id: 66
+event: assistant/chunk
+data: {"turn":1,"step":3,"chunk":{"type":"usage","usage":{"inputTokens":178,"outputTokens":64,"totalTokens":4338,"cacheReadTokens":4096,"reasoningTokens":30}}}
+
+id: 67
+event: assistant/chunk
+data: {"turn":1,"step":3,"chunk":{"type":"finish","reason":{"kind":"stop"}}}
+
+id: 68
+event: assistant/message
+data: {"turn":1,"step":3,"message":{"role":"assistant","content":[{"type":"text","text":"README.md の先頭に「こんにちは！よろしくお願いします。」の挨拶を1行追加しました。"}],"source":{"kind":"model","provider":"deepseek-official","model":"deepseek/deepseek-v4-flash"},"id":"90d655a3-e249-409e-984e-c53c7e82b0ee"},"usage":{"inputTokens":178,"outputTokens":64,"totalTokens":4338,"cacheReadTokens":4096,"reasoningTokens":30}}
+
+id: 69
+event: step/end
+data: {"turn":1,"step":3}
+
+id: 70
+event: turn/end
+data: {"turn":1,"reason":{"kind":"completed"}}
+
+: ping
+
+: ping
+
+: ping
+

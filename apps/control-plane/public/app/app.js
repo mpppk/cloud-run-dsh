@@ -26,6 +26,7 @@
 // the shared ./sse.js module (same file the debug UI imports).
 
 import { createSseParser, parseSseChunks } from "./sse.js";
+import { describeEvent } from "./render.js";
 
 // ---------------------------------------------------------------------------
 // API
@@ -197,6 +198,7 @@ const conv = {
   maxNum: -1,
   stream: null, // { abort: AbortController } while connected
   decidedAsks: new Map(), // ask id -> decision text (cards update in place)
+  streamingAssistant: null, // live assistant bubble while text-delta chunks stream (issue #147)
   sending: false,
   timers: [],
 };
@@ -476,19 +478,6 @@ function wireStopButton() {
 // Conversation rendering + stream
 // ---------------------------------------------------------------------------
 
-function shortText(data) {
-  if (data === null || data === undefined) return "";
-  if (typeof data === "string") return data;
-  if (typeof data === "object") {
-    for (const key of ["content", "text", "message"]) {
-      if (typeof data[key] === "string" && data[key]) return data[key];
-    }
-    if (typeof data.tool === "string") return `ツール: ${data.tool}`;
-    return JSON.stringify(data).slice(0, 200);
-  }
-  return String(data);
-}
-
 function askIdOf(data) {
   if (!data || typeof data !== "object") return null;
   for (const key of ["approvalId", "approval_id", "id"]) {
@@ -519,44 +508,82 @@ function appendMessage(cls, text) {
   return li;
 }
 
+/**
+ * Appends a text-delta fragment to the live assistant bubble, creating it
+ * on the first fragment (issue #147: streaming display instead of one raw
+ * JSON line per chunk). The closing `assistant/message` replaces this
+ * approximation with the final text via finishStreamingAssistant().
+ */
+function appendStreamingAssistant(fragment) {
+  if (!conv.streamingAssistant || !conv.streamingAssistant.isConnected) {
+    conv.streamingAssistant = appendMessage("msg-assistant msg-streaming", "");
+  }
+  conv.streamingAssistant.textContent += fragment;
+  scrollBottom();
+}
+
+/**
+ * Settles the live bubble with the final `assistant/message` text (or
+ * drops the empty bubble when the message had no readable body).
+ */
+function finishStreamingAssistant(text) {
+  const live = conv.streamingAssistant;
+  conv.streamingAssistant = null;
+  if (live && live.isConnected) {
+    if (text) {
+      live.textContent = text;
+      live.classList.remove("msg-streaming");
+    } else live.remove();
+  } else if (text) {
+    appendMessage("msg-assistant", text);
+  }
+}
+
 function renderEvent(ev) {
-  const type = ev.eventType;
+  // Issue #147: allow-list rendering via render.js. Anything describeEvent
+  // does not explicitly surface (internal plumbing, unknown future types)
+  // is hidden — raw JSON never reaches the conversation.
+  const described = describeEvent(ev);
   const data = ev.data;
-  if (type === "user_message") {
-    appendMessage("msg-user", shortText(data?.content ?? data));
-    return;
+  switch (described.kind) {
+    case "hidden":
+      return;
+    case "user":
+      appendMessage("msg-user", described.text);
+      return;
+    case "assistant":
+      // A tool-call-only assistant/message arrives with no text while a
+      // previous text stream may still be live: keep the live bubble.
+      if (conv.streamingAssistant && conv.streamingAssistant.isConnected && !described.text) return;
+      finishStreamingAssistant(described.text);
+      return;
+    case "stream":
+      appendStreamingAssistant(described.text);
+      return;
+    case "tool":
+      appendMessage("msg-tool", described.text);
+      return;
+    case "cancel":
+      appendMessage("msg-system", "中断しました");
+      return;
+    case "approval-asked":
+      renderAskCard(data);
+      return;
+    case "approval": {
+      const id = askIdOf(data);
+      const decision = data?.decision === "rejected" ? "却下しました" : "承認しました";
+      if (id) markAskDecided(id, decision);
+      else appendMessage("msg-system", decision);
+      return;
+    }
+    case "approval-decided": {
+      const id = askIdOf(data);
+      if (id && !conv.decidedAsks.has(id)) markAskDecided(id, "確定しました");
+      return;
+    }
+    default:
+      return;
   }
-  if (type === "assistant/message") {
-    appendMessage("msg-assistant", shortText(data));
-    return;
-  }
-  if (type === "approval/asked") {
-    renderAskCard(data);
-    return;
-  }
-  if (type === "approval") {
-    const id = askIdOf(data);
-    const decision = data?.decision === "rejected" ? "却下しました" : "承認しました";
-    if (id) markAskDecided(id, decision);
-    else appendMessage("msg-system", decision);
-    return;
-  }
-  if (type === "approval/decided") {
-    const id = askIdOf(data);
-    if (id && !conv.decidedAsks.has(id)) markAskDecided(id, "確定しました");
-    return;
-  }
-  if (type === "cancel") {
-    appendMessage("msg-system", "中断しました");
-    return;
-  }
-  if (type === "turn/start" || (typeof type === "string" && type.startsWith("turn/"))) return;
-  if (typeof type === "string" && (type.startsWith("step/") || type.startsWith("agent/"))) return;
-  if (type === "tool/call" || type === "tool/result") {
-    appendMessage("msg-tool", shortText(data));
-    return;
-  }
-  appendMessage("msg-system", shortText(data));
 }
 
 function renderAskCard(data) {
