@@ -47,12 +47,15 @@ import {
   createControlPlaneDeps,
   createFetchHandler,
   InMemoryMembershipStore,
+  RepositoryAuthorizerTransientError,
   RuntimeRegistry,
+  SESSION_COOKIE_NAME,
   SystemClock,
   toErrorResponse,
   WorkspaceRuntimeHandleAdapter,
   type ControlPlaneClock,
   type ControlPlaneDeps,
+  type RepositoryPermissionInput,
   type WorkspaceRuntimeHandle,
   type InstanceDiagnostic,
 } from "./index.js";
@@ -273,9 +276,9 @@ class FakeHandle implements WorkspaceRuntimeHandle {
     return this.state;
   }
 
-  stopIdentities: { id: string; email: string }[] = [];
+  stopIdentities: { id: string; login: string }[] = [];
 
-  async stop(identity?: { id: string; email: string }): Promise<string> {
+  async stop(identity?: { id: string; login: string }): Promise<string> {
     this.stopCalls++;
     if (identity) this.stopIdentities.push(identity);
     this.state = "STOPPED";
@@ -294,10 +297,10 @@ class FakeHandle implements WorkspaceRuntimeHandle {
     if (!this.inputAllowed) throw new AgentInputRefusedError("RESTORE_FAILED");
   }
 
-  checkpointIdentities: { id: string; email: string }[] = [];
+  checkpointIdentities: { id: string; login: string }[] = [];
   checkpointSkipped = false;
 
-  async runManualCheckpoint(identity?: { id: string; email: string }): Promise<{ skipped: boolean }> {
+  async runManualCheckpoint(identity?: { id: string; login: string }): Promise<{ skipped: boolean }> {
     this.checkpointCalls++;
     if (identity) this.checkpointIdentities.push(identity);
     this.recordActivity("checkpoint");
@@ -360,12 +363,22 @@ function startHarness(
     handles.set(workspace.id, handle);
     return handle;
   });
-  const knownUsers = new Set(["alice", "bob", "carol"]);
+  // Issue #152: session-cookie authentication. Known users hold server-side
+  // sessions (numeric GitHub ids, never logins); unknown users get no
+  // session, so their requests stay 401.
+  const sessionPrincipals: Record<string, { numericId: number; login: string }> = {
+    alice: { numericId: 1, login: "alice" },
+    bob: { numericId: 2, login: "bob" },
+    carol: { numericId: 3, login: "carol" },
+  };
 
   const deps = createControlPlaneDeps({
     resolveUser: async (identity) => {
-      if (!knownUsers.has(identity.subject)) return null;
-      return { id: identity.subject, email: `${identity.subject}@example.com` };
+      // Legacy IAP seam (issues #149/#152 transitional): the request path no
+      // longer calls this — authentication is session-cookie based. Kept so
+      // the seam type stays satisfied until #156 removes it.
+      void identity;
+      return null;
     },
     repo,
     leases,
@@ -382,10 +395,29 @@ function startHarness(
 
   const url = (path: string) => `${origin}${path}`;
 
+  const sessionTokens = new Map<string, string>();
   const fetchAs = async (user: string, path: string, init: RequestInit = {}): Promise<Response> => {
     const headers = new Headers(init.headers);
-    headers.set("x-goog-authenticated-user-id", `accounts.google.com:${user}`);
-    headers.set("x-goog-authenticated-user-email", `${user}@example.com`);
+    const principal = sessionPrincipals[user];
+    if (principal) {
+      let raw = sessionTokens.get(user);
+      if (!raw) {
+        const created = await deps.sessions.createSession(
+          {
+            id: `github:${principal.numericId}`,
+            provider: "github",
+            providerUserId: String(principal.numericId),
+            login: principal.login,
+          },
+          new SystemClock().now(),
+        );
+        raw = created.rawToken;
+        sessionTokens.set(user, raw);
+      }
+      headers.set("cookie", `${SESSION_COOKIE_NAME}=${raw}`);
+    }
+    // Unknown users (e.g. "mallory") get no session cookie: IAP-style
+    // headers alone must NOT authenticate (issue #152 acceptance).
     return fetch(url(path), { ...init, headers });
   };
 
@@ -431,16 +463,50 @@ describe("authentication", () => {
   });
   afterAll(() => h.stop());
 
-  test("missing IAP headers -> 401 with typed error body", async () => {
+  test("missing session cookie -> 401 with typed error body", async () => {
     const res = await fetch(h.url("/v1/workspaces"), { method: "POST" });
     expect(res.status).toBe(401);
     const body = await res.json();
     expect(body.error.code).toBe("unauthorized");
   });
 
-  test("unknown identity -> 401", async () => {
+  test("unknown identity (no session) -> 401", async () => {
     const res = await h.fetchAs("mallory", "/v1/workspaces", { method: "POST" });
     expect(res.status).toBe(401);
+  });
+
+  test("issue #152: IAP headers without a session authenticate nothing", async () => {
+    const res = await fetch(h.url("/v1/workspaces"), {
+      headers: {
+        "x-goog-authenticated-user-id": "accounts.google.com:alice",
+        "x-goog-authenticated-user-email": "alice",
+      },
+    });
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error.code).toBe("unauthorized");
+  });
+
+  test("issue #152: malformed / duplicated / unknown / expired cookies -> 401", async () => {
+    const cases: Array<[string, Record<string, string>]> = [
+      ["empty value", { cookie: `${SESSION_COOKIE_NAME}=` }],
+      ["duplicated cookie", { cookie: `${SESSION_COOKIE_NAME}=a; ${SESSION_COOKIE_NAME}=b` }],
+      ["unknown token", { cookie: `${SESSION_COOKIE_NAME}=${"a".repeat(43)}` }],
+      ["unrelated cookies only", { cookie: "other=1" }],
+    ];
+    for (const [name, headers] of cases) {
+      const res = await fetch(h.url("/v1/workspaces"), { headers });
+      expect(res.status, name).toBe(401);
+    }
+    // Expired session: mint then look up past its 7-day lifetime.
+    const created = await h.deps.sessions.createSession(
+      { id: "github:9", provider: "github", providerUserId: "9", login: "expired" },
+      new Date(0),
+    );
+    const expired = await fetch(h.url("/v1/workspaces"), {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${created.rawToken}` },
+    });
+    expect(expired.status).toBe(401);
   });
 
   test("auth runs before route existence: 401 not 404", async () => {
@@ -462,6 +528,234 @@ describe("authentication", () => {
     expect((await h.fetchAs("alice", "/healthz")).status).toBe(404);
     expect((await h.fetchAs("alice", "/livez")).status).toBe(200);
   });
+
+  test("issue #152: auth routes are public, API routes require a session (routing regression)", async () => {
+    // No session anywhere: public auth/health/static routes answer on their
+    // own terms, while /v1/* uniformly 401s — auth routing can never be
+    // shadowed by the session gate or vice versa.
+    const anon = (path: string, init?: RequestInit): Promise<Response> =>
+      fetch(h.url(path), init);
+    // Health + static shell stay public.
+    expect((await anon("/livez")).status).toBe(200);
+    expect((await anon("/")).status).toBe(200);
+    // Unconfigured OAuth (this harness wires none): the ROUTES exist, so
+    // they answer 503 (not configured) — never 401 (gate shadow) or 404.
+    expect((await anon("/auth/login")).status).toBe(503);
+    expect((await anon("/auth/callback?code=c&state=s")).status).toBe(503);
+    // /auth/session without a cookie is 401 from the route itself.
+    expect((await anon("/auth/session")).status).toBe(401);
+    // Every /v1/* route 401s without a session, whatever the method.
+    for (const [method, path] of [
+      ["GET", "/v1/workspaces"],
+      ["POST", "/v1/workspaces"],
+      ["GET", "/v1/workspaces/00000000-0000-0000-0000-000000000000"],
+      ["POST", "/v1/sessions/00000000-0000-0000-0000-000000000000/messages"],
+      ["GET", "/v1/sessions/00000000-0000-0000-0000-000000000000/events"],
+    ] as const) {
+      expect((await anon(path, { method })).status, `${method} ${path}`).toBe(401);
+    }
+    // ... and a valid session passes the gate (membership decides the rest:
+    // alice owns nothing here, so the list is 200-empty, not 401/403).
+    const list = await h.fetchAs("alice", "/v1/workspaces");
+    expect(list.status).toBe(200);
+  });
+});
+
+describe("issue #153: CSRF / Origin / Content-Type hardening", () => {
+  const APP_ORIGIN = "https://dsh-control-abc.run.app";
+  let h: TestHarness;
+  beforeAll(() => {
+    // OAuth-configured harness: APP_ORIGIN anchors the mutation gates.
+    h = startHarness({
+      oauth: {
+        appOrigin: APP_ORIGIN,
+        githubClientId: "test-client",
+        githubClientSecret: "test-secret",
+      },
+    });
+  });
+  afterAll(() => h.stop());
+
+  /** Session-authenticated request with explicit Origin + content-type. */
+  const mut = (
+    user: string,
+    path: string,
+    init: RequestInit & { origin?: string | null },
+  ): Promise<Response> => {
+    const { origin, ...rest } = init;
+    const headers = new Headers(rest.headers);
+    if (origin !== null) headers.set("origin", origin ?? APP_ORIGIN);
+    return h.fetchAs(user, path, { ...rest, headers });
+  };
+
+  test("valid same-origin POST passes", async () => {
+    const res = await mut("alice", "/v1/workspaces", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
+    });
+    expect(res.status).toBe(201);
+  });
+
+  test("foreign / missing / null Origin on mutations -> 403 with no side effects", async () => {
+    const before = (await (await h.fetchAs("alice", "/v1/workspaces")).json()) as {
+      workspaces: unknown[];
+    };
+    for (const [name, origin] of [
+      ["foreign origin", "https://evil.example"],
+      ["http downgrade", "http://dsh-control-abc.run.app"],
+      ["trailing slash", `${APP_ORIGIN}/`],
+      ["null origin", "null"],
+    ] as const) {
+      const res = await mut("alice", "/v1/workspaces", {
+        method: "POST",
+        origin,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
+      });
+      expect(res.status, name).toBe(403);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe("forbidden");
+    }
+    // Missing Origin header entirely.
+    const noOrigin = await h.fetchAs("alice", "/v1/workspaces", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
+    });
+    expect(noOrigin.status).toBe(403);
+    // No workspace was created by any rejected request.
+    const after = (await (await h.fetchAs("alice", "/v1/workspaces")).json()) as {
+      workspaces: unknown[];
+    };
+    expect(after.workspaces).toHaveLength(before.workspaces.length);
+  });
+
+  test("GETs are exempt from Origin validation (no state change)", async () => {
+    const res = await mut("alice", "/v1/workspaces", { method: "GET", origin: "https://evil.example" });
+    expect(res.status).toBe(200);
+  });
+
+  test("non-JSON content-types on mutations -> 400", async () => {
+    for (const [name, contentType, body] of [
+      ["text/plain", "text/plain", "hello"],
+      ["form-urlencoded", "application/x-www-form-urlencoded", "a=1&b=2"],
+      ["multipart", "multipart/form-data; boundary=xyz", "--xyz--"],
+    ] as const) {
+      const res = await mut("alice", "/v1/workspaces", {
+        method: "POST",
+        headers: { "content-type": contentType },
+        body,
+      });
+      expect(res.status, name).toBe(400);
+    }
+  });
+
+  test("expired session + valid Origin -> 401; forged session + valid Origin -> 401", async () => {
+    const expired = await h.deps.sessions.createSession(
+      { id: "github:9", provider: "github", providerUserId: "9", login: "old" },
+      new Date(0),
+    );
+    const res = await fetch(h.url("/v1/workspaces"), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: APP_ORIGIN,
+        cookie: `${SESSION_COOKIE_NAME}=${expired.rawToken}`,
+      },
+      body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
+    });
+    expect(res.status).toBe(401);
+    const forged = await fetch(h.url("/v1/workspaces"), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: APP_ORIGIN,
+        cookie: `${SESSION_COOKIE_NAME}=${"f".repeat(43)}`,
+      },
+      body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
+    });
+    expect(forged.status).toBe(401);
+  });
+
+  test("logout CSRF: foreign-origin POST /auth/logout -> 403 and the session survives", async () => {
+    // Log in alice through the harness session cache, then attack logout.
+    const created = await h.fetchAs("alice", "/v1/workspaces");
+    expect(created.status).toBe(200);
+    const attack = await fetch(h.url("/auth/logout"), {
+      method: "POST",
+      headers: { origin: "https://evil.example" },
+    });
+    expect(attack.status).toBe(403);
+    // The session still authenticates afterwards.
+    expect((await h.fetchAs("alice", "/v1/workspaces")).status).toBe(200);
+    // ... while a same-origin logout revokes (via a throwaway session, so
+    // alice's cached harness session stays usable for later tests).
+    const tmp = await h.deps.sessions.createSession(
+      { id: "github:99", provider: "github", providerUserId: "99", login: "tmp" },
+      new Date(),
+    );
+    const logout = await fetch(h.url("/auth/logout"), {
+      method: "POST",
+      headers: {
+        origin: APP_ORIGIN,
+        cookie: `${SESSION_COOKIE_NAME}=${tmp.rawToken}`,
+      },
+      body: "",
+    });
+    expect(logout.status).toBe(200);
+    expect(logout.headers.get("set-cookie")).toContain("Max-Age=0");
+    expect(await h.deps.sessions.lookupSession(tmp.rawToken, new Date())).toBeNull();
+  });
+
+  test("state-changing endpoints are unreachable via GET", async () => {
+    const ws = (await (
+      await mut("alice", "/v1/workspaces", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
+      })
+    ).json()) as { id: string };
+    expect((await mut("alice", `/v1/workspaces/${ws.id}/stop`, { method: "GET" })).status).toBe(
+      404,
+    );
+    expect((await mut("alice", "/auth/logout", { method: "GET" })).status).toBe(404);
+  });
+
+  test("rejected message send appends no event (no orphan side effects)", async () => {
+    const ws = (await (
+      await mut("alice", "/v1/workspaces", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
+      })
+    ).json()) as { id: string };
+    const session = (await (
+      await mut("alice", `/v1/workspaces/${ws.id}/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      })
+    ).json()) as { id: string };
+    await h.deps.leases.acquire(ws.id, crypto.randomUUID(), "github:1");
+    // A throwaway session cookie for membership-holder github:1 (the
+    // harness cache belongs to alice's session; minting here keeps this
+    // test independent of it).
+    const tmp = await h.deps.sessions.createSession(
+      { id: "github:1", provider: "github", providerUserId: "1", login: "alice" },
+      new Date(),
+    );
+    const res = await fetch(h.url(`/v1/sessions/${session.id}/messages`), {
+      method: "POST",
+      headers: {
+        "content-type": "text/plain",
+        origin: APP_ORIGIN,
+        cookie: `${SESSION_COOKIE_NAME}=${tmp.rawToken}`,
+      },
+      body: "forged simple-request body",
+    });
+    expect(res.status).toBe(400);
+    expect(await h.repo.readEvents(session.id)).toHaveLength(0);
+  });
 });
 
 describe("readiness endpoint", () => {
@@ -476,8 +770,10 @@ describe("readiness endpoint", () => {
     }
   });
 
-  test("honest readiness: a not-ready probe -> 503 with reason", async () => {
+  test("honest readiness: a not-ready probe -> 503 without internal reason (issue #153)", async () => {
+    const logger = new InMemoryLogger();
     const h = startHarness({
+      logger,
       readiness: () => ({
         ready: false,
         reason: "workspace runtime operations are unavailable: RuntimeRegistry is not wired",
@@ -488,7 +784,12 @@ describe("readiness endpoint", () => {
       expect(res.status).toBe(503);
       const body = await res.json();
       expect(body.status).toBe("not_ready");
-      expect(body.reason).toContain("RuntimeRegistry is not wired");
+      // Issue #153: the pre-auth public body carries no reason — internals
+      // stay in the structured log only.
+      expect(body).not.toHaveProperty("reason");
+      expect(JSON.stringify(body)).not.toContain("RuntimeRegistry");
+      const line = logger.parsed.find((e) => e["event"] === "readyz.not_ready");
+      expect(line?.["reason"]).toContain("RuntimeRegistry is not wired");
     } finally {
       h.stop();
     }
@@ -523,7 +824,9 @@ describe("readiness endpoint", () => {
       expect(res.status).toBe(503);
       const body = await res.json();
       expect(body.status).toBe("not_ready");
-      expect(typeof body.reason).toBe("string");
+      // Issue #153: no DB internals in the public body (hostname, SQL text).
+      expect(body).not.toHaveProperty("reason");
+      expect(JSON.stringify(body)).not.toContain("30s");
     } finally {
       h.stop();
     }
@@ -675,7 +978,7 @@ describe("membership authorization (仕様書 sections 21/26 item 7)", () => {
   });
 
   test("second member added via membership store can read the workspace", async () => {
-    await h.membership.addMember(workspaceId, "bob");
+    await h.membership.addMember(workspaceId, "github:2");
     const res = await h.fetchAs("bob", `/v1/workspaces/${workspaceId}`, { method: "GET" });
     expect(res.status).toBe(200);
   });
@@ -713,7 +1016,7 @@ describe("GET /v1/workspaces (issue #137)", () => {
   });
 
   test("a shared (non-owner) member also sees the workspace", async () => {
-    await h.membership.addMember(aliceIds[0]!, "bob");
+    await h.membership.addMember(aliceIds[0]!, "github:2");
     const res = await h.fetchAs("bob", "/v1/workspaces", { method: "GET" });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { workspaces: Array<{ id: string }> };
@@ -742,6 +1045,136 @@ describe("GET /v1/workspaces (issue #137)", () => {
     const listBody = (await list.json()) as { workspaces: Array<Record<string, unknown>> };
     expect(listBody.workspaces.find((w) => w["id"] === aliceIds[0])).toEqual(singleBody);
   });
+
+describe("issue #154: repository authorization on workspace creation", () => {
+  // Nested inside the GET /v1/workspaces describe for file-locality with the
+  // other workspace-creation tests; every test below boots its OWN harness
+  // (setupAuthorizer) and stops it, so the outer harness is untouched.
+  const TOKEN = "ghs_installation-token-secret-xyz";
+
+  class FakeAuthorizer {
+    readonly calls: RepositoryPermissionInput[] = [];
+    behavior: "allow" | "deny" | "transient" = "allow";
+    async canReadRepository(input: RepositoryPermissionInput): Promise<boolean> {
+      this.calls.push(input);
+      if (this.behavior === "transient") {
+        // The error carries a token-like string on purpose: the handler
+        // must never echo it.
+        throw new RepositoryAuthorizerTransientError(`lookup failed (${TOKEN})`);
+      }
+      return this.behavior === "allow";
+    }
+  }
+
+  async function setupAuthorizer(
+    behavior: FakeAuthorizer["behavior"],
+  ): Promise<{ h: TestHarness; authorizer: FakeAuthorizer }> {
+    const authorizer = new FakeAuthorizer();
+    authorizer.behavior = behavior;
+    const h = startHarness({ repositoryAuthorizer: authorizer });
+    return { h, authorizer };
+  }
+
+  const createBody = { repositoryOwner: "mpppk", repositoryName: "demo" };
+  const postWorkspace = (h: TestHarness, body: unknown): Promise<Response> =>
+    h.fetchAs("alice", "/v1/workspaces", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+  async function workspaceCount(h: TestHarness): Promise<number> {
+    const list = (await (await h.fetchAs("alice", "/v1/workspaces")).json()) as {
+      workspaces: unknown[];
+    };
+    return list.workspaces.length;
+  }
+
+  test("allowed repository -> 201, authorizer saw numeric id + login", async () => {
+    const { h, authorizer } = await setupAuthorizer("allow");
+    try {
+      const res = await postWorkspace(h, createBody);
+      expect(res.status).toBe(201);
+      expect(authorizer.calls).toEqual([
+        {
+          owner: "mpppk",
+          repo: "demo",
+          githubUserId: "1",
+          githubLogin: "alice",
+        },
+      ]);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("denied repository -> single-bucket 403, no workspace row", async () => {
+    const { h } = await setupAuthorizer("deny");
+    try {
+      expect(await workspaceCount(h)).toBe(0);
+      for (const body of [
+        createBody,
+        // Unknown repo and no-permission repo share the bucket.
+        { repositoryOwner: "private", repositoryName: "hidden" },
+      ]) {
+        const res = await postWorkspace(h, body);
+        expect(res.status).toBe(403);
+        const payload = (await res.json()) as { error: { code: string; message: string } };
+        expect(payload.error.code).toBe("forbidden");
+        // No existence oracle: the message names no repo, no permission.
+        expect(JSON.stringify(payload)).not.toContain("private");
+        expect(JSON.stringify(payload)).not.toContain("hidden");
+      }
+      expect(await workspaceCount(h)).toBe(0);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("transient GitHub failure -> 502 (distinct from deny), no row, no token leak", async () => {
+    const { h } = await setupAuthorizer("transient");
+    try {
+      const res = await postWorkspace(h, createBody);
+      expect(res.status).toBe(502);
+      const raw = await res.text();
+      expect(raw).not.toContain(TOKEN);
+      expect(await workspaceCount(h)).toBe(0);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("malicious coordinates -> 400 before any row, authorizer never called", async () => {
+    const { h, authorizer } = await setupAuthorizer("allow");
+    try {
+      for (const body of [
+        { repositoryOwner: "../evil", repositoryName: "demo" },
+        { repositoryOwner: "mpppk", repositoryName: "../../etc" },
+        { repositoryOwner: "", repositoryName: "demo" },
+      ]) {
+        const res = await postWorkspace(h, body);
+        expect(res.status, JSON.stringify(body)).toBe(400);
+      }
+      expect(authorizer.calls).toHaveLength(0);
+      expect(await workspaceCount(h)).toBe(0);
+    } finally {
+      h.stop();
+    }
+  });
+
+  test("absent authorizer keeps legacy behavior (201, membership still enforced)", async () => {
+    const h = startHarness();
+    try {
+      const res = await postWorkspace(h, createBody);
+      expect(res.status).toBe(201);
+      const ws = (await res.json()) as { id: string };
+      // Post-creation operations still require membership.
+      expect((await h.fetchAs("carol", `/v1/workspaces/${ws.id}`)).status).toBe(403);
+    } finally {
+      h.stop();
+    }
+  });
+});
 
   test("listing never calls recordActivity (idle timer untouched)", async () => {
     const spy = new FakeHandle();
@@ -788,7 +1221,7 @@ describe("listWorkspaces query shape (issue #137, no N+1)", () => {
       params: {} as Record<string, string>,
       url: new URL("http://x/v1/workspaces"),
       deps: { membership, repo } as unknown as ControlPlaneDeps,
-      user: { id: userId, email: `${userId}@example.com` },
+      user: { id: `github:${userId}`, provider: "github", providerUserId: userId, login: `${userId}@example.com` },
     };
   }
 
@@ -800,12 +1233,12 @@ describe("listWorkspaces query shape (issue #137, no N+1)", () => {
       const id = `ws-list-${i}`;
       await repo.createWorkspace({
         id,
-        ownerId: "alice",
+        ownerId: "github:1",
         repositoryOwner: "mpppk",
         repositoryName: "demo",
         baseBranch: "main",
       });
-      await membership.addMember(id, "alice");
+      await membership.addMember(id, "github:1");
     }
     // A decoy owned by someone else: visible ids resolve first, so its row
     // must never be fetched.
@@ -816,14 +1249,14 @@ describe("listWorkspaces query shape (issue #137, no N+1)", () => {
       repositoryName: "demo",
       baseBranch: "main",
     });
-    await membership.addMember("ws-list-decoy", "bob");
+    await membership.addMember("ws-list-decoy", "github:2");
 
     exec.queryCount = 0;
-    const res = await listWorkspaces(listCtx(membership, repo, "alice"));
+    const res = await listWorkspaces(listCtx(membership, repo, "1"));
     expect(res.status).toBe(200);
     const body = (await res.json()) as { workspaces: Array<{ id: string; ownerId: string }> };
     expect(body.workspaces).toHaveLength(5);
-    expect(body.workspaces.every((w) => w.ownerId === "alice")).toBe(true);
+    expect(body.workspaces.every((w) => w.ownerId === "github:1")).toBe(true);
     // Exactly 1 query (WHERE id IN (...)) — independent of the count.
     expect(exec.queryCount).toBe(1);
   });
@@ -832,7 +1265,7 @@ describe("listWorkspaces query shape (issue #137, no N+1)", () => {
     const exec = new CountingFakeExecutor();
     const repo = new PostgresSessionPersistenceRepository(exec);
     const membership = new InMemoryMembershipStore();
-    const res = await listWorkspaces(listCtx(membership, repo, "carol"));
+    const res = await listWorkspaces(listCtx(membership, repo, "3"));
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ workspaces: [] });
     expect(exec.queryCount).toBe(0);
@@ -974,11 +1407,11 @@ describe("workspace and session routes", () => {
     });
     expect(res.status).toBe(201);
     const body = await res.json();
-    expect(body.ownerId).toBe("alice");
+    expect(body.ownerId).toBe("github:1");
     expect(body.runtimeState).toBe("STOPPED");
     expect(body.baseBranch).toBe("main");
     // owner is member
-    expect(await h.membership.isMember(body.id, "alice")).toBe(true);
+    expect(await h.membership.isMember(body.id, "github:1")).toBe(true);
   });
 
   test("POST /v1/workspaces validates required fields", async () => {
@@ -1063,7 +1496,7 @@ describe("controller enforcement", () => {
     h = startHarness();
     const ws = await h.createWorkspace("alice");
     workspaceId = ws.id;
-    await h.membership.addMember(workspaceId, "bob");
+    await h.membership.addMember(workspaceId, "github:2");
     const sessionRes = await h.fetchAs("alice", `/v1/workspaces/${workspaceId}/sessions`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -1196,7 +1629,7 @@ describe("controller enforcement", () => {
     expect(h.handles.get(workspaceId)!.activities).toContain("checkpoint");
     // Issue #75: the REAL caller reaches the handle for the host forward.
     expect(h.handles.get(workspaceId)!.checkpointIdentities).toEqual([
-      { id: "alice", email: "alice@example.com" },
+      { id: "github:1", login: "alice" },
     ]);
     // Issue #89: the response carries the host's skip flag so callers can
     // tell a real snapshot (skipped: false) from a clean-tree skip.
@@ -1227,7 +1660,7 @@ describe("controller enforcement", () => {
     expect(res.status).toBe(200);
     expect(h.handles.get(workspaceId)!.stopCalls).toBe(1);
     expect(h.handles.get(workspaceId)!.stopIdentities).toEqual([
-      { id: "alice", email: "alice@example.com" },
+      { id: "github:1", login: "alice" },
     ]);
   });
 
@@ -1264,7 +1697,7 @@ describe("controller lease routes", () => {
 
   test("acquire, heartbeat, release lifecycle", async () => {
     const ws = await h.createWorkspace("alice");
-    await h.membership.addMember(ws.id, "bob");
+    await h.membership.addMember(ws.id, "github:2");
 
     const acquire = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/controller/acquire`, {
       method: "POST",
@@ -1391,7 +1824,7 @@ describe("controller status read route", () => {
 
   test("another member's lease -> held:true, mine:false; controllerId and userIds never leak", async () => {
     const ws = await h.createWorkspace("alice");
-    await h.membership.addMember(ws.id, "bob");
+    await h.membership.addMember(ws.id, "github:2");
     const controllerId = await acquireAsAlice(ws.id);
     const res = await h.fetchAs("bob", `/v1/workspaces/${ws.id}/controller`, { method: "GET" });
     expect(res.status).toBe(200);
@@ -1474,7 +1907,7 @@ describe("controller status read route", () => {
     expect(open.status).toBe(200);
     // ensureControllerLeaseForOpen took the lease for the opener — the
     // badge must agree with requireController without an explicit acquire.
-    expect((await h.deps.leases.getActive(ws.id))?.userId).toBe("alice");
+    expect((await h.deps.leases.getActive(ws.id))?.userId).toBe("github:1");
     const res = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/controller`, { method: "GET" });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { held: boolean; mine: boolean; expiresAt: string };
@@ -1685,7 +2118,7 @@ describe("open/stop composition with the T8 runtime", () => {
       expect(startCalls()).toBe(1);
       // The opener holds the controller lease, so it can message right away.
       const lease = await h.leases.getActive(ws.id);
-      expect(lease?.userId).toBe("alice");
+      expect(lease?.userId).toBe("github:1");
       // Agent-host phase on the same runtime object (same shared store).
       expect(await runtime.completeRestore()).toBe("READY");
       const reread = await h.fetchAs("alice", `/v1/workspaces/${ws.id}/open`, {
@@ -2248,8 +2681,6 @@ describe("SSE heartbeat cadence with an injected fake clock", () => {
     const HEARTBEAT_MS = 500;
 
     const deps = createControlPlaneDeps({
-      resolveUser: async (identity) =>
-        identity.subject === "alice" ? { id: "alice", email: "a@example.com" } : null,
       repo,
       leases,
       membership,
@@ -2260,6 +2691,11 @@ describe("SSE heartbeat cadence with an injected fake clock", () => {
       ssePollIntervalMs: 10,
       sseHeartbeatMs: HEARTBEAT_MS,
     });
+    // Issue #152: the SSE stream authenticates via session cookie.
+    const sseSession = await deps.sessions.createSession(
+      { id: "github:1", provider: "github", providerUserId: "1", login: "alice" },
+      new Date(),
+    );
 
     // Real SystemClock drives the server; the deps clock is the fake above.
     expect(deps.clock.nowMs()).toBe(1_000_000);
@@ -2272,7 +2708,7 @@ describe("SSE heartbeat cadence with an injected fake clock", () => {
       baseBranch: "main",
       runtimeState: "STOPPED",
     });
-    await membership.addMember(workspace.id, "alice");
+    await membership.addMember(workspace.id, "github:1");
     const session = await repo.createSession({
       id: crypto.randomUUID(),
       workspaceId: workspace.id,
@@ -2284,8 +2720,7 @@ describe("SSE heartbeat cadence with an injected fake clock", () => {
         `${server.url.origin}/v1/sessions/${session.id}/events`,
         {
           headers: {
-            "x-goog-authenticated-user-id": "accounts.google.com:alice",
-            "x-goog-authenticated-user-email": "a@example.com",
+            cookie: `${SESSION_COOKIE_NAME}=${sseSession.rawToken}`,
           },
         },
       );
@@ -2488,7 +2923,7 @@ describe("message forwarding to agent-host (issue #22)", () => {
         sessionId,
         seq: event.seq,
         content: "fix the flaky test",
-        identity: { id: "alice", email: "alice@example.com" },
+        identity: { id: "github:1", login: "alice" },
       });
       // No duplicate: the DB still holds exactly the one event.
       expect(await h.repo.readEvents(sessionId)).toHaveLength(1);
@@ -2643,7 +3078,7 @@ describe("approval/cancel forwarding to agent-host (issue #39)", () => {
         sessionId,
         approvalId: "ap-1",
         decision: "rejected",
-        identity: { id: "alice", email: "alice@example.com" },
+        identity: { id: "github:1", login: "alice" },
       });
       expect(await h.repo.readEvents(sessionId)).toHaveLength(1);
     } finally {
@@ -2667,7 +3102,7 @@ describe("approval/cancel forwarding to agent-host (issue #39)", () => {
       expect(forwarder.cancelCalls[0]).toMatchObject({
         instanceUrl: "https://ah.test",
         sessionId,
-        identity: { id: "alice", email: "alice@example.com" },
+        identity: { id: "github:1", login: "alice" },
       });
       expect(await h.repo.readEvents(sessionId)).toHaveLength(1);
     } finally {
@@ -2884,7 +3319,7 @@ describe("unexpected error observability (issue #48)", () => {
       // correlation works. The errorId remains an additional correlation key.
       // The field is passed to the logger per 仕様書 §25.
       expect(line!["workspaceId"]).toBe(ws.id);
-      expect(line!["userId"]).toBe("alice");
+      expect(line!["userId"]).toBe("github:1");
       expect(line!["method"]).toBe("POST");
       expect(line!["path"]).toContain("/v1/workspaces/");
       expect(logger.lines.join("\n")).not.toContain("An0therS3cretPass");

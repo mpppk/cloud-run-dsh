@@ -6,9 +6,11 @@
 // only (dynamic `/app/<id>` pathnames are never served).
 //
 // What this screen deliberately does NOT do:
-// - no auth header inputs (in production IAP injects them; locally the dev
-//   server's fake IAP stands in — see src/dev.ts). fetch() sends no custom
-//   auth headers at all, so the same file works under IAP untouched.
+// - no auth header inputs: authentication is the `__Host-dsh_session`
+//   cookie (issue #152). fetch() sends same-origin cookies automatically,
+//   so the same file works locally and in production untouched.
+//   Unauthenticated API calls (401) navigate to /auth/login with a
+//   return_to back to this screen.
 // - no controller acquire / heartbeat / release calls: the server lines up
 //   single-writer ownership on prepare and the agent-host keeps it alive.
 //   When a write still meets a 409 with nobody holding the role (lapsed
@@ -39,6 +41,7 @@ async function api(method, path, body) {
     init.body = JSON.stringify(body);
   }
   const res = await fetch(path, init);
+  if (res.status === 401) redirectToLogin();
   const text = await res.text();
   let json = null;
   try {
@@ -51,6 +54,16 @@ async function api(method, path, body) {
 
 function wsPath(id, suffix) {
   return `/v1/workspaces/${encodeURIComponent(id)}${suffix ?? ""}`;
+}
+
+/**
+ * Unauthenticated (issue #152): the session is missing or expired. Navigate
+ * to the GitHub login with a same-origin return_to back to this screen; the
+ * OAuth callback restores the session cookie and bounces back here.
+ */
+function redirectToLogin() {
+  const returnTo = `${window.location.pathname}${window.location.search}`;
+  window.location.assign(`/auth/login?return_to=${encodeURIComponent(returnTo)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -672,6 +685,7 @@ async function streamLoop(sessionId, abortSignal) {
     `/v1/sessions/${encodeURIComponent(sessionId)}/events` +
     (resumeFrom !== null ? `?seq=${resumeFrom}` : "");
   const res = await fetch(path, { signal: abortSignal });
+  if (res.status === 401) redirectToLogin();
   if (res.status !== 200 || !res.body) throw new Error(`stream ${res.status}`);
   const reader = res.body.getReader();
   const decoder = new TextDecoder();

@@ -19,7 +19,7 @@ import {
   startDevControlPlane,
   type RunningControlPlane,
 } from "./dev.js";
-import { createFetchHandler, type ControlPlaneDeps } from "./index.js";
+import { createFetchHandler, SESSION_COOKIE_NAME, type ControlPlaneDeps } from "./index.js";
 
 let deps: ControlPlaneDeps;
 let server: RunningControlPlane;
@@ -184,6 +184,12 @@ describe("replay never leaks into the production path (issue #147)", () => {
   test("a message through the production handler appends exactly one event", async () => {
     const prodDeps = createDevControlPlaneDeps();
     const prodFetch = createFetchHandler(prodDeps);
+    // Issue #152: session-cookie authentication (bob = github:2).
+    const bobSession = await prodDeps.sessions.createSession(
+      { id: "github:2", provider: "github", providerUserId: "2", login: "bob" },
+      new Date(),
+    );
+    const bobCookie = `${SESSION_COOKIE_NAME}=${bobSession.rawToken}`;
     const call = async (
       method: string,
       path: string,
@@ -192,7 +198,7 @@ describe("replay never leaks into the production path (issue #147)", () => {
       const res = await prodFetch(
         new Request(`http://127.0.0.1${path}`, {
           method,
-          headers: { "content-type": "application/json", ...iap("bob") },
+          headers: { "content-type": "application/json", cookie: bobCookie },
           body: body === undefined ? undefined : JSON.stringify(body),
         }),
       );
@@ -212,10 +218,9 @@ describe("replay never leaks into the production path (issue #147)", () => {
     const made = await call("POST", `/v1/workspaces/${wsId}/sessions`, {});
     expect(made.status).toBe(201);
     const sessionId = (made.json as { id: string }).id;
-    // Controller gate: hold the lease as the sender (resolveUser maps the
-    // IAP header to the bare name, same as the dev-server open() path).
-    const acquired = await prodDeps.leases.acquire(wsId, "ctrl-bob", "bob");
-    expect(acquired.userId).toBe("bob");
+    // Controller gate: hold the lease as the sender (github:2).
+    const acquired = await prodDeps.leases.acquire(wsId, "ctrl-bob", "github:2");
+    expect(acquired.userId).toBe("github:2");
     const sent = await call("POST", `/v1/sessions/${sessionId}/messages`, { content: "prod path" });
     expect(sent.status).toBe(201);
     const events = await prodDeps.repo.readEvents(sessionId, 0);

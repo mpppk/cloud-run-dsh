@@ -17,13 +17,18 @@ import {
 } from "@cloud-run-dsh/controller-lease";
 import type { Session, Workspace } from "@cloud-run-dsh/session-persistence-postgres";
 import { summarizeRestoreError } from "@cloud-run-dsh/session-persistence-postgres";
-import { ApiError, badGateway, badRequest, conflict, notFound } from "./errors.js";
+import { ApiError, badGateway, badRequest, conflict, forbidden, notFound } from "./errors.js";
 import {
   AgentHostConflictError,
   type ForwardMessageArgs,
 } from "./forwarding.js";
+import {
+  RepositoryAuthorizerTransientError,
+  RepositoryInputError,
+  validateRepositoryCoordinates,
+} from "@cloud-run-dsh/github-credential-broker";
 import { assertMember } from "./membership.js";
-import type { InternalUser } from "./auth.js";
+import type { AuthenticatedUser } from "./auth.js";
 import type { ControlPlaneDeps } from "./deps.js";
 import {
   optionalObject,
@@ -39,7 +44,7 @@ export interface RouteContext {
   readonly params: Record<string, string>;
   readonly url: URL;
   readonly deps: ControlPlaneDeps;
-  readonly user: InternalUser;
+  readonly user: AuthenticatedUser;
 }
 
 export type RouteHandler = (ctx: RouteContext) => Promise<Response>;
@@ -108,6 +113,40 @@ export const createWorkspace: RouteHandler = async (ctx) => {
   const repositoryOwner = requireString(body, "repositoryOwner");
   const repositoryName = requireString(body, "repositoryName");
   const baseBranch = optionalString(body, "baseBranch") ?? "main";
+  // Issue #154: repository authorization BEFORE the workspace row exists.
+  // The GitHub login travels only as permission-lookup input; the stable
+  // numeric id stays the identity key throughout.
+  if (ctx.deps.repositoryAuthorizer) {
+    try {
+      validateRepositoryCoordinates(repositoryOwner, repositoryName);
+    } catch (e) {
+      if (e instanceof RepositoryInputError) throw badRequest(e.message);
+      throw e;
+    }
+    let allowed: boolean;
+    try {
+      allowed = await ctx.deps.repositoryAuthorizer.canReadRepository({
+        owner: repositoryOwner,
+        repo: repositoryName,
+        githubUserId: ctx.user.providerUserId,
+        githubLogin: ctx.user.login,
+      });
+    } catch (e) {
+      if (e instanceof RepositoryInputError) throw badRequest(e.message);
+      if (e instanceof RepositoryAuthorizerTransientError) {
+        throw badGateway(
+          "repository authorization is temporarily unavailable — retry later",
+        );
+      }
+      throw e;
+    }
+    if (!allowed) {
+      // ONE bucket for every deny shape (unknown repo / App not installed /
+      // insufficient permission) so the response never oracles whether a
+      // private repository exists.
+      throw forbidden("repository is not accessible with this identity");
+    }
+  }
   const id = crypto.randomUUID();
   const workspace = await ctx.deps.repo.createWorkspace({
     id,
@@ -437,7 +476,7 @@ export const stopWorkspace: RouteHandler = async (ctx) => {
   const handle = await ctx.deps.runtimes.get(workspace);
   // Issue #72: the REAL caller travels into the agent-host prepare-stop
   // forward (the factory refuses a faceless stop when a forwarder is wired).
-  const state = await handle.stop({ id: ctx.user.id, email: ctx.user.email });
+  const state = await handle.stop({ id: ctx.user.id, login: ctx.user.login });
   return json({ workspaceId: workspace.id, state });
 };
 
@@ -525,7 +564,7 @@ export const manualCheckpoint: RouteHandler = async (ctx) => {
   // line). The marker records the host's skip flag for audit, and the
   // response carries it as `skipped` (issue #89) so callers can tell a
   // real snapshot apart from a clean-tree skip.
-  const { skipped } = await handle.runManualCheckpoint({ id: ctx.user.id, email: ctx.user.email });
+  const { skipped } = await handle.runManualCheckpoint({ id: ctx.user.id, login: ctx.user.login });
   return json({ workspaceId: workspace.id, checkpointed: true, skipped });
 };
 
@@ -578,7 +617,7 @@ export const postMessage: RouteHandler = async (ctx) => {
       sessionId: session.id,
       seq: event!.seq,
       content,
-      identity: { id: ctx.user.id, email: ctx.user.email },
+      identity: { id: ctx.user.id, login: ctx.user.login },
     };
     try {
       await forwarder.forward(forwardArgs);
@@ -654,7 +693,7 @@ export const postApproval: RouteHandler = async (ctx) => {
         sessionId: session.id,
         approvalId,
         decision,
-        identity: { id: ctx.user.id, email: ctx.user.email },
+        identity: { id: ctx.user.id, login: ctx.user.login },
       });
     } catch (e) {
       // The host refused for a caller-actionable reason — propagate the 409
@@ -721,7 +760,7 @@ export const postCancel: RouteHandler = async (ctx) => {
         instanceUrl,
         workspaceId: workspace.id,
         sessionId: session.id,
-        identity: { id: ctx.user.id, email: ctx.user.email },
+        identity: { id: ctx.user.id, login: ctx.user.login },
       });
     } catch (e) {
       // The host refused for a caller-actionable reason — propagate the 409

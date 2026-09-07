@@ -736,7 +736,7 @@ describe("runManualCheckpoint — GCS marker", () => {
 });
 
 describe("stop() remote preparation (issue #72)", () => {
-  const CALLER = { id: "alice", email: "alice@example.com" };
+  const CALLER = { id: "github:1", login: "alice" };
 
   /** MessageForwarder fake with switchable prepare-stop behavior. */
   class FakeLifecycleForwarder implements MessageForwarder {
@@ -879,7 +879,7 @@ describe("stop() remote preparation (issue #72)", () => {
 });
 
 describe("runManualCheckpoint remote trigger (issue #75)", () => {
-  const CALLER = { id: "alice", email: "alice@example.com" };
+  const CALLER = { id: "github:1", login: "alice" };
 
   class FakeCheckpointForwarder implements MessageForwarder {
     checkpointCalls: ForwardCheckpointArgs[] = [];

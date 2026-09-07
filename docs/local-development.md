@@ -26,18 +26,23 @@ bun run dev:control-plane
 
 Use a different port with `PORT=9000 bun run dev:control-plane`.
 
-## Authentication (IAP headers)
+## Authentication (session cookie)
 
-The API expects the two headers that Identity-Aware Proxy injects in front of
-Cloud Run. Locally you set them yourself:
+The API authenticates with the `__Host-dsh_session` cookie (issues #150–#152:
+opaque server-side session, `Secure; HttpOnly; SameSite=Lax; Path=/`).
+Locally you never craft it by hand — the dev server signs in a fixed dev
+principal automatically: the first cookie-less request gets a real
+server-side session for `github:1` / `dev` plus a `Set-Cookie` response
+(disable with `DSH_DEV_AUTO_LOGIN=0`). Use a cookie jar so later calls
+authenticate as the same user:
 
+```bash
+curl -c /tmp/dsh-jar -b /tmp/dsh-jar …
 ```
-x-goog-authenticated-user-id: accounts.google.com:<user-id>
-x-goog-authenticated-user-email: <user-email>
-```
 
-Any user id/email pair works locally; the part after `accounts.google.com:` is
-the internal user id. Requests without these headers get `401`.
+Requests without a valid session cookie get `401`. (The pre-#152
+`x-goog-authenticated-user-*` headers are ignored — sending them
+authenticates nothing.)
 
 ## curl walkthrough
 
@@ -45,17 +50,18 @@ Run these against `http://127.0.0.1:8787`. Set shell variables once:
 
 ```bash
 BASE=http://127.0.0.1:8787
-ALICE_ID='x-goog-authenticated-user-id: accounts.google.com:alice'
-ALICE_EMAIL='x-goog-authenticated-user-email: alice@example.com'
+JAR=/tmp/dsh-jar
+# Prime the dev session (auto-login) so the jar holds a session cookie:
+curl -s -c "$JAR" -b "$JAR" "$BASE/v1/workspaces" > /dev/null
 ```
 
 ### 1. Create a workspace (201)
 
 ```bash
-curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" -H 'content-type: application/json' \
+curl -s -c "$JAR" -b "$JAR" -H 'content-type: application/json' \
   -X POST "$BASE/v1/workspaces" \
   -d '{"repositoryOwner":"mpppk","repositoryName":"demo","baseBranch":"main"}'
-# {"id":"…","ownerId":"alice",…,"runtimeState":"STOPPED",…}
+# {"id":"…","ownerId":"github:1",…,"runtimeState":"STOPPED",…}
 ```
 
 Copy the returned `id` into `WS_ID`:
@@ -71,7 +77,7 @@ workspaces the shape is `{"workspaces": []}`. Like the controller status
 read, listing never extends the idle timer:
 
 ```bash
-curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" "$BASE/v1/workspaces"
+curl -s -c "$JAR" -b "$JAR" "$BASE/v1/workspaces"
 # {"workspaces":[{"id":"…","ownerId":"alice",…,"runtimeState":"STOPPED",…}]}
 ```
 
@@ -84,18 +90,18 @@ in production the agent-host does this after boot + restore). Poll `GET`
 until `runtimeState` reads `READY`:
 
 ```bash
-curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" -H 'content-type: application/json' \
+curl -s -c "$JAR" -b "$JAR" -H 'content-type: application/json' \
   -X POST "$BASE/v1/workspaces/$WS_ID/open" -d '{}'
 # {"workspaceId":"…","state":"STARTING"}
 
-curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" "$BASE/v1/workspaces/$WS_ID"
+curl -s -c "$JAR" -b "$JAR" "$BASE/v1/workspaces/$WS_ID"
 # … "runtimeState":"STARTING" … → (a few seconds later) … "runtimeState":"READY" …
 ```
 
 ### 3. Create a session (201)
 
 ```bash
-curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" -H 'content-type: application/json' \
+curl -s -c "$JAR" -b "$JAR" -H 'content-type: application/json' \
   -X POST "$BASE/v1/workspaces/$WS_ID/sessions" -d '{}'
 # {"id":"…","workspaceId":"…","metadata":{},…}
 ```
@@ -109,7 +115,7 @@ SESSION_ID=<paste the session id>
 ### 4. Acquire the controller lease (200)
 
 ```bash
-curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" -H 'content-type: application/json' \
+curl -s -c "$JAR" -b "$JAR" -H 'content-type: application/json' \
   -X POST "$BASE/v1/workspaces/$WS_ID/controller/acquire" -d '{}'
 # {"workspaceId":"…","controllerId":"…","expiresAt":"…"}
 ```
@@ -122,7 +128,7 @@ to the lease (`held` / `mine` / `expiresAt`) — never `controllerId` or user
 ids — and never extends the idle timer, so the debug UI polls it freely:
 
 ```bash
-curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" \
+curl -s -c "$JAR" -b "$JAR" \
   "$BASE/v1/workspaces/$WS_ID/controller"
 # {"held":true,"mine":true,"expiresAt":"…"}
 ```
@@ -132,7 +138,7 @@ curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" \
 The message field is **`content`**, not `text`:
 
 ```bash
-curl -s -H "$ALICE_ID" -H "$ALICE_EMAIL" -H 'content-type: application/json' \
+curl -s -c "$JAR" -b "$JAR" -H 'content-type: application/json' \
   -X POST "$BASE/v1/sessions/$SESSION_ID/messages" \
   -d '{"content":"fix the flaky test"}'
 # {"sessionId":"…","seq":0,"eventType":"user_message","eventTime":…,"data":{"content":"fix the flaky test"}}
@@ -146,7 +152,7 @@ is the production-safe order.
 ### 6. Watch the event stream (SSE)
 
 ```bash
-curl -N -H "$ALICE_ID" -H "$ALICE_EMAIL" "$BASE/v1/sessions/$SESSION_ID/events?seq=0"
+curl -N -c "$JAR" -b "$JAR" "$BASE/v1/sessions/$SESSION_ID/events?seq=0"
 # id: 0
 # event: user_message
 # data: {"content":"fix the flaky test"}
@@ -160,7 +166,8 @@ and watch it appear.
 
 ## Behavior to expect
 
-- **401** — no/malformed IAP headers.
+- **401** — no/invalid/expired session cookie (dev auto-login is off or the
+  jar was wiped).
 - **403** — the user is not a member of the workspace (only the creator is a
   member automatically).
 - **409** — a member without the controller lease tries message / approval /
@@ -183,11 +190,11 @@ control-plane serves a dependency-free debug screen (workspace / lease /
 session / turn / SSE / request log) from the same origin, so no CORS setup
 is needed.
 
-- The header box at the top fills `x-goog-authenticated-user-id` /
-  `x-goog-authenticated-user-email` for every API call (saved to
-  localStorage, omitted when empty).
-- Under IAP leave both boxes empty: the proxy injects the headers, so the
-  same screen works in production with no code change.
+- The screen sends no auth headers (issue #152): same-origin `fetch()`
+  carries the dev session cookie automatically. To act as a second user,
+  disable auto-login (`DSH_DEV_AUTO_LOGIN=0`) and create sessions
+  explicitly — the header box era (pre-#152 IAP headers) is over and its
+  inputs are ignored.
 - Your workspaces are listed by `GET /v1/workspaces` (step 1b above);
   created ids are also kept in the browser's
   localStorage (an "existing id" box imports ids made via curl).
@@ -210,12 +217,15 @@ UI (`/` stays as-is). No build step, no npm dependencies — plain ES modules
   "再開しています…" banner, waits for readiness via `GET` polling, then
   retries the send on the same session. A failed prepare shows
   "準備に失敗しました" with a retry button.
-- **No auth inputs**: the page sends no auth headers. Locally the dev
-  server's fake IAP stands in (headerless requests run as
-  `dev@example.com`; any explicit header wins; disable with
-  `DSH_DEV_FAKE_IAP=0`). Under production IAP the same page works
-  untouched. The fake IAP lives only in `apps/control-plane/src/dev.ts` —
-  `main.ts` never imports it.
+- **No auth inputs**: the page sends no auth headers — authentication is the
+  `__Host-dsh_session` cookie (issues #150–#152), which `fetch()` sends
+  automatically on same-origin requests. Locally the dev server signs in a
+  fixed dev principal automatically (cookie-less requests get a real
+  server-side session for `github:1`/`dev` plus a `Set-Cookie` response;
+  disable with `DSH_DEV_AUTO_LOGIN=0`, legacy name `DSH_DEV_FAKE_IAP=0`
+  still honored). A 401 (missing/expired session) navigates to `/auth/login`
+  with a `return_to` back to the screen. The auto-login lives only in
+  `apps/control-plane/src/dev.ts` — `main.ts` never imports it.
 - **Idle-timer discipline**: the screen's timers only hit `GET` workspace /
   controller plus the SSE stream (all `recordActivity`-free), so leaving it
   open never extends the idle timer. Message / approval sends are the only

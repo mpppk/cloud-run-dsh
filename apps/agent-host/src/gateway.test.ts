@@ -47,7 +47,7 @@ class SeamedTurnStarter extends RecordingTurnStarter {
   }
 }
 
-const IAP = { "x-goog-authenticated-user-email": "user@example.com" };
+const IAP = { "x-dsh-user-id": "github:1", "x-dsh-user-login": "alice" };
 
 async function gatewayWithReadyHost() {
   const th = await composeTestHost();
@@ -57,7 +57,7 @@ async function gatewayWithReadyHost() {
 }
 
 describe("AgentGateway", () => {
-  test("GET AGENT_HOST_HEALTH_PATH does not require IAP identity", async () => {
+  test("GET AGENT_HOST_HEALTH_PATH does not require DSH caller identity", async () => {
     const th = await composeTestHost();
     const res = await th.host.gateway.handle(request("GET", AGENT_HOST_HEALTH_PATH));
     expect(res.status).toBe(503); // RESTORING — not ready yet
@@ -79,13 +79,13 @@ describe("AgentGateway", () => {
     expect(served.status).toBe(200);
     // ... and the reserved path is NOT served here (a 404 from the gateway
     // proves the move; on GCP the platform answers /healthz before us).
-    // NOTE: with IAP identity — without it the gateway 401s before route
+    // NOTE: with DSH caller identity — without it the gateway 401s before route
     // matching, which would prove nothing about the path.
     const reserved = await th.host.gateway.handle(request("GET", "/healthz", IAP));
     expect(reserved.status).toBe(404);
   });
 
-  test("non-health routes require an IAP identity", async () => {
+  test("non-health routes require an DSH caller identity", async () => {
     const th = await gatewayWithReadyHost();
     const res = await th.host.gateway.handle(
       request("POST", "/workspaces/ws-1/sessions/s1/messages"),

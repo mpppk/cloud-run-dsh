@@ -150,6 +150,23 @@ export interface ControlPlaneConfig {
    */
   readonly cloudSqlConnectionName: string;
   /**
+   * GitHub OAuth login (issue #151). All three must be set together; when
+   * absent, OAuth login is disabled (/auth/login + /auth/callback answer
+   * 503) so IAP-fronted deployments boot without OAuth credentials until
+   * the #155 cutover.
+   *
+   * - APP_ORIGIN: the public control-plane origin
+   *   (e.g. https://dsh-control-abc.run.app). The OAuth callback URL is
+   *   built from this — never from the request Host header.
+   * - GITHUB_APP_CLIENT_ID / GITHUB_APP_CLIENT_SECRET: the existing GitHub
+   *   App's OAuth Web-flow credentials (Settings > General > Client
+   *   secrets), SEPARATE from GITHUB_APP_PRIVATE_KEY_PEM (JWT signing for
+   *   installation tokens). The secret value is never logged.
+   */
+  readonly appOrigin?: string;
+  readonly githubAppClientId?: string;
+  readonly githubAppClientSecret?: string;
+  /**
    * Optional agent-host LLM overrides, passed through to created Instances
    * ONLY when set (issue #41). Unset means "defer to the agent-host
    * defaults" (LLM_BASE_URL https://openrouter.ai/api/v1,
@@ -220,6 +237,7 @@ export function readControlPlaneConfig(
     openrouterApiKey: env["OPENROUTER_API_KEY"]!.trim(),
     cloudSqlConnectionName: env["CLOUD_SQL_CONNECTION_NAME"]!.trim(),
     ...readLlmOverrides(env),
+    ...readOAuthConfig(env),
     instanceGcIntervalMs: readOptionalMs(
       env["INSTANCE_GC_INTERVAL_MS"],
       "INSTANCE_GC_INTERVAL_MS",
@@ -239,6 +257,45 @@ export function readControlPlaneConfig(
       1,
     ),
   };
+}
+
+/**
+ * GitHub OAuth login (issue #151). All-or-nothing: blank/unset means
+ * disabled; a partial set fails boot fast (a login that mints states but
+ * can never exchange them would strand users mid-flow). APP_ORIGIN must be
+ * an absolute http(s) URL — the callback URL is derived from it.
+ */
+function readOAuthConfig(
+  env: Readonly<Record<string, string | undefined>>,
+): Pick<ControlPlaneConfig, "appOrigin" | "githubAppClientId" | "githubAppClientSecret"> {
+  const appOrigin = env["APP_ORIGIN"]?.trim();
+  const clientId = env["GITHUB_APP_CLIENT_ID"]?.trim();
+  // Single-line secret: surrounding whitespace (e.g. a Secret Manager
+  // trailing newline) is never part of the value.
+  const clientSecret = env["GITHUB_APP_CLIENT_SECRET"]?.trim();
+  const present = [appOrigin, clientId, clientSecret].filter(
+    (v) => v !== undefined && v !== "",
+  ).length;
+  if (present === 0) return {};
+  const missing: string[] = [];
+  if (!appOrigin) missing.push("APP_ORIGIN");
+  if (!clientId) missing.push("GITHUB_APP_CLIENT_ID");
+  if (!clientSecret) missing.push("GITHUB_APP_CLIENT_SECRET");
+  if (missing.length > 0) {
+    throw new Error(
+      `partial GitHub OAuth configuration: missing ${missing.join(", ")} (set APP_ORIGIN, GITHUB_APP_CLIENT_ID and GITHUB_APP_CLIENT_SECRET together, or none)`,
+    );
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(appOrigin!);
+  } catch {
+    throw new Error(`invalid APP_ORIGIN: ${JSON.stringify(appOrigin)} (want an absolute http(s) URL)`);
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(`invalid APP_ORIGIN: ${JSON.stringify(appOrigin)} (want an absolute http(s) URL)`);
+  }
+  return { appOrigin, githubAppClientId: clientId, githubAppClientSecret: clientSecret };
 }
 
 /**

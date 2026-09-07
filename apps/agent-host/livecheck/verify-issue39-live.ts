@@ -107,8 +107,8 @@ const cpServer = Bun.serve({ port: 0, fetch: createFetchHandler(cpDeps) });
 
 const cpFetch = (path: string, init: RequestInit = {}) => {
   const headers = new Headers(init.headers);
-  headers.set("x-goog-authenticated-user-id", "accounts.google.com:alice");
-  headers.set("x-goog-authenticated-user-email", "alice@example.com");
+  headers.set("x-dsh-user-id", "github:1");
+  headers.set("x-dsh-user-login", "alice");
   return fetch(`${cpServer.url.origin}${path}`, { ...init, headers });
 };
 

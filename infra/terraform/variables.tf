@@ -158,6 +158,12 @@ variable "control_plane_database_url_secret_id" {
   default     = "control-plane-database-url"
 }
 
+variable "github_app_client_secret_id" {
+  description = "Secret Manager secret ID for the GitHub App OAuth Web-flow client secret (issue #151; separate from the private key. Version added out-of-band)."
+  type        = string
+  default     = "github-app-client-secret"
+}
+
 variable "iap_support_email" {
   description = "Support email for the IAP OAuth brand. Required when creating google_iap_brand. Supply out-of-band."
   type        = string

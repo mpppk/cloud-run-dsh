@@ -11,6 +11,7 @@ import { join } from "node:path";
 import type { ActivityKind } from "@cloud-run-dsh/workspace-runtime";
 import { createDevControlPlaneDeps } from "./dev.js";
 import { startControlPlane, type RunningControlPlane } from "./server.js";
+import { SESSION_COOKIE_NAME } from "./index.js";
 import type { ControlPlaneDeps, WorkspaceRuntimeHandle } from "./index.js";
 import { leaseRole } from "../public/app.js";
 import { createSseParser, parseSseChunks } from "../public/sse.js";
@@ -19,11 +20,21 @@ let deps: ControlPlaneDeps;
 let server: RunningControlPlane;
 let base: string;
 
-function iap(user: string): Record<string, string> {
-  return {
-    "x-goog-authenticated-user-id": `accounts.google.com:${user}`,
-    "x-goog-authenticated-user-email": `${user}@example.com`,
-  };
+const __sessTokens = new Map<string, string>();
+async function sess(user: string): Promise<Record<string, string>> {
+  // Issue #152: session-cookie authentication. One server-side session
+  // per test user (numeric GitHub ids); the raw token travels as a cookie.
+  let raw = __sessTokens.get(user);
+  if (!raw) {
+    const numericId = new Map([["alice", 1], ["bob", 2], ["carol", 3]]).get(user) ?? 9999;
+    const created = await deps.sessions.createSession(
+      { id: `github:${numericId}`, provider: "github", providerUserId: String(numericId), login: user },
+      new Date(),
+    );
+    raw = created.rawToken;
+    __sessTokens.set(user, raw);
+  }
+  return { cookie: `${SESSION_COOKIE_NAME}=${raw}` };
 }
 
 beforeAll(() => {
@@ -116,9 +127,9 @@ describe("static UI delivery (issue #128)", () => {
   });
 
   test("static is GET/HEAD only: POST / and DELETE /ui/app.js -> 404", async () => {
-    const post = await fetch(`${base}/`, { method: "POST", headers: iap("alice") });
+    const post = await fetch(`${base}/`, { method: "POST", headers: await sess("alice") });
     expect(post.status).toBe(404);
-    const del = await fetch(`${base}/ui/app.js`, { method: "DELETE", headers: iap("alice") });
+    const del = await fetch(`${base}/ui/app.js`, { method: "DELETE", headers: await sess("alice") });
     expect(del.status).toBe(404);
   });
 
@@ -135,12 +146,12 @@ describe("static UI delivery (issue #128)", () => {
   });
 
   test("authenticated GET /healthz -> 404 (issue #68: never served)", async () => {
-    const res = await fetch(`${base}/healthz`, { headers: iap("alice") });
+    const res = await fetch(`${base}/healthz`, { headers: await sess("alice") });
     expect(res.status).toBe(404);
   });
 
   test("authenticated unknown route -> 404 JSON, never HTML", async () => {
-    const res = await fetch(`${base}/v1/definitely-not-a-route`, { headers: iap("alice") });
+    const res = await fetch(`${base}/v1/definitely-not-a-route`, { headers: await sess("alice") });
     expect(res.status).toBe(404);
     expect(res.headers.get("content-type")).toContain("application/json");
     const body = await res.json();
@@ -150,12 +161,12 @@ describe("static UI delivery (issue #128)", () => {
   test("existing /v1/* routes still work through the same server", async () => {
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo", baseBranch: "main" }),
     });
     expect(created.status).toBe(201);
     const ws = (await created.json()) as { id: string };
-    const read = await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: iap("alice") });
+    const read = await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: await sess("alice") });
     expect(read.status).toBe(200);
   });
 
@@ -176,7 +187,7 @@ describe("static UI delivery (issue #128)", () => {
   test("serving static files never calls recordActivity (idle timer untouched)", async () => {
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo", baseBranch: "main" }),
     });
     const ws = (await created.json()) as { id: string };
@@ -188,7 +199,7 @@ describe("static UI delivery (issue #128)", () => {
     }
     expect((await fetch(`${base}/`, { method: "HEAD" })).status).toBe(200);
     // A control-plane read for contrast goes through the same server.
-    expect((await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: iap("alice") })).status).toBe(
+    expect((await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: await sess("alice") })).status).toBe(
       200,
     );
     expect(spy.activities).toEqual([]);

@@ -36,6 +36,9 @@ import type {
   HttpRequest as InstanceHttpRequest,
   HttpResponse as InstanceHttpResponse,
 } from "@cloud-run-dsh/cloud-run-instance-client";
+import type {
+  HttpTransport as BrokerHttpTransport,
+} from "@cloud-run-dsh/github-credential-broker";
 import type { GcsClient } from "@cloud-run-dsh/workspace-checkpoint";
 import {
   RefreshingGcsTokenProvider,
@@ -629,4 +632,30 @@ export class FetchGcsClient implements GcsClient {
     if (!res.ok) throw new Error(`gcs head failed: ${res.status}`);
     return true;
   }
+}
+
+// ---------------------------------------------------------------------------
+// GitHub credential broker transport (issue #154: repository authorization).
+//
+// Adapts fetch to the broker's HttpTransport seam for installation-token
+// issuance + collaborator-permission lookups. Response bodies are passed
+// through as text (the broker parses); NOTHING here logs bodies or headers
+// (the Authorization header carries the short-lived installation token).
+// ---------------------------------------------------------------------------
+
+export function createBrokerHttpTransport(
+  fetchFn: typeof fetch = fetch,
+): BrokerHttpTransport {
+  return async (req) => {
+    const res = await fetchFn(req.url, {
+      method: req.method,
+      headers: { ...req.headers },
+      body: req.body,
+    });
+    const headers: Record<string, string> = {};
+    res.headers.forEach((value, key) => {
+      headers[key] = value;
+    });
+    return { status: res.status, headers, body: await res.text() };
+  };
 }

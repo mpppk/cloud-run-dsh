@@ -24,6 +24,8 @@ import type {
 } from "@cloud-run-dsh/session-persistence-postgres";
 import type { ActivityKind } from "@cloud-run-dsh/workspace-runtime";
 import { createControlPlaneDeps, createFetchHandler } from "./index.js";
+import { buildSessionSetCookie, parseSessionCookies } from "./auth-session.js";
+import { githubUser } from "./auth.js";
 import { SERVER_IDLE_TIMEOUT_SECONDS } from "./server.js";
 import type { RunningControlPlane } from "./index.js";
 import {
@@ -284,60 +286,82 @@ export function createDevControlPlaneDeps(): ControlPlaneDeps {
 }
 
 /**
- * Dev-only fake IAP (issue #138).
+ * Dev-only auto-login (issue #152; replaces the pre-#152 fake IAP header
+ * injection).
  *
- * In production IAP always injects `x-goog-authenticated-user-id` /
- * `x-goog-authenticated-user-email` before the container, so the browser
- * sends nothing. The local dev server has no IAP, and the product UI
- * (`/app`) deliberately has no header input box (showing IAP internals to
- * users would defeat its "no open / lease words" acceptance rule), so the
- * dev server injects a default development identity when — and only when —
- * the request carries NEITHER header. Any explicit header disables the
- * injection for that request, so the debug UI's per-user switching keeps
- * working untouched.
+ * The product UI (`/app`) has no login screen in this milestone, and the
+ * local dev server has no GitHub OAuth credentials, so the dev server signs
+ * in a fixed development principal automatically: requests WITHOUT a valid
+ * session cookie get one issued (a real server-side session for the dev
+ * user) and the response carries the `Set-Cookie`, so browsers and
+ * cookie-aware clients keep working exactly like the production session
+ * flow. Requests that already carry a valid session pass through untouched —
+ * explicit sessions (e.g. a second dev user created in tests) always win.
  *
- * Lives ONLY in this dev entrypoint: production (main.ts) composes
- * createFetchHandler directly and never imports this module.
+ * Production (main.ts) composes createFetchHandler directly and never
+ * imports this module, so auto-login can never run in production.
  */
-export const DEV_FAKE_IAP_USER_ID_HEADER = "accounts.google.com:dev";
-export const DEV_FAKE_IAP_USER_EMAIL_HEADER = "dev@example.com";
+export const DEV_USER = githubUser(1, "dev");
 
-/** `DSH_DEV_FAKE_IAP=0` (also `false` / `no`) disables the fake IAP. Default: enabled. */
-export function isDevFakeIapEnabled(env: Record<string, string | undefined> = process.env): boolean {
-  const raw = env["DSH_DEV_FAKE_IAP"];
+/** `DSH_DEV_AUTO_LOGIN=0` (also `false` / `no`) disables auto-login. Default: enabled. */
+export function isDevAutoLoginEnabled(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const raw = env["DSH_DEV_AUTO_LOGIN"] ?? env["DSH_DEV_FAKE_IAP"];
   if (raw === undefined) return true;
   const lowered = raw.trim().toLowerCase();
   return lowered !== "0" && lowered !== "false" && lowered !== "no";
 }
 
 /**
- * Dev fetch handler: the production handler wrapped with fake-IAP header
- * injection. Same routing, same auth order (static before auth), same
- * idleTimeout as startControlPlane — the only difference is the default
- * identity for headerless browser navigations and fetches.
+ * Dev fetch handler: the production handler wrapped with session
+ * auto-login. Same routing, same auth order (static before auth), same
+ * idleTimeout as startControlPlane — the only difference is the automatic
+ * dev session for cookie-less requests.
  */
 export function createDevFetchHandler(
   deps: ControlPlaneDeps,
 ): (request: Request) => Promise<Response> {
   const base = createFetchHandler(deps);
   return async (request: Request): Promise<Response> => {
-    if (
-      isDevFakeIapEnabled() &&
-      !request.headers.get("x-goog-authenticated-user-id") &&
-      !request.headers.get("x-goog-authenticated-user-email")
-    ) {
-      const headers = new Headers(request.headers);
-      headers.set("x-goog-authenticated-user-id", DEV_FAKE_IAP_USER_ID_HEADER);
-      headers.set("x-goog-authenticated-user-email", DEV_FAKE_IAP_USER_EMAIL_HEADER);
-      request = new Request(request, { headers });
+    let setCookie: string | undefined;
+    if (isDevAutoLoginEnabled()) {
+      const presented = parseSessionCookies(request.headers.get("cookie"));
+      const hasValid =
+        presented.length === 1 &&
+        !!presented[0] &&
+        (await deps.sessions.lookupSession(presented[0]!, deps.clock.now())) !== null;
+      if (!hasValid) {
+        const created = await deps.sessions.createSession(DEV_USER, deps.clock.now());
+        const headers = new Headers(request.headers);
+        const existing = headers.get("cookie");
+        headers.set(
+          "cookie",
+          existing
+            ? `${existing}; __Host-dsh_session=${created.rawToken}`
+            : `__Host-dsh_session=${created.rawToken}`,
+        );
+        request = new Request(request, { headers });
+        setCookie = buildSessionSetCookie(created.rawToken);
+      }
     }
     const response = await base(request);
     // Issue #147: replay the recorded production turn after a dev message
     // send (dev-only, env-gated — see replayRecordedTurn below).
+    let out = response;
     if (response.status === 201) {
       await maybeReplayRecordedTurn(request, deps);
     }
-    return response;
+    if (setCookie) {
+      const headers = new Headers(out.headers);
+      headers.append("set-cookie", setCookie);
+      out = new Response(out.body, {
+        status: out.status,
+        statusText: out.statusText,
+        headers,
+      });
+    }
+    return out;
   };
 }
 
@@ -468,17 +492,14 @@ function main(): void {
   const server = startDevControlPlane(deps, port);
   const url = `http://127.0.0.1:${server.port}`;
   console.log(`[dev] control plane listening on ${url}`);
-  if (isDevFakeIapEnabled()) {
+  if (isDevAutoLoginEnabled()) {
     console.log(
-      `[dev] fake IAP enabled: requests without IAP headers run as ${DEV_FAKE_IAP_USER_EMAIL_HEADER} ` +
-        `(explicit headers still win; disable with DSH_DEV_FAKE_IAP=0)`,
+      `[dev] auto-login enabled: requests without a session cookie run as dev (${DEV_USER.id} / ${DEV_USER.login}) ` +
+        `(explicit sessions still win; disable with DSH_DEV_AUTO_LOGIN=0)`,
     );
   } else {
-    console.log("[dev] fake IAP disabled (DSH_DEV_FAKE_IAP=0): requests without IAP headers get 401");
+    console.log("[dev] auto-login disabled (DSH_DEV_AUTO_LOGIN=0): requests without a session cookie get 401");
   }
-  console.log("[dev] IAP headers: x-goog-authenticated-user-id / x-goog-authenticated-user-email");
-  console.log(`[dev] e.g. curl -H 'x-goog-authenticated-user-id: accounts.google.com:me' \\`);
-  console.log(`[dev]        -H 'x-goog-authenticated-user-email: me@example.com' ${url}/livez`);
   console.log("[dev] See docs/local-development.md for a full walkthrough. Ctrl-C to stop.");
 
   process.on("SIGINT", () => {

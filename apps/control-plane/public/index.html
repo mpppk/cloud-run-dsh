@@ -12,14 +12,11 @@
 No build step, no dependencies. Opening this page never extends the idle timer.</p>
 
 <section id="headers">
-<h2>Auth headers (local only)</h2>
-<p class="hint">Sent as <code>x-goog-authenticated-user-id</code> /
-<code>x-goog-authenticated-user-email</code> on every API call.
-Leave both empty under IAP — the proxy injects the headers, so no code change is needed.</p>
-<label>user id <input id="in-user-id" data-testid="user-id" placeholder="accounts.google.com:alice" /></label>
-<label>email <input id="in-user-email" data-testid="user-email" placeholder="alice@example.com" /></label>
-<button id="btn-save-headers" data-testid="save-headers">save</button>
-<span id="headers-state"></span>
+<h2>Auth (session cookie)</h2>
+<p class="hint">Authenticated with the <code>__Host-dsh_session</code> cookie
+(issue #152), sent automatically by the browser. Locally the dev server signs
+in its dev principal automatically; in production log in with GitHub first.
+No header inputs — <code>x-goog-authenticated-user-*</code> headers are ignored.</p>
 </section>
 
 <section id="workspaces">

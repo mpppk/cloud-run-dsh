@@ -1,9 +1,10 @@
 // Debug Web UI (issue #128). Plain ES module — no npm dependencies, no bundler.
 //
 // Everything is same-origin fetch against the control-plane that serves this
-// file. Local and IAP-fronted production share one code path: auth headers
-// are read from the header inputs and omitted when empty, so under IAP the
-// proxy-injected headers pass through untouched.
+// file. Authentication is the `__Host-dsh_session` cookie (issue #152),
+// which the browser sends automatically — this file attaches NO auth
+// headers at all. Locally the dev server signs in its dev principal
+// automatically; in production the browser holds a GitHub-login session.
 //
 // The event stream is read with fetch + ReadableStream (NOT the built-in
 // browser SSE client, which cannot attach custom headers), parsing the SSE
@@ -57,8 +58,6 @@ export function leaseRole(status, nowMs) {
 // ---------------------------------------------------------------------------
 
 const LS = {
-  userId: "dsh.ui.userId",
-  userEmail: "dsh.ui.userEmail",
   workspaces: "dsh.ui.workspaces",
 };
 
@@ -90,14 +89,14 @@ function saveWorkspaces(ids) {
   localStorage.setItem(LS.workspaces, JSON.stringify(ids));
 }
 
+/**
+ * Extra headers for API calls. Issue #152: none — the session cookie
+ * authenticates every request and custom headers would only risk CORS
+ * preflights. (The pre-#152 IAP header inputs are gone; the server ignores
+ * `x-goog-authenticated-user-*`.)
+ */
 function authHeaders() {
-  const headers = {};
-  const id = (localStorage.getItem(LS.userId) ?? "").trim();
-  const email = (localStorage.getItem(LS.userEmail) ?? "").trim();
-  // Empty means "let the IAP proxy inject" — never send a blank header.
-  if (id) headers["x-goog-authenticated-user-id"] = id;
-  if (email) headers["x-goog-authenticated-user-email"] = email;
-  return headers;
+  return {};
 }
 
 function logRequest(method, path, status, bodyText) {
@@ -445,15 +444,7 @@ function sseDisconnect() {
 // ---------------------------------------------------------------------------
 
 function boot() {
-  // headers
-  $("in-user-id").value = localStorage.getItem(LS.userId) ?? "";
-  $("in-user-email").value = localStorage.getItem(LS.userEmail) ?? "";
-  $("btn-save-headers").onclick = () => {
-    localStorage.setItem(LS.userId, $("in-user-id").value.trim());
-    localStorage.setItem(LS.userEmail, $("in-user-email").value.trim());
-    $("headers-state").textContent = "saved";
-  };
-
+  // Issue #152: no auth header inputs — the session cookie authenticates.
   // workspaces
   renderWsList();
   $("btn-create-ws").onclick = async () => {

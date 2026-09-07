@@ -169,6 +169,11 @@ echo -n "$GITHUB_APP_PEM" | gcloud secrets versions add github-app-private-key -
 echo -n "$LLM_KEY"        | gcloud secrets versions add llm-api-key        --data-file=-
 ```
 
+A fourth container, `github-app-client-secret` (issue #151: the App's OAuth
+Web-flow client secret, separate from the private key above), is also
+provisioned by the apply — its version is added in Step 6.x when OAuth login
+is enabled.
+
 `$LLM_KEY` is the **OpenRouter** API key (`sk-or-v1-…`, from https://openrouter.ai/keys).
 The agent-host turn (issue #21) calls OpenRouter's OpenAI-compatible
 endpoint with it; how the secret reaches the container is described in
@@ -470,6 +475,11 @@ export CP_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-host/control-plane
 #
 # Control-plane environment — mirrors the 11 `REQUIRED_ENV_KEYS` in apps/control-plane/src/config.ts
 # (8 plain keys via this file + 3 secrets via --set-secrets below = 11).
+# GitHub OAuth login (issues #151/#153, REQUIRED before the #155 public
+# cutover, harmless while IAP still fronts the service) adds 2 plain keys
+# (APP_ORIGIN, GITHUB_APP_CLIENT_ID) + 1 secret (GITHUB_APP_CLIENT_SECRET) —
+# see "Step 6.x — GitHub OAuth login" below. Until they are set, /auth/login
+# and /auth/callback answer 503 and the CSRF Origin gate stays off.
 # If you add an env key to config.ts, update this step in the same PR.
 # Secret hygiene: the DB password, the PEM, AND the LLM key never appear in
 # argv or shell history — secrets travel via Secret Manager (--set-secrets)
@@ -565,6 +575,61 @@ IAP configuration (brand + client were already created by Terraform in Step 2; m
 2. Front the service with IAP — either an HTTPS Load Balancer backend (classic, stable) or the newer direct IAP-on-Cloud Run integration, whichever your project's Preview surface supports.
 3. Grant `roles/iap.httpsResourceAccessor` to your users (Terraform does this for `var.iap_members`; add more with `gcloud iap web add-iam-policy-binding`).
 4. The control plane **never trusts the IAP identity alone** — it resolves IAP identity → internal user → workspace membership → authorization (仕様書 §21, 実装手順書 §25). IAP being on does not make membership checks optional.
+
+---
+
+## Step 6.x — GitHub OAuth login (issues #149–#154; REQUIRED before the #155 public cutover)
+
+The control plane authenticates browsers with GitHub App OAuth (Web application
+flow + PKCE) and opaque server-side sessions (`__Host-dsh_session` cookie),
+authorized per workspace by membership plus repository permission (issue #154).
+No new GitHub App is needed — the existing App (the one that already clones
+repos in production) gains OAuth credentials:
+
+1. **Enable the Web flow on the existing App.** GitHub App settings →
+   General: confirm user authorization during installation / the web flow is
+   enabled. If the project has no App yet (fresh setup), register one first
+   (private key → `github-app-private-key` as in §2.4) and then continue here.
+2. **Authorization callback URL.** Set it to exactly:
+   `<APP_ORIGIN>/auth/callback`
+   where `APP_ORIGIN` is the control-plane Cloud Run HTTPS service URL
+   (e.g. `https://dsh-control-abc123-uc.a.run.app`) — resolve it at deploy
+   time with `gcloud run services describe control-plane --format='value(status.url)'`.
+   Never invent a fixed URL; the callback is built from `APP_ORIGIN`, never
+   from the request Host header.
+3. **Client secret.** Settings → General → Client secrets → "Generate a new
+   client secret". This is SEPARATE from the App private key (JWT signing for
+   installation tokens). Store it out-of-band — the container exists from
+   Terraform (`infra/terraform/secrets.tf`, issue #151):
+   ```bash
+   echo -n "$CLIENT_SECRET" | gcloud secrets versions add github-app-client-secret --data-file=-
+   ```
+4. **Migrate the database.** `infra/migrations/0003_auth_sessions.sql`
+   (sessions + login flows; rollback in `0003_auth_sessions.down.sql`):
+   ```bash
+   DATABASE_URL=... bun run infra/migrations/runner.ts
+   ```
+5. **Configure + redeploy the service.** Add to the Step 6 env file:
+   ```bash
+   APP_ORIGIN: "https://dsh-control-abc123-uc.a.run.app"
+   GITHUB_APP_CLIENT_ID: "<Iv1.… from the App settings page>"
+   ```
+   and extend `--set-secrets` with
+   `GITHUB_APP_CLIENT_SECRET=github-app-client-secret:latest`
+   (the control-plane SA already holds the accessor grant — `iam.tf`).
+   All three must be set together (partial config fails boot fast).
+
+Verify: `GET /auth/login` 302s to `github.com/login/oauth/authorize` with
+`state` + `code_challenge`; completing the flow sets `__Host-dsh_session`
+and `GET /auth/session` returns `{ user: { id: "github:<numeric-id>", … } }`.
+Workspace creation now additionally requires the caller's GitHub
+read-or-above permission on the target repository (issue #154 — uses the
+existing App key, no new credential).
+
+Transitional posture (before #155): with OAuth configured but IAP still
+fronting, browser login works behind IAP and the CSRF Origin gate is active.
+With OAuth unconfigured, `/auth/login` + `/auth/callback` answer 503 and the
+Origin gate stays off — DO NOT expose the service publicly in that state.
 
 ---
 

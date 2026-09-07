@@ -95,7 +95,7 @@ function forwardArgs(overrides: Partial<ForwardMessageArgs> = {}): ForwardMessag
     sessionId: "sess-1",
     seq: 0,
     content: "fix the flaky test",
-    identity: { id: "alice", email: "alice@example.com" },
+    identity: { id: "github:1", login: "alice" },
     ...overrides,
   };
 }
@@ -307,8 +307,8 @@ describe("HttpAgentHostForwarder", () => {
     expect(init.method).toBe("POST");
     const headers = init.headers as Record<string, string>;
     expect(headers["authorization"]).toBe("Bearer id-token-123");
-    expect(headers["x-goog-authenticated-user-email"]).toBe("alice@example.com");
-    expect(headers["x-goog-authenticated-user-id"]).toBe("accounts.google.com:alice");
+    expect(headers["x-dsh-user-id"]).toBe("github:1");
+    expect(headers["x-dsh-user-login"]).toBe("alice");
     const sent = JSON.parse(init.body as string) as Record<string, unknown>;
     expect(sent).toMatchObject({
       workspaceId: "ws-1",
@@ -324,6 +324,19 @@ describe("HttpAgentHostForwarder", () => {
     const { forwarder, seenAudiences } = successSetup();
     await forwarder.forward(forwardArgs({ instanceUrl: "https://dsh-ws-1.run.app/" }));
     expect(seenAudiences).toEqual(["https://dsh-ws-1.run.app"]);
+  });
+
+  test("issue #149: internal forward carries no x-goog-authenticated-user-* headers", async () => {
+    // The DSH internal protocol uses x-dsh-user-*; Google/IAP reserved
+    // headers must never appear on control-plane -> agent-host traffic.
+    const { calls, forwarder } = successSetup();
+    await forwarder.forward(forwardArgs({}));
+    const headers = calls[0]!.init!.headers as Record<string, string>;
+    for (const name of Object.keys(headers)) {
+      expect(name.toLowerCase().startsWith("x-goog-")).toBe(false);
+    }
+    expect(headers["x-dsh-user-id"]).toBe("github:1");
+    expect(headers["x-dsh-user-login"]).toBe("alice");
   });
 
   test("agent-host 409/403 propagate as AgentHostConflictError (not forward failure)", async () => {
@@ -451,7 +464,7 @@ describe("HttpAgentHostForwarder approval/cancel (issue #39)", () => {
     sessionId: "sess-1",
     approvalId: "ask-1",
     decision: "rejected",
-    identity: { id: "alice", email: "alice@example.com" },
+    identity: { id: "github:1", login: "alice" },
     ...overrides,
   });
 
@@ -459,7 +472,7 @@ describe("HttpAgentHostForwarder approval/cancel (issue #39)", () => {
     instanceUrl: "https://dsh-ws-1.run.app",
     workspaceId: "ws-1",
     sessionId: "sess-1",
-    identity: { id: "alice", email: "alice@example.com" },
+    identity: { id: "github:1", login: "alice" },
     ...overrides,
   });
 
@@ -476,8 +489,8 @@ describe("HttpAgentHostForwarder approval/cancel (issue #39)", () => {
     expect(init.method).toBe("POST");
     const headers = init.headers as Record<string, string>;
     expect(headers["authorization"]).toBe("Bearer id-token-123");
-    expect(headers["x-goog-authenticated-user-email"]).toBe("alice@example.com");
-    expect(headers["x-goog-authenticated-user-id"]).toBe("accounts.google.com:alice");
+    expect(headers["x-dsh-user-id"]).toBe("github:1");
+    expect(headers["x-dsh-user-login"]).toBe("alice");
     expect(JSON.parse(init.body as string)).toEqual({
       approvalId: "ask-1",
       decision: "rejected",
@@ -532,14 +545,14 @@ describe("HttpAgentHostForwarder lifecycle forwards (issues #72/#75)", () => {
   const prepareArgs = (overrides: Partial<ForwardPrepareStopArgs> = {}): ForwardPrepareStopArgs => ({
     instanceUrl: "https://dsh-ws-1.run.app",
     workspaceId: "ws-1",
-    identity: { id: "alice", email: "alice@example.com" },
+    identity: { id: "github:1", login: "alice" },
     ...overrides,
   });
 
   const checkpointArgs = (overrides: Partial<ForwardCheckpointArgs> = {}): ForwardCheckpointArgs => ({
     instanceUrl: "https://dsh-ws-1.run.app",
     workspaceId: "ws-1",
-    identity: { id: "alice", email: "alice@example.com" },
+    identity: { id: "github:1", login: "alice" },
     ...overrides,
   });
 
@@ -568,8 +581,8 @@ describe("HttpAgentHostForwarder lifecycle forwards (issues #72/#75)", () => {
     expect(init.method).toBe("POST");
     const headers = init.headers as Record<string, string>;
     expect(headers["authorization"]).toBe("Bearer id-token-123");
-    expect(headers["x-goog-authenticated-user-email"]).toBe("alice@example.com");
-    expect(headers["x-goog-authenticated-user-id"]).toBe("accounts.google.com:alice");
+    expect(headers["x-dsh-user-id"]).toBe("github:1");
+    expect(headers["x-dsh-user-login"]).toBe("alice");
   });
 
   test("forwardCheckpoint POSTs to the checkpoint path and reports the host skip flag", async () => {
@@ -636,7 +649,7 @@ describe("HttpAgentHostForwarder delivery logging", () => {
     sessionId: "sess-1",
     approvalId: "ask-1",
     decision: "rejected",
-    identity: { id: "alice", email: "alice@example.com" },
+    identity: { id: "github:1", login: "alice" },
     ...overrides,
   });
 
@@ -644,7 +657,7 @@ describe("HttpAgentHostForwarder delivery logging", () => {
     instanceUrl: "https://dsh-ws-1.run.app",
     workspaceId: "ws-1",
     sessionId: "sess-1",
-    identity: { id: "alice", email: "alice@example.com" },
+    identity: { id: "github:1", login: "alice" },
     ...overrides,
   });
 
