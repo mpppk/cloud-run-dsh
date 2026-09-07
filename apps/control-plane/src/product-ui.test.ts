@@ -338,6 +338,12 @@ describe("product UI polling never extends the idle timer", () => {
 
 describe("one-action start + transparent resume (API shape the UI drives)", () => {
   test("create -> prepare (202) -> poll to READY -> session -> message -> stop -> prepare again -> message", async () => {
+    // Issue #147 replay is orthogonal to this resume shape (and would shift
+    // every seq by +70 per send), so it stays off here — dev-replay.test.ts
+    // owns the replay assertions.
+    const savedReplay = process.env["DSH_DEV_SSE_REPLAY"];
+    process.env["DSH_DEV_SSE_REPLAY"] = "0";
+    try {
     // 1 action on the home screen: create + prepare + session.
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
@@ -402,6 +408,10 @@ describe("one-action start + transparent resume (API shape the UI drives)", () =
     });
     expect(resent.status).toBe(201);
     expect(((await resent.json()) as { seq: number }).seq).toBe(1);
+    } finally {
+      if (savedReplay === undefined) delete process.env["DSH_DEV_SSE_REPLAY"];
+      else process.env["DSH_DEV_SSE_REPLAY"] = savedReplay;
+    }
   }, 30_000);
 
   test("READY with only the lease lost -> 409, then re-open recovers the same send at seq 0", async () => {

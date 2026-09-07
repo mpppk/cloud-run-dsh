@@ -17,6 +17,7 @@ import { ControllerLeaseService, HEARTBEAT_INTERVAL_MS } from "@cloud-run-dsh/co
 import { InMemoryLeaseStore } from "@cloud-run-dsh/controller-lease/testing";
 import { PostgresSessionPersistenceRepository } from "@cloud-run-dsh/session-persistence-postgres";
 import { InMemoryFakeExecutor } from "@cloud-run-dsh/session-persistence-postgres/testing";
+import { join } from "node:path";
 import type {
   SessionPersistenceRepository,
   Workspace,
@@ -319,7 +320,7 @@ export function createDevFetchHandler(
   deps: ControlPlaneDeps,
 ): (request: Request) => Promise<Response> {
   const base = createFetchHandler(deps);
-  return (request: Request): Promise<Response> => {
+  return async (request: Request): Promise<Response> => {
     if (
       isDevFakeIapEnabled() &&
       !request.headers.get("x-goog-authenticated-user-id") &&
@@ -330,8 +331,117 @@ export function createDevFetchHandler(
       headers.set("x-goog-authenticated-user-email", DEV_FAKE_IAP_USER_EMAIL_HEADER);
       request = new Request(request, { headers });
     }
-    return base(request);
+    const response = await base(request);
+    // Issue #147: replay the recorded production turn after a dev message
+    // send (dev-only, env-gated — see replayRecordedTurn below).
+    if (response.status === 201) {
+      await maybeReplayRecordedTurn(request, deps);
+    }
+    return response;
   };
+}
+
+/**
+ * Recorded-turn replay (issue #147, dev ONLY).
+ *
+ * The dev server has no agent-host, so a local message send used to append
+ * nothing but `user_message` — the `request/*`, `turn/*`, `step/*`,
+ * `assistant/*` and `tool/*` events never flowed locally, which is exactly
+ * why the #147 raw-JSON conversation went unnoticed until a real browser
+ * hit GCP. After a dev message send (201), the wrapper above appends the
+ * recorded production turn (`testdata/g2-sse-reference.txt`: one full turn
+ * captured from the live agent-host, secrets-free), so the local browser
+ * renders an agent-equivalent conversation.
+ *
+ * Faithful but compressed: every recorded event keeps its type and data
+ * (fresh eventTime, server-assigned seq), except the recording's own
+ * `user_message` — the live send already appended the user's real message,
+ * so replaying the recorded greeting would double it. Timing is collapsed
+ * (appended at once; the SSE poll delivers them on its cadence).
+ *
+ * Production-leak guard, pinned by test: this module is imported ONLY by
+ * the dev entrypoint and dev/test code. `main.ts` (production) composes
+ * `createFetchHandler` directly and never imports this module — `grep` for
+ * `testdata`, `g2-sse` or `DSH_DEV_SSE_REPLAY` outside dev/test sources
+ * must come back empty, and a message sent through the production handler
+ * appends exactly one event.
+ */
+
+/** `DSH_DEV_SSE_REPLAY=0` (also `false` / `no`) disables the replay. Default: enabled. */
+export function isDevSseReplayEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env["DSH_DEV_SSE_REPLAY"];
+  if (raw === undefined) return true;
+  const lowered = raw.trim().toLowerCase();
+  return lowered !== "0" && lowered !== "false" && lowered !== "no";
+}
+
+export interface RecordedEvent {
+  readonly eventType: string;
+  readonly data: unknown;
+}
+
+/** Parses the recorded SSE wire format (id/event/data blocks + `: ` comments). */
+export function parseRecordedSse(text: string): RecordedEvent[] {
+  const events: RecordedEvent[] = [];
+  for (const block of text.split(/\n\n+/)) {
+    const trimmed = block.trim();
+    if (!trimmed) continue;
+    // SSE comments (`: stream open`, `: ping`) carry no event.
+    if (trimmed.startsWith(":")) continue;
+    const typeMatch = /^event: (.+)$/m.exec(block);
+    if (!typeMatch) throw new Error(`recorded block without event type: ${block.slice(0, 80)}`);
+    const dataMatch = /^data: (.*)$/ms.exec(block);
+    if (!dataMatch) throw new Error(`recorded ${typeMatch[1]} block without data`);
+    events.push({ eventType: typeMatch[1]!.trim(), data: JSON.parse(dataMatch[1]!) });
+  }
+  return events;
+}
+
+const RECORDED_TURN_FILE = join(import.meta.dir, "..", "testdata", "g2-sse-reference.txt");
+
+/** Parsed recording, cached per process (test seam: `clearCachedRecordedTurn`). */
+let cachedRecordedTurn: RecordedEvent[] | null = null;
+
+/** Test seam: drops the cached recording so the next send re-reads the file. */
+export function clearCachedRecordedTurn(): void {
+  cachedRecordedTurn = null;
+}
+
+async function loadRecordedTurn(): Promise<RecordedEvent[]> {
+  if (!cachedRecordedTurn) {
+    const text = await Bun.file(RECORDED_TURN_FILE).text();
+    cachedRecordedTurn = parseRecordedSse(text);
+  }
+  return cachedRecordedTurn;
+}
+
+/**
+ * Appends the recorded turn to the session behind a dev message send.
+ * No-op unless the request was `POST /v1/sessions/:id/messages` answered
+ * with 201 and the replay is enabled. Failures (missing fixture, storage
+ * error) are logged and never fail the already-accepted send.
+ */
+async function maybeReplayRecordedTurn(request: Request, deps: ControlPlaneDeps): Promise<void> {
+  if (!isDevSseReplayEnabled()) return;
+  if (request.method !== "POST") return;
+  const match = /^\/v1\/sessions\/([^/]+)\/messages$/.exec(new URL(request.url).pathname);
+  if (!match) return;
+  const sessionId = decodeURIComponent(match[1]!);
+  try {
+    const recorded = await loadRecordedTurn();
+    // Skip the recording's own user_message (index 0): the live send
+    // already appended the user's real message.
+    const replay = recorded.filter((e) => e.eventType !== "user_message");
+    if (replay.length === 0) return;
+    const eventTime = deps.clock.now().getTime();
+    await deps.repo.append(
+      sessionId,
+      replay.map((e) => ({ eventType: e.eventType, eventTime, data: e.data })),
+    );
+    console.log(`[dev] replayed ${replay.length} recorded events into session ${sessionId}`);
+  } catch (e) {
+    console.log(`[dev] recorded-turn replay skipped: ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 /** Starts the dev server: production socket options, dev fetch handler. */

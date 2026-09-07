@@ -33,6 +33,7 @@ interface StaticEntry {
     | "sse.js"
     | "app/index.html"
     | "app/app.js"
+    | "app/render.js"
     | "app/app.css";
   readonly contentType: string;
 }
@@ -53,6 +54,10 @@ const STATIC_ALLOWLIST: Readonly<Record<string, StaticEntry>> = {
   "/app": { file: "app/index.html", contentType: "text/html; charset=utf-8" },
   "/app/": { file: "app/index.html", contentType: "text/html; charset=utf-8" },
   "/app/app.js": { file: "app/app.js", contentType: "text/javascript; charset=utf-8" },
+  // Conversation rendering rules (issue #147): a dependency-free module
+  // imported by /app/app.js and by bun tests — served, never inlined, so
+  // the browser and the tests execute the same file.
+  "/app/render.js": { file: "app/render.js", contentType: "text/javascript; charset=utf-8" },
   "/app/app.css": { file: "app/app.css", contentType: "text/css; charset=utf-8" },
   "/app/sse.js": { file: "sse.js", contentType: "text/javascript; charset=utf-8" },
 };
