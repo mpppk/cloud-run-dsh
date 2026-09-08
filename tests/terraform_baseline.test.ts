@@ -18,6 +18,7 @@ describe("terraform baseline file existence", () => {
     "apis.tf",
     "artifact_registry.tf",
     "cloudsql.tf",
+    "control-plane.tf",
     "storage.tf",
     "iam.tf",
     "secrets.tf",
@@ -254,7 +255,7 @@ describe("content checks", () => {
     expect(saIamSaUserBlocks.length).toBe(3);
   });
 
-  test("secrets.tf creates 4 secrets without values", () => {
+  test("secrets.tf creates 5 secrets without values", () => {
     const c = tfContents["secrets.tf"];
     expect(c).toContain("github_app_private_key");
     expect(c).toContain("llm_api_key");
@@ -263,6 +264,10 @@ describe("content checks", () => {
     // accessor grant (iam.tf) cannot drift out of sync with its existence.
     expect(c).toContain("control_plane_database_url");
     expect(tfContents["variables.tf"]).toContain("control_plane_database_url_secret_id");
+    // Issue #151: the GitHub App OAuth client secret container (version
+    // added out-of-band in runbook Step 6.x).
+    expect(c).toContain("github_app_client_secret");
+    expect(tfContents["variables.tf"]).toContain("github_app_client_secret_id");
     expect(c).not.toMatch(/secret_data/);
   });
 
@@ -302,8 +307,7 @@ describe("content checks", () => {
     expect(literals.length).toBe(0);
   });
 
-  test("cloudsql.tf pins destroy order database-before-user for issue #73", () => {
-    const c = tfContents["cloudsql.tf"];
+  test("cloudsql.tf pins destroy order database-before-user for issue #73", () => {    const c = tfContents["cloudsql.tf"];
     // The DATABASE must depend on the USER so that destroy runs
     // database -> user (destroy is the inverse of creation order).
     // The reverse direction (user depending on database) would destroy the
@@ -316,5 +320,175 @@ describe("content checks", () => {
     const userBlock = c.match(/resource "google_sql_user" "app" \{[\s\S]*?\n\}/);
     expect(userBlock).not.toBeNull();
     expect(userBlock![0]).not.toMatch(/depends_on\s*=\s*\[google_sql_database\.dsh\]/);
+  });
+});
+
+describe("issue #155: control-plane service with fail-closed public gate", () => {
+  test("exactly one google_cloud_run_v2_service (control_plane); ADR-0001 preserved", () => {
+    const services = [
+      ...allTf.matchAll(/resource "google_cloud_run_v2_service" "([^"]+)" \{/g),
+    ].map((m) => m[1]);
+    expect(services).toEqual(["control_plane"]);
+    // Preview Instances stay outside Terraform (ADR-0001): no agent-host
+    // service, instance, or worker-pool resources anywhere.
+    expect(allTf).not.toMatch(/resource "google_cloud_run_v2_service" "agent_host"/);
+    expect(allTf).not.toMatch(/google_cloud_run_v2_service" "agent-host/);
+    expect(allTf).not.toMatch(/cloud_run_v2_worker_pool/);
+    expect(allTf).not.toMatch(/cloud_run_instance/);
+    expect(tfContents["control-plane.tf"]).toMatch(/ADR-0001/);
+  });
+
+  test("no allUsers and no run-invoker IAM bindings anywhere (asymmetry by construction)", () => {
+    // Public mode uses invoker_iam_disabled (official recommended mechanism),
+    // never an allUsers grant — this must hold for every present and future
+    // caller identity, including agent-host Instances. Anchored on quoted
+    // member literals so prose mentions of the word cannot false-green.
+    expect(allTf).not.toMatch(/"allUsers"/);
+    expect(allTf).not.toMatch(/'allUsers'/);
+    expect(allTf).not.toMatch(/google_cloud_run_v2_service_iam_(binding|member|policy)/);
+    expect(allTf).not.toMatch(/roles\/run\.invoker/);
+  });
+
+  test("fail-closed defaults: no image means no service; public defaults to false", () => {
+    const vars = tfContents["variables.tf"];
+    const imageBlock = vars.match(/variable "control_plane_image" \{[\s\S]*?\n\}/);
+    expect(imageBlock).not.toBeNull();
+    expect(imageBlock![0]).toMatch(/default\s*=\s*""/);
+    const publicBlock = vars.match(/variable "control_plane_public" \{[\s\S]*?\n\}/);
+    expect(publicBlock).not.toBeNull();
+    expect(publicBlock![0]).toMatch(/default\s*=\s*false/);
+    const c = tfContents["control-plane.tf"];
+    // count = 0 until an image is supplied: defaults create nothing.
+    expect(c).toMatch(/count\s*=\s*local\.cp_enabled \? 1 : 0/);
+    expect(c).toMatch(/cp_enabled = var\.control_plane_image != ""/);
+  });
+
+  test("public gate: restrictive ingress + IAM check by default, ALL + disabled only when public", () => {
+    const c = tfContents["control-plane.tf"];
+    expect(c).toMatch(/ingress = local\.cp_public \? "INGRESS_TRAFFIC_ALL" : "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"/);
+    expect(c).toMatch(/invoker_iam_disabled = local\.cp_public/);
+    expect(c).toMatch(/cp_public\s*=\s*local\.cp_enabled && var\.control_plane_public/);
+    // Literal `= true` on either field would publicize unconditionally.
+    expect(c).not.toMatch(/^\s*ingress\s*=\s*"INGRESS_TRAFFIC_ALL"\s*$/m);
+    expect(c).not.toMatch(/^\s*invoker_iam_disabled\s*=\s*true\s*$/m);
+    // Lifecycle preconditions fail the PLAN when public mode lacks its
+    // mandatory config (non-empty https origin, client/App IDs, images).
+    expect(c).toContain("precondition");
+    expect(c).toContain("control_plane_app_origin");
+    expect(c).toContain("control_plane_github_client_id");
+    expect(c).toContain("control_plane_github_app_id");
+    expect(c).toContain("control_plane_agent_host_image");
+    expect(c).toContain("https://");
+  });
+
+  test("credential env is secret_key_ref only; DB-URL secret backs both URL vars; no values", () => {
+    const c = tfContents["control-plane.tf"];
+    for (const name of [
+      "DATABASE_URL",
+      "AGENT_HOST_DATABASE_URL",
+      "GITHUB_APP_PRIVATE_KEY_PEM",
+      "OPENROUTER_API_KEY",
+      "GITHUB_APP_CLIENT_SECRET",
+    ]) {
+      expect(c).toContain(`name = "${name}"`);
+    }
+    const refs = [...c.matchAll(/secret_key_ref \{[\s\S]*?\n\s*\}/g)];
+    expect(refs.length).toBeGreaterThanOrEqual(5);
+    // Both URL vars reference the same socket-form secret (runbook Step 6):
+    // AGENT_HOST_DATABASE_URL must never be a plain value (it embeds the
+    // DB password and would land in state).
+    const dbUrlRefs = refs.filter((b) => b[0].includes("control_plane_database_url_secret_id"));
+    expect(dbUrlRefs.length).toBe(2);
+    // No plain `value = "..."` env assignment may carry a secret-looking
+    // name; plain env is non-secret config only.
+    const plainSecrets = [
+      ...c.matchAll(/^\s*name\s*=\s*"(DATABASE_URL|AGENT_HOST_DATABASE_URL|GITHUB_APP_PRIVATE_KEY_PEM|OPENROUTER_API_KEY|GITHUB_APP_CLIENT_SECRET|.*PASSWORD.*|.*SECRET.*|.*PRIVATE_KEY.*)"\s*$/gm),
+    ].filter((m) => {
+      const block = c.slice(Math.max(0, (m.index ?? 0) - 200), (m.index ?? 0) + 400);
+      return !block.includes("secret_key_ref");
+    });
+    expect(plainSecrets.map((m) => m[0]).join("\n")).toBe("");
+    // Secret containers resolve through the *_secret_id variables (custom
+    // IDs keep working), never hardcoded names.
+    expect(c).toContain("var.control_plane_database_url_secret_id");
+    expect(c).toContain("var.github_app_private_key_secret_id");
+    expect(c).toContain("var.llm_api_key_secret_id");
+    expect(c).toContain("var.github_app_client_secret_id");
+  });
+
+  test("production surface mirrored: SA, SQL volume, probes, timeout, traffic", () => {
+    const c = tfContents["control-plane.tf"];
+    // Runtime identity: the existing control-plane SA (IAM unchanged).
+    expect(c).toMatch(/service_account\s*=\s*google_service_account\.control_plane\.email/);
+    // Cloud SQL socket volume (runbook Step 6 --add-cloudsql-instances).
+    expect(c).toContain("cloud_sql_instance");
+    expect(c).toMatch(/mount_path\s*=\s*"\/cloudsql"/);
+    expect(c).toContain("google_sql_database_instance.main.connection_name");
+    // Probes: honest startup gate on /readyz, process liveness on /livez.
+    expect(c).toMatch(/path\s*=\s*"\/readyz"/);
+    expect(c).toMatch(/path\s*=\s*"\/livez"/);
+    expect(c).toContain("startup_probe");
+    expect(c).toContain("liveness_probe");
+    expect(c).toMatch(/container_port\s*=\s*8080/);
+    expect(c).toMatch(/timeout\s*=\s*"300s"/);
+    expect(c).toMatch(/percent\s*=\s*100/);
+    // Plain env mirrors runbook Step 6 REQUIRED keys (minus secrets).
+    // Anchored on map-key assignments (env names are HCL keys, not quoted).
+    for (const name of [
+      "GCP_PROJECT_ID",
+      "GCP_REGION",
+      "AGENT_HOST_IMAGE",
+      "AGENT_HOST_SERVICE_ACCOUNT",
+      "CHECKPOINT_BUCKET",
+      "CLOUD_SQL_CONNECTION_NAME",
+      "GITHUB_APP_ID",
+      "APP_ORIGIN",
+      "GITHUB_APP_CLIENT_ID",
+    ]) {
+      expect(c).toMatch(new RegExp(`^\\s*${name}\\s*=`, "m"));
+    }
+  });
+
+  test("outputs expose service uri/name for the two-phase bootstrap", () => {
+    const c = tfContents["outputs.tf"];
+    expect(c).toContain("control_plane_service_uri");
+    expect(c).toContain("control_plane_service_name");
+    expect(c).toContain("google_cloud_run_v2_service.control_plane");
+  });
+
+  test("README documents the service, gate, bootstrap and #156 gating", () => {
+    const c = readFileSync(join(tfDir, "README.md"), "utf8");
+    expect(c).toContain("control-plane.tf");
+    expect(c).toMatch(/control_plane_public/);
+    expect(c).toMatch(/two-phase/i);
+    expect(c).toMatch(/#156/);
+    expect(c).toMatch(/ADR-0001/);
+  });
+
+  test("runbook Step 6.y documents the manual-service import adoption path", () => {
+    const c = readFileSync(join(import.meta.dir, "../docs/deployment-runbook.md"), "utf8");
+    // Exact import address with the count index (the resource uses count).
+    expect(c).toContain("google_cloud_run_v2_service.control_plane[0]");
+    expect(c).toContain("projects/<project>/locations/<region>/services/control-plane");
+    // The import/plan commands must be truly copy-executable: no "[... same
+    // flags ...]" ellipses anywhere in the runbook, and the shared TF_VAR
+    // exports (project, region, plus the three phase-1 values that make
+    // count=1) must be spelled out.
+    expect(c).not.toMatch(/\[\.\.\. same/);
+    for (const name of [
+      "TF_VAR_project_id",
+      "TF_VAR_region",
+      "TF_VAR_control_plane_image",
+      "TF_VAR_control_plane_github_app_id",
+      "TF_VAR_control_plane_agent_host_image",
+    ]) {
+      expect(c).toContain(`export ${name}=`);
+    }
+    // Fresh-project path and the stop signal on replace plans.
+    expect(c).toMatch(/Fresh project/i);
+    expect(c).toMatch(/DELETE\/replace/i);
+    // Preview Instances must never be imported (ADR-0001).
+    expect(c).toMatch(/Never import preview Instances/i);
+    expect(c).toMatch(/ADR-0001/);
   });
 });

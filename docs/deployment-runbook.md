@@ -454,7 +454,12 @@ curl -X POST -H "Authorization: Bearer $(gcloud auth print-access-token)" \
 
 ## Step 6 — Deploy the control plane to Cloud Run
 
-The control plane (`apps/control-plane`) is **not** provisioned by the T2 Terraform baseline. Deploy it with `gcloud` (wrap it in Terraform later when a stable `google_cloud_run_v2_service` wiring is agreed for this repo):
+The control plane (`apps/control-plane`) is provisioned by Terraform
+(`infra/terraform/control-plane.tf`, issue #155) — the `gcloud run deploy`
+below is kept as the manual equivalent and rollback reference only. The
+Terraform service mirrors this step exactly: same service account, same
+`/cloudsql` socket volume, same Secret Manager refs, same env keys, startup
+probe on `/readyz` + liveness on `/livez`.
 
 ```bash
 export CP_SA_EMAIL="$(terraform -chdir=infra/terraform output -raw control_plane_service_account_email)"
@@ -609,8 +614,9 @@ repos in production) gains OAuth credentials:
    ```bash
    echo -n "$CLIENT_SECRET" | gcloud secrets versions add github-app-client-secret --data-file=-
    ```
-4. **Migrate the database.** `infra/migrations/0003_auth_sessions.sql`
-   (sessions + login flows; rollback in `0003_auth_sessions.down.sql`):
+4. **Migrate the database.** `infra/migrations/` via the runner (0001–0004;
+   0004 adds the OAuth binding column + expiry index for old-0003 databases;
+   each `.down.sql` is the manual rollback):
    ```bash
    DATABASE_URL=... bun run infra/migrations/runner.ts
    ```
@@ -635,6 +641,120 @@ Transitional posture (before #155): with OAuth configured but IAP still
 fronting, browser login works behind IAP and the CSRF Origin gate is active.
 With OAuth unconfigured, `/auth/login` + `/auth/callback` answer 503 and the
 Origin gate stays off — DO NOT expose the service publicly in that state.
+
+---
+
+## Step 6.y — Public rollout (issue #155; production E2E gate)
+
+Do this ONLY after Step 6.x is fully working behind IAP (login → session →
+workspace 401/403 behavior verified). The service switches from
+internal+LB + invoker IAM check to the internet edge with application-level
+authentication; agent-host Instances stay non-public (Invoker IAM for the
+control-plane SA only — that asymmetry is load-bearing, never relax it).
+
+Public mode uses the official recommended mechanism
+(`invoker_iam_disabled = true`,
+https://cloud.google.com/run/docs/authenticating/public) — there is NO
+`allUsers` IAM grant anywhere in this repo, so domain-restricted-sharing
+policies cannot break the rollout.
+
+Two-phase bootstrap (the service URI only exists after phase 1):
+
+### 0. Export the shared inputs once (every command below is copy-executable)
+
+```bash
+# Replace every <...> with real values. These exports serve the import, the
+# safe plan, phase 1 AND phase 2 — set them once per shell session.
+export TF_VAR_project_id="<project>"
+export TF_VAR_region="<region>"
+export TF_VAR_control_plane_image="<region>-docker.pkg.dev/<project>/agent-host/control-plane:v1"
+export TF_VAR_control_plane_github_app_id="<gh-app-id>"
+export TF_VAR_control_plane_agent_host_image="<region>-docker.pkg.dev/<project>/agent-host/agent-host:v1"
+# Only if you renamed the service (default "control-plane" matches Step 6):
+# export TF_VAR_control_plane_service_name="<custom-name>"
+```
+
+### Adoption: existing manual service vs fresh project (read first)
+
+Step 6 deploys a manual service named `control-plane` (`gcloud run deploy
+control-plane`). A phase 1 `terraform apply` (same name/project/region)
+would CREATE the same name → API 409 AlreadyExists. Pick one path BEFORE
+phase 1:
+
+- **(a) Import the manual service (recommended).** Converges it under
+  Terraform on the next apply; the URI (hence APP_ORIGIN and the GitHub
+  callback) stays unchanged. The resource uses `count`, so the address
+  carries the `[0]` index — the exports above make count 1 (without the
+  image vars, count is 0 and the address does not exist):
+
+  ```bash
+  terraform -chdir=infra/terraform import \
+    'google_cloud_run_v2_service.control_plane[0]' \
+    'projects/<project>/locations/<region>/services/control-plane'
+  # Verify state, then plan BEFORE applying (no extra flags needed — the
+  # TF_VAR exports above supply them):
+  terraform -chdir=infra/terraform state show 'google_cloud_run_v2_service.control_plane[0]' | head -20
+  terraform -chdir=infra/terraform plan
+  # Expect: no-op, or in-place updates converging manual drift (ingress, env,
+  # probes). A plan that proposes to DELETE/replace the service is a STOP
+  # signal — do not apply; reconcile the name/project/region first.
+  ```
+
+- **(b) Fresh project (no manual service).** Nothing to import: `gcloud run
+  services list` shows zero services, so phase 1 CREATEs cleanly. (Verified
+  2026-09-08: project `cloud-run-dsh`, region `asia-northeast1` lists zero
+  services — this path applies there today.)
+
+- **Never import preview Instances.** Agent-host Instances (`dsh-<uuid>`)
+  are per-workspace runtime objects owned by the application (ADR-0001) —
+  importing one would turn every workspace open into plan drift. The
+  asymmetry probe in the E2E script (AGENT_HOST_URL) checks them read-only
+  instead.
+
+```bash
+# Phase 1 — private service (defaults: public=false; inputs from the TF_VAR
+# exports above). Learn the URI.
+terraform -chdir=infra/terraform apply
+terraform -chdir=infra/terraform output -raw control_plane_service_uri
+# → https://dsh-control-abc123-uc.a.run.app  (this becomes APP_ORIGIN)
+
+# Phase 2 — out-of-band, in order:
+#   1. Secret versions (Step 6 + Step 6.x, incl. github-app-client-secret).
+#   2. GitHub App callback URL = <APP_ORIGIN>/auth/callback (exact).
+#   3. Migrations 0001–0004 (bun run infra/migrations/runner.ts).
+# Then re-apply in public mode (only the three new values are additional):
+terraform -chdir=infra/terraform apply \
+  -var='control_plane_public=true' \
+  -var='control_plane_app_origin=<URI from phase 1>' \
+  -var='control_plane_github_client_id=<Iv1…>'
+```
+
+Then verify end-to-end (acceptance list from #155 — anonymous HTML/login,
+anonymous `/v1` 401, session cookie API/SSE, foreign-Origin 403, membership +
+repo auth, open/session/message/SSE/checkpoint/stop/logout, agent-host
+anonymous denial, resource cleanup):
+
+```bash
+APP_ORIGIN=<URI> DSH_SESSION=<paste __Host-dsh_session from a logged-in browser> \
+  AGENT_HOST_URL=<instance base URL> \
+  bun run scripts/verify-issue155-e2e.ts --strict
+# --strict is REQUIRED for production acceptance: it fails fast (before
+# mutating anything) when AGENT_HOST_URL is unset, because the agent-host
+# anonymous-denial asymmetry is load-bearing. Without --strict the probe is
+# a labeled skip (ad-hoc runs only).
+# Optional: E2E_REPO_OWNER/E2E_REPO_NAME pick the create target (default mpppk/demo).
+```
+
+Rollback (any problem): `control_plane_public=false` + re-apply — ingress
+returns to internal+LB and the invoker IAM check returns, with zero app
+changes (the Origin gate follows APP_ORIGIN presence; sessions keep working
+behind IAP). The manual `gcloud run deploy` in Step 6 stays as the
+non-Terraform fallback.
+
+**#156 (IAP removal) is GATED on production E2E success above.** Do not
+delete `infra/terraform/iap.tf`, IAP IAM bindings, or IAP wording in this
+runbook until the E2E checklist passes on the public endpoint AND agent-host
+is confirmed still non-public with Invoker IAM intact.
 
 ---
 
@@ -808,6 +928,13 @@ curl -s -c "$JAR" -b "$JAR" -X POST "https://<control-plane-host>/v1/workspaces/
 ## Step 8 — Teardown (stop paying)
 
 Order matters: remove Instance-attached things first, empty the bucket, then Terraform.
+
+> Control-plane service (issue #155): it IS in Terraform state. Either
+> destroy it explicitly first (`terraform destroy
+> -target=google_cloud_run_v2_service.control_plane`) or re-apply with
+> `control_plane_deletion_protection=false` before the full destroy —
+> otherwise deletion protection (default `true`) fails the destroy and
+> billing does NOT stop.
 
 ```bash
 # 1. Delete EVERY Cloud Run Instance you (or the control plane) created.
