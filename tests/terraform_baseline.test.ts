@@ -470,6 +470,20 @@ describe("issue #155: control-plane service with fail-closed public gate", () =>
     // Exact import address with the count index (the resource uses count).
     expect(c).toContain("google_cloud_run_v2_service.control_plane[0]");
     expect(c).toContain("projects/<project>/locations/<region>/services/control-plane");
+    // The import/plan commands must be truly copy-executable: no "[... same
+    // flags ...]" ellipses anywhere in the runbook, and the shared TF_VAR
+    // exports (project, region, plus the three phase-1 values that make
+    // count=1) must be spelled out.
+    expect(c).not.toMatch(/\[\.\.\. same/);
+    for (const name of [
+      "TF_VAR_project_id",
+      "TF_VAR_region",
+      "TF_VAR_control_plane_image",
+      "TF_VAR_control_plane_github_app_id",
+      "TF_VAR_control_plane_agent_host_image",
+    ]) {
+      expect(c).toContain(`export ${name}=`);
+    }
     // Fresh-project path and the stop signal on replace plans.
     expect(c).toMatch(/Fresh project/i);
     expect(c).toMatch(/DELETE\/replace/i);

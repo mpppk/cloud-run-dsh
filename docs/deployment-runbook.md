@@ -660,27 +660,41 @@ policies cannot break the rollout.
 
 Two-phase bootstrap (the service URI only exists after phase 1):
 
+### 0. Export the shared inputs once (every command below is copy-executable)
+
+```bash
+# Replace every <...> with real values. These exports serve the import, the
+# safe plan, phase 1 AND phase 2 — set them once per shell session.
+export TF_VAR_project_id="<project>"
+export TF_VAR_region="<region>"
+export TF_VAR_control_plane_image="<region>-docker.pkg.dev/<project>/agent-host/control-plane:v1"
+export TF_VAR_control_plane_github_app_id="<gh-app-id>"
+export TF_VAR_control_plane_agent_host_image="<region>-docker.pkg.dev/<project>/agent-host/agent-host:v1"
+# Only if you renamed the service (default "control-plane" matches Step 6):
+# export TF_VAR_control_plane_service_name="<custom-name>"
+```
+
 ### Adoption: existing manual service vs fresh project (read first)
 
 Step 6 deploys a manual service named `control-plane` (`gcloud run deploy
-control-plane`). Phase 1 `terraform apply` with the default
-`control_plane_service_name = "control-plane"` (same project/region) would
-CREATE the same name → API 409 AlreadyExists. Pick one path BEFORE phase 1:
+control-plane`). A phase 1 `terraform apply` (same name/project/region)
+would CREATE the same name → API 409 AlreadyExists. Pick one path BEFORE
+phase 1:
 
 - **(a) Import the manual service (recommended).** Converges it under
   Terraform on the next apply; the URI (hence APP_ORIGIN and the GitHub
   callback) stays unchanged. The resource uses `count`, so the address
-  carries the `[0]` index — set the image vars first (otherwise count is 0
-  and the address does not exist):
+  carries the `[0]` index — the exports above make count 1 (without the
+  image vars, count is 0 and the address does not exist):
 
   ```bash
-  # Same vars phase 1 needs (image/App/agent-host image), then import:
   terraform -chdir=infra/terraform import \
     'google_cloud_run_v2_service.control_plane[0]' \
     'projects/<project>/locations/<region>/services/control-plane'
-  # Verify state, then plan BEFORE applying:
+  # Verify state, then plan BEFORE applying (no extra flags needed — the
+  # TF_VAR exports above supply them):
   terraform -chdir=infra/terraform state show 'google_cloud_run_v2_service.control_plane[0]' | head -20
-  terraform -chdir=infra/terraform plan [... same -var flags as phase 1 ...]
+  terraform -chdir=infra/terraform plan
   # Expect: no-op, or in-place updates converging manual drift (ingress, env,
   # probes). A plan that proposes to DELETE/replace the service is a STOP
   # signal — do not apply; reconcile the name/project/region first.
@@ -698,11 +712,9 @@ CREATE the same name → API 409 AlreadyExists. Pick one path BEFORE phase 1:
   instead.
 
 ```bash
-# Phase 1 — private service (defaults: public=false). Learn the URI.
-terraform -chdir=infra/terraform apply \
-  -var='control_plane_image=<region>-docker.pkg.dev/<project>/agent-host/control-plane:v1' \
-  -var='control_plane_github_app_id=<gh-app-id>' \
-  -var='control_plane_agent_host_image=<region>-docker.pkg.dev/<project>/agent-host/agent-host:v1'
+# Phase 1 — private service (defaults: public=false; inputs from the TF_VAR
+# exports above). Learn the URI.
+terraform -chdir=infra/terraform apply
 terraform -chdir=infra/terraform output -raw control_plane_service_uri
 # → https://dsh-control-abc123-uc.a.run.app  (this becomes APP_ORIGIN)
 
@@ -710,11 +722,11 @@ terraform -chdir=infra/terraform output -raw control_plane_service_uri
 #   1. Secret versions (Step 6 + Step 6.x, incl. github-app-client-secret).
 #   2. GitHub App callback URL = <APP_ORIGIN>/auth/callback (exact).
 #   3. Migrations 0001–0004 (bun run infra/migrations/runner.ts).
-# Then re-apply in public mode:
+# Then re-apply in public mode (only the three new values are additional):
 terraform -chdir=infra/terraform apply \
   -var='control_plane_public=true' \
   -var='control_plane_app_origin=<URI from phase 1>' \
-  -var='control_plane_github_client_id=<Iv1…>' [... same image/App vars ...]
+  -var='control_plane_github_client_id=<Iv1…>'
 ```
 
 Then verify end-to-end (acceptance list from #155 — anonymous HTML/login,
