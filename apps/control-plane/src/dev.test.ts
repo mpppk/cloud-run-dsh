@@ -12,6 +12,7 @@ import {
   isDevLeaseHeartbeatRunning,
 } from "./dev.js";
 import { startControlPlane, type RunningControlPlane } from "./server.js";
+import { SESSION_COOKIE_NAME } from "./index.js";
 import type { ControlPlaneDeps } from "./index.js";
 
 describe("dev composition (src/dev.ts)", () => {
@@ -30,11 +31,21 @@ describe("dev composition (src/dev.ts)", () => {
     server.stop();
   });
 
-  function iap(user: string): Record<string, string> {
-    return {
-      "x-goog-authenticated-user-id": `accounts.google.com:${user}`,
-      "x-goog-authenticated-user-email": `${user}@example.com`,
-    };
+  const __sessTokens = new Map<string, string>();
+  async function sess(user: string): Promise<Record<string, string>> {
+    // Issue #152: session-cookie authentication. One server-side session
+    // per test user (numeric GitHub ids); the raw token travels as a cookie.
+    let raw = __sessTokens.get(user);
+    if (!raw) {
+      const numericId = new Map([["alice", 1], ["bob", 2], ["carol", 3]]).get(user) ?? 9999;
+      const created = await deps.sessions.createSession(
+        { id: `github:${numericId}`, provider: "github", providerUserId: String(numericId), login: user },
+        new Date(),
+      );
+      raw = created.rawToken;
+      __sessTokens.set(user, raw);
+    }
+    return { cookie: `${SESSION_COOKIE_NAME}=${raw}` };
   }
 
   /** Polls GET until runtimeState matches (or the deadline passes). Returns the last seen state. */
@@ -42,7 +53,7 @@ describe("dev composition (src/dev.ts)", () => {
     const deadline = Date.now() + timeoutMs;
     let seen = "";
     for (;;) {
-      const read = await fetch(`${base}/v1/workspaces/${workspaceId}`, { headers: iap("alice") });
+      const read = await fetch(`${base}/v1/workspaces/${workspaceId}`, { headers: await sess("alice") });
       expect(read.status).toBe(200);
       seen = ((await read.json()) as { runtimeState: string }).runtimeState;
       if (seen === want || Date.now() > deadline) return seen;
@@ -65,16 +76,16 @@ describe("dev composition (src/dev.ts)", () => {
   test("create + open workspace succeeds for the owner (issue #136: 202 STARTING, then READY)", async () => {
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo", baseBranch: "main" }),
     });
     expect(created.status).toBe(201);
     const ws = (await created.json()) as { id: string; ownerId: string };
-    expect(ws.ownerId).toBe("alice");
+    expect(ws.ownerId).toBe("github:1");
 
     const opened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({}),
     });
     expect(opened.status).toBe(202);
@@ -87,7 +98,7 @@ describe("dev composition (src/dev.ts)", () => {
   test("403 for a non-member", async () => {
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("bob") },
+      headers: { "content-type": "application/json", ...(await sess("bob")) },
       body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
     });
     expect(created.status).toBe(201);
@@ -96,7 +107,7 @@ describe("dev composition (src/dev.ts)", () => {
     // carol is a known identity (dev resolves any IAP identity) but not a member.
     const res = await fetch(`${base}/v1/workspaces/${ws.id}`, {
       method: "GET",
-      headers: iap("carol"),
+      headers: await sess("carol"),
     });
     expect(res.status).toBe(403);
     const body = await res.json();
@@ -106,14 +117,14 @@ describe("dev composition (src/dev.ts)", () => {
   test("409 for an observer (member without the controller lease) posting a message", async () => {
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
     });
     const ws = (await created.json()) as { id: string };
 
     const sessionRes = await fetch(`${base}/v1/workspaces/${ws.id}/sessions`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({}),
     });
     expect(sessionRes.status).toBe(201);
@@ -122,16 +133,16 @@ describe("dev composition (src/dev.ts)", () => {
     // alice acquires the controller...
     const acquired = await fetch(`${base}/v1/workspaces/${ws.id}/controller/acquire`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({}),
     });
     expect(acquired.status).toBe(200);
 
     // ...and bob, a mere member-observer, is refused with 409.
-    await deps.membership.addMember(ws.id, "bob");
+    await deps.membership.addMember(ws.id, "github:2");
     const res = await fetch(`${base}/v1/sessions/${session.id}/messages`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("bob") },
+      headers: { "content-type": "application/json", ...(await sess("bob")) },
       body: JSON.stringify({ content: "hello from an observer" }),
     });
     expect(res.status).toBe(409);
@@ -142,7 +153,7 @@ describe("dev composition (src/dev.ts)", () => {
   test("open walks STARTING -> READY: GET and repo.getWorkspace agree (issues #131/#136)", async () => {
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
     });
     expect(created.status).toBe(201);
@@ -150,13 +161,13 @@ describe("dev composition (src/dev.ts)", () => {
 
     const opened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({}),
     });
     expect(opened.status).toBe(202);
     expect((await opened.json()).state).toBe("STARTING");
 
-    const read = await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: iap("alice") });
+    const read = await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: await sess("alice") });
     expect(read.status).toBe(200);
     expect((await read.json()).runtimeState).toBe("STARTING");
 
@@ -167,7 +178,7 @@ describe("dev composition (src/dev.ts)", () => {
   test("stop persists STOPPED: GET and repo.getWorkspace agree (issue #131)", async () => {
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
     });
     expect(created.status).toBe(201);
@@ -175,20 +186,20 @@ describe("dev composition (src/dev.ts)", () => {
 
     const opened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({}),
     });
     expect(opened.status).toBe(202);
 
     const stopped = await fetch(`${base}/v1/workspaces/${ws.id}/stop`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({}),
     });
     expect(stopped.status).toBe(200);
     expect((await stopped.json()).state).toBe("STOPPED");
 
-    const read = await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: iap("alice") });
+    const read = await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: await sess("alice") });
     expect(read.status).toBe(200);
     expect((await read.json()).runtimeState).toBe("STOPPED");
     expect((await deps.repo.getWorkspace(ws.id))?.runtimeState).toBe("STOPPED");
@@ -204,7 +215,7 @@ describe("dev composition (src/dev.ts)", () => {
     // STARTING (and must not arm a second READY timer behind it).
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
     });
     expect(created.status).toBe(201);
@@ -212,7 +223,7 @@ describe("dev composition (src/dev.ts)", () => {
 
     const opened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({}),
     });
     expect(opened.status).toBe(202);
@@ -220,13 +231,13 @@ describe("dev composition (src/dev.ts)", () => {
 
     const reopened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({}),
     });
     expect(reopened.status).toBe(200);
     expect((await reopened.json()).state).toBe("READY");
     // The row never left READY — not even transiently.
-    const read = await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: iap("alice") });
+    const read = await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: await sess("alice") });
     expect((await read.json()).runtimeState).toBe("READY");
     await Bun.sleep(500);
     expect((await deps.repo.getWorkspace(ws.id))?.runtimeState).toBe("READY");
@@ -242,7 +253,7 @@ describe("dev composition (src/dev.ts)", () => {
   test("open arms the lease heartbeat; re-open keeps it; stop clears it", async () => {
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo" }),
     });
     expect(created.status).toBe(201);
@@ -251,7 +262,7 @@ describe("dev composition (src/dev.ts)", () => {
 
     const opened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({}),
     });
     expect(opened.status).toBe(202);
@@ -262,7 +273,7 @@ describe("dev composition (src/dev.ts)", () => {
     // holder's lease still needs its dev stand-in renewal).
     const reopened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({}),
     });
     expect(reopened.status).toBe(200);
@@ -272,7 +283,7 @@ describe("dev composition (src/dev.ts)", () => {
     // rule as the production loop's isStopped self-stop).
     const stopped = await fetch(`${base}/v1/workspaces/${ws.id}/stop`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json", ...(await sess("alice")) },
       body: JSON.stringify({}),
     });
     expect(stopped.status).toBe(200);

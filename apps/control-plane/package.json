@@ -9,6 +9,7 @@
     "@cloud-run-dsh/cloud-run-instance-client": "workspace:*",
     "@cloud-run-dsh/controller-lease": "workspace:*",
     "@cloud-run-dsh/gcp-token-provider": "workspace:*",
+    "@cloud-run-dsh/github-credential-broker": "workspace:*",
     "@cloud-run-dsh/observability": "workspace:*",
     "@cloud-run-dsh/session-persistence-postgres": "workspace:*",
     "@cloud-run-dsh/workspace-checkpoint": "workspace:*",

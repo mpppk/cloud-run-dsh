@@ -1,10 +1,11 @@
 // Bun HTTP server (実装手順書 section 24: listen on 0.0.0.0:$PORT).
 // No heavyweight framework — a small pattern router over Bun.serve.
 
-import { authenticate } from "./auth.js";
-import type { InternalUser } from "./auth.js";
+import { authenticateSession } from "./auth-session.js";
+import type { AuthenticatedUser } from "./auth.js";
 import type { ControlPlaneDeps } from "./deps.js";
-import { ApiError, badRequest, internalError, notFound } from "./errors.js";
+import { handleAuthCallback, handleAuthLogin, handleAuthLogout, handleAuthSession } from "./auth-github.js";
+import { ApiError, badRequest, forbidden, internalError, notFound } from "./errors.js";
 import type { Logger } from "@cloud-run-dsh/observability";
 import { describeError, newErrorId } from "@cloud-run-dsh/observability";
 import * as handlers from "./handlers.js";
@@ -76,6 +77,59 @@ function match(
     if (matched) return { handler: route.handler, params };
   }
   return null;
+}
+
+/**
+ * Issue #153: state-changing request hardening for the cookie-authenticated
+ * control plane.
+ *
+ * The session cookie is sent automatically by browsers, so every mutation
+ * needs CSRF defense. Same-origin JSON API is the entire client model
+ * (no third-party web clients — no CORS), so the defense is:
+ *
+ * 1. Strict Origin validation: mutations require `Origin === APP_ORIGIN`
+ *    (exact match). Missing / "null" / foreign origins are 403. The Host
+ *    header is NEVER a trust anchor, and there is no Referer fallback.
+ *    Enforced only when APP_ORIGIN is configured (deps.oauth.appOrigin):
+ *    pre-#155 IAP-fronted deployments without OAuth config keep working,
+ *    while every OAuth-configured (hence public-bound) deployment is
+ *    gated. GET/HEAD are never state-changing and are exempt, as are the
+ *    OAuth flow routes (GET /auth/login initiates; GET /auth/callback is a
+ *    cross-site redirect by design, protected by state + PKCE instead).
+ * 2. JSON content-type enforcement: a mutation carrying a non-JSON
+ *    content-type (urlencoded / text/plain — what a plain HTML form can
+ *    send) is 400. A missing content-type is allowed only for an empty
+ *    body; anything else is 400. (Route-level parseJsonBody re-checks for
+ *    body-carrying routes; this gate closes the empty-body form hole.)
+ */
+const MUTATION_METHODS: ReadonlySet<string> = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+function isMutationTarget(pathname: string): boolean {
+  return pathname === "/auth/logout" || pathname === "/v1" || pathname.startsWith("/v1/");
+}
+
+function checkMutationGuards(request: Request, appOrigin: string | undefined): void {
+  if (!MUTATION_METHODS.has(request.method) || !isMutationTarget(new URL(request.url).pathname)) {
+    return;
+  }
+  if (appOrigin !== undefined) {
+    // Exact match only. `URL` parsing is deliberately NOT used: normalizing
+    // here could admit equivalent-but-different origins through the gate.
+    if (request.headers.get("origin") !== appOrigin) {
+      throw forbidden("cross-origin request refused");
+    }
+  }
+  const contentType = request.headers.get("content-type");
+  if (contentType !== null) {
+    if (!contentType.toLowerCase().includes("application/json")) {
+      throw badRequest("content-type must be application/json");
+    }
+  } else {
+    const length = request.headers.get("content-length");
+    if (length !== null && length.trim() !== "" && length.trim() !== "0") {
+      throw badRequest("content-type must be application/json");
+    }
+  }
 }
 
 function errorResponse(status: number, code: string, message: string): Response {
@@ -180,7 +234,7 @@ export function errorContextFromRequest(
   method: string,
   pathname: string | undefined,
   params: Record<string, string> | undefined,
-  user: InternalUser | undefined,
+  user: AuthenticatedUser | undefined,
 ): ErrorLogContext {
   const ctx: Record<string, string> = {};
   if (method) ctx["method"] = method;
@@ -198,7 +252,7 @@ export function createFetchHandler(deps: ControlPlaneDeps): (request: Request) =
   return async (request: Request): Promise<Response> => {
     // Recovered on the failure path for the unexpected-error log (issue #48).
     let pathname: string | undefined;
-    let user: InternalUser | undefined;
+    let user: AuthenticatedUser | undefined;
     let params: Record<string, string> | undefined;
     try {
       const url = new URL(request.url);
@@ -241,34 +295,66 @@ export function createFetchHandler(deps: ControlPlaneDeps): (request: Request) =
       if (url.pathname === "/readyz" && request.method === "GET") {
         const report = await deps.readiness?.();
         if (report && !report.ready) {
-          return new Response(
-            JSON.stringify({ status: "not_ready", reason: report.reason }),
-            { status: 503, headers: { "content-type": "application/json; charset=utf-8" } },
-          );
+          // Issue #153: the public body is a FIXED string. /readyz is served
+          // before auth, so per-probe reasons (hostnames, SQL errors,
+          // secret-adjacent config) must never reach the prober — details go
+          // to the structured log only.
+          deps.logger?.error("readyz.not_ready", { reason: report.reason ?? "unknown" });
+          return new Response(JSON.stringify({ status: "not_ready" }), {
+            status: 503,
+            headers: { "content-type": "application/json; charset=utf-8" },
+          });
         }
         return new Response(JSON.stringify({ status: "ready" }), {
           headers: { "content-type": "application/json; charset=utf-8" },
         });
       }
 
+      // Issue #153: CSRF / content-type gates for mutations. Runs before the
+      // auth routes (POST /auth/logout is a mutation) and before session
+      // authentication: a forged cross-site request is refused without
+      // touching the session store.
+      checkMutationGuards(request, deps.oauth?.appOrigin);
+
       const pathSegments = url.pathname.split("/").filter((s) => s.length > 0);
 
-      // Debug Web UI (issue #128): static files served BEFORE authentication,
-      // next to /livez and /readyz. A browser navigation cannot attach custom
-      // headers, so requiring IAP headers on the HTML itself would make the
-      // screen unopenable locally. In production IAP in front of Cloud Run
-      // protects the HTML together with the API. The files are an empty
-      // screen with no data; /v1/* authentication is unchanged. The
-      // allowlist (static.ts) only matches exact UI paths, so unknown routes
-      // still fall through to authenticate() and keep their 401/404 behavior.
+      // Debug Web UI (issue #128) + product UI (#138): static files served
+      // BEFORE authentication, next to /livez and /readyz. A browser
+      // navigation cannot attach credentials selectively, so the HTML shell
+      // itself is public (issue #152 route policy: static HTML carries no
+      // data; every API datum / action behind /v1/* requires a session).
+      // The files are an empty screen with no data; /v1/* authentication is
+      // unchanged. The allowlist (static.ts) only matches exact UI paths, so
+      // unknown routes still fall through to authenticateSession() and keep
+      // their 401/404 behavior.
       // Serving these files never calls recordActivity (仕様書 section 11).
       if (request.method === "GET" || request.method === "HEAD") {
         const staticResponse = await serveStaticFile(request.method, url.pathname);
         if (staticResponse) return staticResponse;
       }
 
-      // 1. Authentication: IAP identity -> internal user (仕様書 section 21).
-      user = await authenticate(request.headers, deps);
+      // GitHub OAuth + session endpoints (issue #151): public auth routes
+      // served BEFORE request authentication. /auth/logout and
+      // /auth/session authenticate via the session cookie themselves
+      // (CSRF policy for the mutation lands in #153).
+      if (url.pathname === "/auth/login" && request.method === "GET") {
+        return await handleAuthLogin(request, deps);
+      }
+      if (url.pathname === "/auth/callback" && request.method === "GET") {
+        return await handleAuthCallback(request, deps);
+      }
+      if (url.pathname === "/auth/logout" && request.method === "POST") {
+        return await handleAuthLogout(request, deps);
+      }
+      if (url.pathname === "/auth/session" && request.method === "GET") {
+        return await handleAuthSession(request, deps);
+      }
+
+      // 1. Authentication: session cookie -> internal user (issue #152).
+      // IAP headers are never consulted: they authenticate nothing on this
+      // path (an attacker can set arbitrary request headers; only the
+      // server-side session counts).
+      user = await authenticateSession(request, deps);
 
       const found = match(request.method, pathSegments);
       if (!found) {

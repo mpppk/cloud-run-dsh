@@ -20,10 +20,17 @@ import {
   FetchGcsClient,
   SqlTransactionalStateStore,
   createAuthenticatedInstanceTransport,
+  createBrokerHttpTransport,
   createDbReadinessProbe,
   createGcpAccessTokenProvider,
 } from "./prod-adapters.js";
 import { HttpAgentHostForwarder, createIdTokenProvider } from "./forwarding.js";
+import {
+  createGitHubCredentialBroker,
+  createRepositoryAuthorizer,
+} from "@cloud-run-dsh/github-credential-broker";
+import { FetchGitHubUserAuthClient } from "./auth-github.js";
+import { PostgresSessionStore } from "./auth-session.js";
 import { OwnerMembershipStore } from "./prod-adapters.js";
 import { createProductionRuntimeRegistry } from "./runtime-factory.js";
 import { startStoppedInstanceSweeper } from "./instance-gc.js";
@@ -78,6 +85,35 @@ async function main(): Promise<void> {
       clock,
     }),
     membership: new OwnerMembershipStore(executor),
+    // Issue #150: server-side sessions in Cloud SQL (SHA-256 hashes only).
+    sessions: new PostgresSessionStore(executor),
+    // Issue #154: workspace creation verifies the caller's repository
+    // permission through the GitHub App (installation token, short-lived,
+    // never persisted). Shares the App id + private key the Instances use
+    // for cloning — no new credential.
+    repositoryAuthorizer: createRepositoryAuthorizer({
+      broker: createGitHubCredentialBroker({
+        secretProvider: async () => ({
+          appId: config.githubAppId,
+          privateKeyPem: config.githubAppPrivateKeyPem,
+        }),
+        transport: createBrokerHttpTransport(),
+      }),
+      transport: createBrokerHttpTransport(),
+    }),
+    // Issue #151: GitHub OAuth login. Absent when APP_ORIGIN /
+    // GITHUB_APP_CLIENT_ID / GITHUB_APP_CLIENT_SECRET are unset — the
+    // /auth/* routes then answer 503 until the #155 cutover config lands.
+    ...(config.appOrigin && config.githubAppClientId && config.githubAppClientSecret
+      ? {
+          oauth: {
+            appOrigin: config.appOrigin,
+            githubClientId: config.githubAppClientId,
+            githubClientSecret: config.githubAppClientSecret,
+          },
+          githubAuth: new FetchGitHubUserAuthClient(),
+        }
+      : {}),
     runtimes,
     clock,
     logger,

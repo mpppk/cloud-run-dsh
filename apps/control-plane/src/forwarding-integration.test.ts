@@ -22,6 +22,7 @@ import {
   createFetchHandler,
   InMemoryMembershipStore,
   RuntimeRegistry,
+  SESSION_COOKIE_NAME,
   SystemClock,
   type WorkspaceRuntimeHandle,
 } from "./index.js";
@@ -89,10 +90,9 @@ describe("control-plane -> agent-host forwarding over HTTP (issue #22)", () => {
     });
     const logger = new InMemoryLogger();
     const deps = createControlPlaneDeps({
-      resolveUser: async (identity) =>
-        identity.subject === "alice"
-          ? { id: "alice", email: "alice@example.com" }
-          : null,
+      // Legacy IAP seam: unused on the request path since #152
+      // (session-cookie authentication); kept for the seam type.
+      resolveUser: async () => null,
       repo,
       leases,
       membership,
@@ -110,10 +110,15 @@ describe("control-plane -> agent-host forwarding over HTTP (issue #22)", () => {
     let ahServer: { stop: (closeActiveConnections?: boolean) => void; url: URL } | null =
       null;
     try {
-      const cpFetch = (user: string, path: string, init: RequestInit = {}) => {
+      // Issue #152: session-cookie authentication. Alice holds a
+      // server-side session (github:1); the raw token travels as a cookie.
+      const aliceSession = await deps.sessions.createSession(
+        { id: "github:1", provider: "github", providerUserId: "1", login: "alice" },
+        new Date(),
+      );
+      const cpFetch = (_user: string, path: string, init: RequestInit = {}) => {
         const headers = new Headers(init.headers);
-        headers.set("x-goog-authenticated-user-id", `accounts.google.com:${user}`);
-        headers.set("x-goog-authenticated-user-email", `${user}@example.com`);
+        headers.set("cookie", `${SESSION_COOKIE_NAME}=${aliceSession.rawToken}`);
         return fetch(`${cpServer.url.origin}${path}`, { ...init, headers });
       };
 
@@ -141,8 +146,8 @@ describe("control-plane -> agent-host forwarding over HTTP (issue #22)", () => {
         fetch: (req) => {
           seenHeaders.push({
             authorization: req.headers.get("authorization"),
-            email: req.headers.get("x-goog-authenticated-user-email"),
-            userId: req.headers.get("x-goog-authenticated-user-id"),
+            email: req.headers.get("x-dsh-user-login"),
+            userId: req.headers.get("x-dsh-user-id"),
           });
           return th.host.gateway.handle(req);
         },
@@ -196,8 +201,8 @@ describe("control-plane -> agent-host forwarding over HTTP (issue #22)", () => {
       // Auth crossed the wire: invoker ID token + caller identity.
       expect(seenHeaders).toHaveLength(1);
       expect(seenHeaders[0]!.authorization).toBe("Bearer test-id-token");
-      expect(seenHeaders[0]!.email).toBe("alice@example.com");
-      expect(seenHeaders[0]!.userId).toBe("accounts.google.com:alice");
+      expect(seenHeaders[0]!.email).toBe("alice");
+      expect(seenHeaders[0]!.userId).toBe("github:1");
 
       // Delivery is traceable in the control-plane log (no secrets).
       expect(
@@ -226,10 +231,9 @@ describe("control-plane -> agent-host forwarding over HTTP (issue #22)", () => {
     });
     const logger = new InMemoryLogger();
     const deps = createControlPlaneDeps({
-      resolveUser: async (identity) =>
-        identity.subject === "alice"
-          ? { id: "alice", email: "alice@example.com" }
-          : null,
+      // Legacy IAP seam: unused on the request path since #152
+      // (session-cookie authentication); kept for the seam type.
+      resolveUser: async () => null,
       repo,
       leases,
       membership,
@@ -246,10 +250,15 @@ describe("control-plane -> agent-host forwarding over HTTP (issue #22)", () => {
     let ahServer: { stop: (closeActiveConnections?: boolean) => void; url: URL } | null =
       null;
     try {
-      const cpFetch = (user: string, path: string, init: RequestInit = {}) => {
+      // Issue #152: session-cookie authentication. Alice holds a
+      // server-side session (github:1); the raw token travels as a cookie.
+      const aliceSession = await deps.sessions.createSession(
+        { id: "github:1", provider: "github", providerUserId: "1", login: "alice" },
+        new Date(),
+      );
+      const cpFetch = (_user: string, path: string, init: RequestInit = {}) => {
         const headers = new Headers(init.headers);
-        headers.set("x-goog-authenticated-user-id", `accounts.google.com:${user}`);
-        headers.set("x-goog-authenticated-user-email", `${user}@example.com`);
+        headers.set("cookie", `${SESSION_COOKIE_NAME}=${aliceSession.rawToken}`);
         return fetch(`${cpServer.url.origin}${path}`, { ...init, headers });
       };
 

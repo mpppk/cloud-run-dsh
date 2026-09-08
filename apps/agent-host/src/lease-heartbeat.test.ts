@@ -16,7 +16,7 @@ function request(
   return new Request(`http://localhost:8080${path}`, { method, headers });
 }
 
-const IAP = { "x-goog-authenticated-user-email": "user@example.com" };
+const IAP = { "x-dsh-user-id": "github:1", "x-dsh-user-login": "alice" };
 
 /** Flushes the async heartbeat ticks scheduled by the last clock advance. */
 async function flushTicks(): Promise<void> {

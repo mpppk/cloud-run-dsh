@@ -185,6 +185,16 @@ resource "google_secret_manager_secret_iam_member" "control_plane_database_url" 
   member    = "serviceAccount:${google_service_account.control_plane.email}"
 }
 
+# Control plane needs the GitHub App OAuth client secret for the #151 login
+# code exchange (GITHUB_APP_CLIENT_SECRET env via --set-secrets). Scoped to
+# the control-plane SA only — the agent host never sees it.
+resource "google_secret_manager_secret_iam_member" "control_plane_github_client_secret" {
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.github_app_client_secret.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.control_plane.email}"
+}
+
 # --- Control plane only: Cloud Run admin ----------------------------------
 # Needed to create/start/stop/delete Cloud Run Instances (spec §2, §27-29).
 # Narrow to run.developer if the organisation forbids run.admin.

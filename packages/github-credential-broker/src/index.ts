@@ -335,6 +335,222 @@ export function assertNoTokenInValue(value: string, token?: string): void {
 }
 
 // ---------------------------------------------------------------------------
+// Repository authorization (issue #154) — "may this GitHub user read this repo?"
+//
+// GitHub user access tokens are NEVER persisted, so authorization reuses the
+// App's installation token (short-lived, memory-only, handed to exactly one
+// operation via withInstallationToken) to ask GitHub what permission the
+// logged-in user holds on the repository:
+//
+//   GET /repos/{owner}/{repo}/collaborators/{username}/permission
+//     -> { permission: "admin" | "maintain" | "write" | "triage" | "read" }
+//
+// Read or above authorizes. Anything else — 404 (repo unknown, App not
+// installed, or user without access: deliberately ONE bucket so the answer
+// never oracles private-repo existence), permission "none" — denies.
+//
+// Endpoint semantics re-verified against the GitHub REST docs while writing
+// this (2026-09): the collaborator-permission endpoint answers 200 with the
+// permission for users WITH access and 404 otherwise; it accepts an
+// installation access token when the App has Contents: read (this App
+// already clones, so it does). Transient transport/5xx failures throw
+// RepositoryAuthorizerTransientError (the caller maps to 502/503, distinct
+// from a deny); malformed coordinates throw RepositoryInputError (400).
+// ---------------------------------------------------------------------------
+
+/** Failure to reach GitHub or an unexpected GitHub answer: retryable, NOT a deny. */
+export class RepositoryAuthorizerTransientError extends Error {
+  override readonly name = "RepositoryAuthorizerTransientError";
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+/** Malformed repository coordinates: caller error, never sent to GitHub. */
+export class RepositoryInputError extends Error {
+  override readonly name = "RepositoryInputError";
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+export interface RepositoryPermissionInput {
+  readonly owner: string;
+  readonly repo: string;
+  /** Stable identity: GitHub numeric user id (authorization key). */
+  readonly githubUserId: string;
+  /**
+   * Current GitHub login. Required as API INPUT by the
+   * collaborators/permission endpoint; it is a profile attribute, never the
+   * authorization key.
+   */
+  readonly githubLogin: string;
+}
+
+export interface RepositoryAuthorizer {
+  /**
+   * Resolves true when the user holds read-or-above permission AND the App
+   * installation can see the repository. False for every deny shape
+   * (unknown repo / App not installed / permission below read) — callers
+   * must map all falses to ONE response so existence never leaks.
+   */
+  canReadRepository(input: RepositoryPermissionInput): Promise<boolean>;
+}
+
+const OWNER_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+const REPO_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
+
+/**
+ * Validates repository coordinates BEFORE any network call. Throws
+ * RepositoryInputError (caller maps to 400). The patterns mirror GitHub's
+ * own naming rules (owner ≤ 39 chars, repo ≤ 100) and reject path
+ * trickery (.., /, %, whitespace) by construction.
+ */
+export function validateRepositoryCoordinates(owner: string, repo: string): void {
+  if (!OWNER_PATTERN.test(owner)) {
+    throw new RepositoryInputError(
+      `invalid repository owner (want 1-39 chars of [A-Za-z0-9-], not leading/trailing '-')`,
+    );
+  }
+  if (!REPO_PATTERN.test(repo) || repo === "." || repo === "..") {
+    throw new RepositoryInputError(
+      `invalid repository name (want 1-100 chars of [A-Za-z0-9_.-])`,
+    );
+  }
+}
+
+/** Permission levels at or above read (GitHub may add more; unknown levels deny). */
+const SUFFICIENT_PERMISSIONS: ReadonlySet<string> = new Set([
+  "admin",
+  "maintain",
+  "write",
+  "triage",
+  "read",
+]);
+
+export interface RepositoryAuthorizerOptions {
+  /** Token source: signing + installation-token issuance are reused, never duplicated. */
+  readonly broker: {
+    withInstallationToken<T>(repository: Repository, fn: (token: string) => Promise<T>): Promise<T>;
+  };
+  readonly transport: HttpTransport;
+  /** GitHub API base URL (default https://api.github.com) */
+  readonly apiBaseUrl?: string;
+  /** Per-call timeout in ms (default 10000). A hanging GitHub must not hang workspace creation. */
+  readonly timeoutMs?: number;
+}
+
+export function createRepositoryAuthorizer(options: RepositoryAuthorizerOptions): RepositoryAuthorizer {
+  const apiBase = (options.apiBaseUrl ?? "https://api.github.com").replace(/\/+$/, "");
+  const timeoutMs = options.timeoutMs ?? 10_000;
+
+  async function permissionLevel(
+    token: string,
+    url: string,
+  ): Promise<{ status: number; permission?: string }> {
+    let res: HttpResponse;
+    try {
+      res = await Promise.race([
+        options.transport({
+          method: "GET",
+          url,
+          headers: {
+            // The live installation token. Transports MUST NOT log headers
+            // or echo them into errors — the token lives only in this
+            // request and is dropped with the withInstallationToken scope.
+            Authorization: `Bearer ${token}`,
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+          },
+        }),
+        new Promise<never>((_, reject) => {
+          setTimeout(
+            () =>
+              reject(
+                new RepositoryAuthorizerTransientError(
+                  `GitHub permission lookup timed out after ${timeoutMs}ms`,
+                ),
+              ),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } catch (e) {
+      if (e instanceof RepositoryAuthorizerTransientError) throw e;
+      throw new RepositoryAuthorizerTransientError(
+        `GitHub permission lookup failed: ${e instanceof Error ? e.message.slice(0, 120) : "unreachable"}`,
+      );
+    }
+    // Drain-or-discard discipline: the body is NEVER stored, logged, or
+    // echoed — only the status and (on 200) the parsed permission level
+    // leave this function.
+    if (res.status !== 200) {
+      return { status: res.status };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(res.body) as unknown;
+    } catch {
+      throw new RepositoryAuthorizerTransientError("GitHub permission lookup answered non-JSON");
+    }
+    const permission =
+      typeof parsed === "object" && parsed !== null
+        ? (parsed as Record<string, unknown>)["permission"]
+        : undefined;
+    return typeof permission === "string" ? { status: 200, permission } : { status: 200 };
+  }
+
+  return {
+    async canReadRepository(input: RepositoryPermissionInput): Promise<boolean> {
+      validateRepositoryCoordinates(input.owner, input.repo);
+      if (!input.githubLogin || !input.githubUserId) {
+        throw new RepositoryInputError("github user identity is required");
+      }
+      const url =
+        `${apiBase}/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}` +
+        `/collaborators/${encodeURIComponent(input.githubLogin)}/permission`;
+      // The installation token lives only inside this callback (scoped
+      // injection — see withInstallationToken): it authenticates ONE GitHub
+      // call and is then dropped. It is never written to the database,
+      // never logged, never embedded in an error. The permission lookup
+      // itself runs over the injected options.transport (same seam the
+      // broker uses for issuance), race-guarded by timeoutMs.
+      let outcome: { status: number; permission?: string };
+      try {
+        outcome = await options.broker.withInstallationToken(
+          { owner: input.owner, name: input.repo },
+          async (token) => permissionLevel(token, url),
+        );
+      } catch (e) {
+        if (e instanceof RepositoryAuthorizerTransientError) throw e;
+        if (e instanceof RepositoryInputError) throw e;
+        // Token issuance failures (App not installed, JWT rejected, GitHub
+        // 5xx on the token endpoints): issuance and lookup share the "GitHub
+        // is not answering normally" bucket. EXCEPTION: a clean
+        // installation-resolution 404 means "App has no access" — a DENY,
+        // not a transient. The broker reports it as
+        // "Failed to resolve installation ...: 404 ...".
+        if (e instanceof Error && /:\s*404(\s|$)/.test(e.message)) {
+          return false;
+        }
+        throw new RepositoryAuthorizerTransientError(
+          `GitHub authorization check failed: ${e instanceof Error ? e.message.slice(0, 120) : "unreachable"}`,
+        );
+      }
+      if (outcome.status === 404) return false;
+      if (outcome.status !== 200) {
+        throw new RepositoryAuthorizerTransientError(
+          `GitHub permission lookup answered ${outcome.status}`,
+        );
+      }
+      return (
+        typeof outcome.permission === "string" && SUFFICIENT_PERMISSIONS.has(outcome.permission)
+      );
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Placeholder (kept for backward compat / smoke test)
 // ---------------------------------------------------------------------------
 

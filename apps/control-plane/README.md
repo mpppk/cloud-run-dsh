@@ -66,6 +66,28 @@ docker run --rm -p 8080:8080 \
 curl -s http://localhost:8080/livez   # {"status":"ok"}
 ```
 
+## Authentication: GitHub OAuth + server-side sessions (issues #149–#154)
+
+- Internal principals are `github:<numeric-id>` (immutable) with a
+  display-only login — never emails, never IAP headers (`src/auth.ts`).
+- Browsers authenticate with the `__Host-dsh_session` cookie (opaque
+  256-bit token; only its SHA-256 is stored in `auth_sessions`,
+  `infra/migrations/0003_auth_sessions.sql`). Login is the GitHub App
+  OAuth Web flow + PKCE: `GET /auth/login` → `GET /auth/callback` →
+  `POST /auth/logout`, `GET /auth/session` (`src/auth-github.ts`).
+- `/v1/*` mutations enforce strict `Origin === APP_ORIGIN` plus JSON
+  content-type (issue #153); `/readyz` exposes no internals (see above).
+- Workspace creation additionally requires the caller's GitHub read-or-above
+  permission on the target repository, checked via the App installation
+  token (issue #154; `packages/github-credential-broker`).
+- Control-plane → agent-host forwarding identifies the caller with
+  `x-dsh-user-*` internal headers; the trust root stays the Instance's
+  Invoker IAM (`src/forwarding.ts`, `apps/agent-host/src/gateway.ts`).
+- OAuth is optional until the #155 cutover: unset `APP_ORIGIN` /
+  `GITHUB_APP_CLIENT_ID` / `GITHUB_APP_CLIENT_SECRET` disables login
+  (`/auth/*` → 503) and the Origin gate. IAP infrastructure is untouched
+  (removal is #156, after production E2E).
+
 ## Runtime registry: wired to Cloud Run Instances
 
 This image composes the Postgres-backed session persistence (T4), controller
@@ -87,8 +109,9 @@ Honest and observable behavior — never silent:
   result cached 10s — `createDbReadinessProbe`, issue #97): **200** `ready`
   when reachable, **503** `not_ready` when unreachable (a failed `open`/`stop`
   surfaces per-request as before: state conflicts as **409**, unreachable
-  infrastructure as **5xx** with no internals leaked; the 503 reason is a
-  fixed string because `/readyz` is served before auth).
+  infrastructure as **5xx** with no internals leaked; the 503 body carries no
+  reason at all — details stay in the structured log — because `/readyz` is
+  served before auth, issue #153).
 - The Instance URL of an opened workspace is available two ways for the
   #22 forwarding work: `WorkspaceRuntimeHandle.getInstanceUrl()` (live
   Instances API lookup, falls back to the durable row) and the

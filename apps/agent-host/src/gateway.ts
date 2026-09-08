@@ -15,7 +15,18 @@ import type { AgentHostConfig } from "./config.js";
 import type { HealthService } from "./health.js";
 import { healthResponse } from "./health.js";
 
-const IAP_IDENTITY_HEADER = "x-goog-authenticated-user-email";
+/**
+ * DSH internal caller-identity headers (issue #149). The control plane sets
+ * these when forwarding; they are NOT Google/IAP reserved headers.
+ *
+ * TRUST ROOT: the Instance's Cloud Run Invoker IAM, which admits ONLY the
+ * control-plane service account. These headers ALONE prove nothing — a
+ * forged `x-dsh-user-id` from any other caller cannot reach this container
+ * because the platform edge rejects it first. Loosening the invoker IAM
+ * binding to any other caller immediately enables identity spoofing.
+ */
+export const DSH_USER_ID_HEADER = "x-dsh-user-id";
+export const DSH_USER_LOGIN_HEADER = "x-dsh-user-login";
 
 const SSE_HEARTBEAT_INTERVAL_MS = 15_000;
 
@@ -128,7 +139,7 @@ export function tryParseRouteIds(request: Request): {
     const match = url.pathname.match(GATEWAY_ROUTE_RE);
     if (match?.[1]) out.workspaceId = match[1];
     if (match?.[2]) out.sessionId = match[2];
-    const identity = request.headers.get(IAP_IDENTITY_HEADER);
+    const identity = request.headers.get(DSH_USER_ID_HEADER);
     if (identity) out.userId = identity;
     return out;
   } catch {
@@ -178,29 +189,24 @@ export class AgentGateway {
     }
 
     // TRUST ASSUMPTION (仕様書 section 21 / 実装手順書 section 25, updated
-    // for issue #22): identity is accepted from the IAP-set headers on
-    // presence alone. The host is NO LONGER only reachable behind IAP: the
-    // control plane calls this gateway directly (service-to-service) and
-    // sets these headers itself when forwarding.
+    // for issues #22 and #149): caller identity arrives in the DSH internal
+    // headers (`x-dsh-user-id` / `x-dsh-user-login`), set by the control
+    // plane when forwarding. They are accepted on presence alone.
     //
-    // The trust root for forwarded identity is therefore NOT "IAP
-    // strips/overwrites this header" — it is the Instance's INVOKER IAM,
-    // which admits only the control-plane service account. A forged header
-    // from any other caller cannot reach this container because the
-    // platform edge rejects it first. Consequently the invoker IAM binding
-    // is the SOLE foundation of this trust: loosening it to any other
-    // caller immediately enables identity spoofing.
+    // The trust root is the Instance's INVOKER IAM, which admits only the
+    // control-plane service account — see DSH_USER_ID_HEADER above. The
+    // workspace-id match below is the only host-side authorization; resolving
+    // the authenticated identity to an internal user and authorizing it
+    // (user → workspace membership → authorization) remains the CONTROL
+    // PLANE's responsibility (T9); this host deliberately does not duplicate
+    // membership resolution.
     //
     // (No IAP brand / load balancer exists in this milestone — see issue
     // #31 user tasks. The only thing guarding this host today is invoker
-    // IAM. Resolving the authenticated identity to an internal user and
-    // authorizing it (user → workspace membership → authorization) remains
-    // the CONTROL PLANE's responsibility (T9); this host deliberately does
-    // not duplicate membership resolution, and the workspace-id match below
-    // is the only host-side authorization.)
-    const identity = request.headers.get(IAP_IDENTITY_HEADER);
+    // IAM.)
+    const identity = request.headers.get(DSH_USER_ID_HEADER);
     if (!identity) {
-      return this.json(401, { error: "unauthenticated: missing IAP identity" });
+      return this.json(401, { error: "unauthenticated: missing DSH caller identity" });
     }
 
     const match = url.pathname.match(GATEWAY_ROUTE_RE);

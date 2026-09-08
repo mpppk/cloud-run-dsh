@@ -8,17 +8,44 @@
 // Auth: IAP identity -> internal user -> workspace membership -> authorization
 // (仕様書 sections 21/26, 実装手順書 section 25). Membership is ALWAYS verified.
 
-import type { IapIdentity, InternalUser } from "./auth.js";
+import { githubUserId } from "./auth.js";
+import { InMemorySessionStore } from "./auth-session.js";
+import type { AuthenticatedUser, IapIdentity, InternalUser } from "./auth.js";
 import type { ControlPlaneDeps } from "./deps.js";
 export type { WorkspaceRuntimeHandle, ControlPlaneDeps, ControlPlaneClock, InstanceDiagnostic } from "./deps.js";
 export { WorkspaceRuntimeHandleAdapter, RuntimeRegistry, SystemClock } from "./deps.js";
 export {
   authenticate,
+  githubUser,
+  githubUserId,
   parseIapHeaders,
+  type AuthenticatedUser,
   type IapIdentity,
   type InternalUser,
   type AuthDeps,
 } from "./auth.js";
+export {
+  buildSessionClearCookie,
+  buildSessionSetCookie,
+  generateCodeVerifier,
+  generateRawToken,
+  hashToken,
+  InMemorySessionStore,
+  parseSessionCookies,
+  pkceChallenge,
+  PostgresSessionStore,
+  authenticateSession,
+  LOGIN_FLOW_LIFETIME_MS,
+  SESSION_COOKIE_NAME,
+  SESSION_LIFETIME_MS,
+  SESSION_TOKEN_BYTES,
+  type ConsumedLoginFlow,
+  type CreatedLoginFlow,
+  type CreatedSession,
+  type SessionAuthDeps,
+  type SessionRecord,
+  type SessionStore,
+} from "./auth-session.js";
 export {
   InMemoryMembershipStore,
   assertMember,
@@ -75,6 +102,30 @@ export {
   type RouteContext,
 } from "./handlers.js";
 export { handleSessionEvents } from "./sse.js";
+export {
+  FetchGitHubUserAuthClient,
+  GitHubOAuthError,
+  buildAuthorizeUrl,
+  callbackUrl,
+  handleAuthCallback,
+  handleAuthLogin,
+  handleAuthLogout,
+  handleAuthSession,
+  resolveReturnTo,
+  type AuthRouteDeps,
+  type CodeExchangeInput,
+  type GitHubUserAuthClient,
+  type GitHubUserProfile,
+  type OAuthConfig,
+} from "./auth-github.js";
+export {
+  RepositoryAuthorizerTransientError,
+  RepositoryInputError,
+  createRepositoryAuthorizer,
+  validateRepositoryCoordinates,
+  type RepositoryAuthorizer,
+  type RepositoryPermissionInput,
+} from "@cloud-run-dsh/github-credential-broker";
 export { serveStaticFile } from "./static.js";
 export {
   createFetchHandler,
@@ -92,19 +143,41 @@ export type { ControlPlanePlaceholder } from "./placeholder.js";
 export { createPlaceholder } from "./placeholder.js";
 
 /**
- * Default IAP identity -> internal user resolution: the IAP subject IS the
- * internal user id. Replace via deps.resolveUser for a real user directory.
+ * TRANSITIONAL (#149) IAP identity -> internal user resolution.
+ *
+ * Issue #149 requires `AuthenticatedUser.id` to be `github:<numeric-id>`
+ * derived from an IMMUTABLE provider id — never a mutable login. IAP only
+ * supplies a Google subject, which is stable per Google account but is NOT a
+ * GitHub numeric id, so this shim namespaces it distinctly (`github:iapp-<subject>`)
+ * and carries the IAP email as the display login. This mapping is replaced
+ * by real GitHub OAuth issuance in #151 (which knows the true numeric id);
+ * rows written under the transitional namespace keep working because
+ * membership compares the same `id` string on both sides.
+ *
+ * Replace via deps.resolveUser for a real user directory.
  */
 export function defaultResolveUser(identity: IapIdentity): Promise<InternalUser | null> {
-  return Promise.resolve({ id: identity.subject, email: identity.email });
+  const providerUserId = `iapp-${identity.subject}`;
+  return Promise.resolve({
+    id: githubUserId(providerUserId),
+    provider: "github",
+    providerUserId,
+    login: identity.email,
+  });
 }
 
 /**
  * Builds the dependency object. All collaborators are injected so tests use
  * fakes and no real GCP/DB/network is required.
+ *
+ * `sessions` defaults to an in-memory store (issue #150); production passes
+ * a Postgres-backed store explicitly.
  */
 export function createControlPlaneDeps(
-  deps: Omit<ControlPlaneDeps, "resolveUser"> & { resolveUser?: ControlPlaneDeps["resolveUser"] },
+  deps: Omit<ControlPlaneDeps, "resolveUser" | "sessions"> & {
+    resolveUser?: ControlPlaneDeps["resolveUser"];
+    sessions?: ControlPlaneDeps["sessions"];
+  },
 ): ControlPlaneDeps {
-  return { resolveUser: defaultResolveUser, ...deps };
+  return { resolveUser: defaultResolveUser, sessions: new InMemorySessionStore(), ...deps };
 }

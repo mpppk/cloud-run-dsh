@@ -16,6 +16,11 @@ import type { WorkspaceRuntime } from "@cloud-run-dsh/workspace-runtime";
 import type { ActivityKind } from "@cloud-run-dsh/workspace-runtime";
 import type { Logger } from "@cloud-run-dsh/observability";
 import type { AuthDeps } from "./auth.js";
+import type { SessionStore } from "./auth-session.js";
+import type { GitHubUserAuthClient, OAuthConfig } from "./auth-github.js";
+import type {
+  RepositoryAuthorizer,
+} from "@cloud-run-dsh/github-credential-broker";
 import type { MembershipStore } from "./membership.js";
 import type { ForwardIdentity, MessageForwarder } from "./forwarding.js";
 
@@ -313,6 +318,30 @@ export interface ControlPlaneDeps extends AuthDeps {
   readonly repo: SessionPersistenceRepository;
   /** T6 controller lease service (controllersPerWorkspace = 1). */
   readonly leases: ControllerLeaseService;
+  /**
+   * Opaque server-side auth sessions + OAuth login-flow state (issue #150).
+   * Required: the /auth/* routes and (from #152) request authentication read
+   * it on every call. `createControlPlaneDeps` defaults to an in-memory
+   * store; production wires Postgres.
+   */
+  readonly sessions: SessionStore;
+  /**
+   * GitHub OAuth configuration (issue #151: APP_ORIGIN + App client
+   * credentials). Absent means OAuth login is disabled — /auth/login and
+   * /auth/callback answer 503. Optional so local / IAP-fronted deployments
+   * boot without OAuth credentials until the #155 cutover.
+   */
+  readonly oauth?: OAuthConfig;
+  /** GitHub OAuth/API client seam (issue #151). Tests inject fakes. */
+  readonly githubAuth?: GitHubUserAuthClient;
+  /**
+   * Repository authorization for workspace creation (issue #154).
+   * Optional so pre-rollout compositions boot without it; production
+   * (main.ts) always wires the GitHub App-backed authorizer. When absent,
+   * workspace creation skips the repository permission check (legacy
+   * behavior — membership remains mandatory).
+   */
+  readonly repositoryAuthorizer?: RepositoryAuthorizer;
   /** Workspace membership store (authorization requires membership). */
   readonly membership: MembershipStore;
   /** Per-workspace runtime handles (T8 composition). */

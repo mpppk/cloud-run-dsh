@@ -215,8 +215,10 @@ export function createIdTokenProvider(
 // ---------------------------------------------------------------------------
 
 export interface ForwardIdentity {
+  /** Stable internal user id (`github:<numeric-id>`). */
   readonly id: string;
-  readonly email: string;
+  /** GitHub login — display / audit only, never an authorization key. */
+  readonly login: string;
 }
 
 export interface ForwardMessageArgs {
@@ -540,10 +542,12 @@ export class HttpAgentHostForwarder implements MessageForwarder {
             "content-type": "application/json",
             // Invoker IAM at the platform edge.
             authorization: `Bearer ${idToken}`,
-            // Caller identity for the host's gateway check. Trusted ONLY
-            // because invoker IAM restricts callers to this service account.
-            "x-goog-authenticated-user-email": args.identity.email,
-            "x-goog-authenticated-user-id": `accounts.google.com:${args.identity.id}`,
+            // Caller identity for the host's gateway check (issue #149: DSH
+            // internal headers, NOT Google/IAP reserved headers). Trusted
+            // ONLY because invoker IAM restricts callers to this service
+            // account — the headers alone prove nothing.
+            "x-dsh-user-id": args.identity.id,
+            "x-dsh-user-login": args.identity.login,
           },
           body: JSON.stringify(args.body),
           signal: controller.signal,
