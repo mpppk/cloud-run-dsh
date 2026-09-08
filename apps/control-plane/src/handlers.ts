@@ -1,7 +1,7 @@
 // Route handlers — 仕様書 section 24 API surface.
 //
 // Authorization pipeline for every workspace-scoped route:
-//   authenticate (IAP identity -> internal user)
+//   authenticateSession (session cookie -> internal user)
 //     -> workspace membership check (仕様書 section 26 item 7)
 //     -> controller check for controller-only operations (仕様書 section 20)
 

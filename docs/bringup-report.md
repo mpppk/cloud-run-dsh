@@ -1,5 +1,9 @@
 # 立ち上げ作業報告（2026-09-03 → 09-04）
 
+> Historical record: IAP への言及は当時の事実記録であり、current design
+> ではない。現在の認証は GitHub App OAuth + opaque `__Host-dsh_session`
+> であり、IAP 基盤は #156 で削除された。
+
 Cloud Run DSH の**土台とサンドボックス**を GCP 上で実際に動かし、コストゼロの状態に戻すまでの記録。
 PR 5本、レビュー9回、そして**実際に `terraform apply` を打たなければ見つからなかった欠陥が4件**。
 エージェント本体はまだ存在しない。

@@ -16,7 +16,7 @@ function request(
   return new Request(`http://localhost:8080${path}`, { method, headers });
 }
 
-const IAP = { "x-dsh-user-id": "github:1", "x-dsh-user-login": "alice" };
+const DSH_IDENTITY = { "x-dsh-user-id": "github:1", "x-dsh-user-login": "alice" };
 
 /** Flushes the async heartbeat ticks scheduled by the last clock advance. */
 async function flushTicks(): Promise<void> {
@@ -50,7 +50,7 @@ describe("LeaseHeartbeatLoop (review BLOCKER fix)", () => {
     expect(lease?.controllerId).toBe("ctrl-1");
 
     const res = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/sessions/s1/messages", IAP),
+      request("POST", "/workspaces/ws-1/sessions/s1/messages", DSH_IDENTITY),
     );
     expect(res.status).toBe(202);
     expect(th.host.health.snapshot().status).toBe("READY");

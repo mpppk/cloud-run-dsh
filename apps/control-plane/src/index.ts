@@ -5,24 +5,21 @@
 //   T6 @cloud-run-dsh/controller-lease            — single-writer controller lease
 //   T8 @cloud-run-dsh/workspace-runtime           — state machine, open/stop, idle
 //
-// Auth: IAP identity -> internal user -> workspace membership -> authorization
-// (仕様書 sections 21/26, 実装手順書 section 25). Membership is ALWAYS verified.
+// Auth: GitHub App OAuth -> opaque server-side session -> workspace
+// membership -> authorization (仕様書 sections 21/26, 実装手順書 section 25).
+// Membership is ALWAYS verified. Legacy header authentication was removed
+// in #156.
 
-import { githubUserId } from "./auth.js";
 import { InMemorySessionStore } from "./auth-session.js";
-import type { AuthenticatedUser, IapIdentity, InternalUser } from "./auth.js";
+import type { AuthenticatedUser, InternalUser } from "./auth.js";
 import type { ControlPlaneDeps } from "./deps.js";
 export type { WorkspaceRuntimeHandle, ControlPlaneDeps, ControlPlaneClock, InstanceDiagnostic } from "./deps.js";
 export { WorkspaceRuntimeHandleAdapter, RuntimeRegistry, SystemClock } from "./deps.js";
 export {
-  authenticate,
   githubUser,
   githubUserId,
-  parseIapHeaders,
   type AuthenticatedUser,
-  type IapIdentity,
   type InternalUser,
-  type AuthDeps,
 } from "./auth.js";
 export {
   bindingMatches,
@@ -151,30 +148,6 @@ export type { ControlPlanePlaceholder } from "./placeholder.js";
 export { createPlaceholder } from "./placeholder.js";
 
 /**
- * TRANSITIONAL (#149) IAP identity -> internal user resolution.
- *
- * Issue #149 requires `AuthenticatedUser.id` to be `github:<numeric-id>`
- * derived from an IMMUTABLE provider id — never a mutable login. IAP only
- * supplies a Google subject, which is stable per Google account but is NOT a
- * GitHub numeric id, so this shim namespaces it distinctly (`github:iapp-<subject>`)
- * and carries the IAP email as the display login. This mapping is replaced
- * by real GitHub OAuth issuance in #151 (which knows the true numeric id);
- * rows written under the transitional namespace keep working because
- * membership compares the same `id` string on both sides.
- *
- * Replace via deps.resolveUser for a real user directory.
- */
-export function defaultResolveUser(identity: IapIdentity): Promise<InternalUser | null> {
-  const providerUserId = `iapp-${identity.subject}`;
-  return Promise.resolve({
-    id: githubUserId(providerUserId),
-    provider: "github",
-    providerUserId,
-    login: identity.email,
-  });
-}
-
-/**
  * Builds the dependency object. All collaborators are injected so tests use
  * fakes and no real GCP/DB/network is required.
  *
@@ -182,10 +155,9 @@ export function defaultResolveUser(identity: IapIdentity): Promise<InternalUser 
  * a Postgres-backed store explicitly.
  */
 export function createControlPlaneDeps(
-  deps: Omit<ControlPlaneDeps, "resolveUser" | "sessions"> & {
-    resolveUser?: ControlPlaneDeps["resolveUser"];
+  deps: Omit<ControlPlaneDeps, "sessions"> & {
     sessions?: ControlPlaneDeps["sessions"];
   },
 ): ControlPlaneDeps {
-  return { resolveUser: defaultResolveUser, sessions: new InMemorySessionStore(), ...deps };
+  return { sessions: new InMemorySessionStore(), ...deps };
 }

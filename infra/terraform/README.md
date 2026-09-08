@@ -15,7 +15,6 @@ Terraform for the Google Cloud baseline described in 実装手順書 §2 and 仕
 | `iam.tf` | Runtime service accounts, AI-agent operator account, and least-privilege bindings |
 | `secrets.tf` | Secret Manager placeholders (no values in code) |
 | `control-plane.tf` | Control-plane Cloud Run service with fail-closed public gate (issue #155; ADR-0001 still excludes agent-host Instances) |
-| `iap.tf` | IAP brand/client + `iap.httpsResourceAccessor` members |
 | `outputs.tf` | Bucket, SQL connection, registry URL, SA emails |
 
 ## Variables
@@ -46,8 +45,6 @@ Terraform for the Google Cloud baseline described in 実装手順書 §2 and 仕
 | `db_transaction_log_retention_days` | number | `7` | no | WAL retention days for PITR (1-7). Only applied when backups are enabled. |
 | `db_query_insights_enabled` | bool | `true` | no | Query Insights. Verification-only profiles may disable. |
 | `checkpoint_live_delete_age_days` | number | `0` | no | Days after which LIVE objects are deleted. `0` = disabled (safe default). |
-| `iap_support_email` | string | `null` | conditional | Support email for IAP brand. Required to create `google_iap_brand`. |
-| `iap_members` | list(string) | `[]` | no | Members granted `roles/iap.httpsResourceAccessor` (e.g. `user:alice@example.com`). |
 | `control_plane_image` | string | `""` | no | Full control-plane image URL. Empty = service NOT managed (fail-closed default). |
 | `control_plane_service_name` | string | `control-plane` | no | Cloud Run service name. |
 | `control_plane_public` | bool | `false` | no | Public gate: `false` = internal+LB ingress with invoker IAM check ON; `true` = `INGRESS_TRAFFIC_ALL` + `invoker_iam_disabled` (official recommended public mechanism, no `allUsers`). Requires https `control_plane_app_origin`, `control_plane_github_client_id`, `control_plane_github_app_id`, `control_plane_agent_host_image` (plan preconditions). |
@@ -64,7 +61,6 @@ Terraform for the Google Cloud baseline described in 実装手順書 §2 and 仕
 ```bash
 # Supply required vars out-of-band — never commit them.
 export TF_VAR_project_id="my-gcp-project"
-export TF_VAR_iap_support_email="support@example.com" # optional until IAP brand needed
 
 terraform -chdir=infra/terraform init
 terraform -chdir=infra/terraform plan -var-file=terraform.tfvars  # or via env vars
@@ -144,7 +140,6 @@ revisiting the runtime SAs' `secretAccessor` grants.
 These are never stored in code and must be injected via Secret Manager / env:
 
 - `TF_VAR_project_id` — GCP project id
-- `TF_VAR_iap_support_email` — IAP OAuth brand support email
 - Secret payloads (added with `gcloud secrets versions add` after `apply`):
   - `github-app-private-key` — GitHub App private key PEM
   - `llm-api-key` — LLM provider API key
@@ -233,26 +228,36 @@ mandatory config (https `control_plane_app_origin`,
 `control_plane_agent_host_image`) fails the plan via lifecycle
 preconditions, not the container at boot.
 
-Two-phase bootstrap (the service URI only exists after phase 1):
+Two-phase bootstrap (the service URI only exists after phase 1). Export the
+shared inputs once so every command below is copy-executable (see runbook
+Step 6.y for the full adoption block including the manual-service import):
 
 ```bash
+export TF_VAR_project_id="<project>"
+export TF_VAR_region="<region>"
+export TF_VAR_control_plane_image="<region>-docker.pkg.dev/<project>/agent-host/control-plane:v1"
+export TF_VAR_control_plane_github_app_id="<gh-app-id>"
+export TF_VAR_control_plane_agent_host_image="<region>-docker.pkg.dev/<project>/agent-host/agent-host:v1"
 # Phase 1 — private service; learn the URI.
-terraform apply -var='control_plane_image=<region>-docker.pkg.dev/<project>/agent-host/control-plane:v1' \
-  -var='control_plane_github_app_id=<gh-app-id>' \
-  -var='control_plane_agent_host_image=<region>-docker.pkg.dev/<project>/agent-host/agent-host:v1'
+terraform apply
 terraform output -raw control_plane_service_uri
 # Phase 2 — out-of-band: secret versions (runbook Step 6.x), GitHub App
 # callback <URI>/auth/callback with APP_ORIGIN=<URI>, migrations 0001-0004.
 # Then re-apply in public mode and verify with scripts/verify-issue155-e2e.ts:
-terraform apply -var='control_plane_public=true' \
+terraform apply \
+  -var='control_plane_public=true' \
   -var='control_plane_app_origin=<URI>' \
-  -var='control_plane_github_client_id=<Iv1…>' [... same image/App vars ...]
+  -var='control_plane_github_client_id=<Iv1…>'
 ```
 
 Rollback to private at any time: `control_plane_public=false` + re-apply
-(ingress back to internal+LB, IAM check back on). #156 (IAP removal) stays
-gated until production E2E succeeds — do not remove `iap.tf` or IAP wording
-in the runbook as part of #155.
+(ingress back to internal+LB, IAM check back on).
+
+> IAP history (issue #156, done): IAP brand/client/IAM (`iap.tf`,
+> `iap_support_email`, `iap_members`, `iap.googleapis.com`) were removed
+> once the public application-auth rollout passed production E2E. Do not
+> reintroduce IAP-gated access; authentication is GitHub App OAuth +
+> opaque `__Host-dsh_session`, and the agent-host stays behind Invoker IAM.
 
 ## Private IP choice (cloudsql.tf)
 

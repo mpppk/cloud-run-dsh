@@ -18,18 +18,18 @@ This runbook takes an operator from an **empty Google Cloud project** to a **dep
 
 Scope of the Terraform baseline (what you are about to create):
 
-- 12 APIs enabled (`cloudresourcemanager`, `compute`, `iam`, `run`, `sqladmin`, `secretmanager`, `artifactregistry`, `storage`, `iap`, `logging`, `monitoring`, `servicenetworking`) — `apis.tf` (`compute` is required by `google_compute_network.sql`; without it the first apply fails with "Compute Engine API has not been used")
+- 11 APIs enabled (`cloudresourcemanager`, `compute`, `iam`, `run`, `sqladmin`, `secretmanager`, `artifactregistry`, `storage`, `logging`, `monitoring`, `servicenetworking`) — `apis.tf` (`compute` is required by `google_compute_network.sql`; without it the first apply fails with "Compute Engine API has not been used")
 - Artifact Registry Docker repository `agent-host` — `artifact_registry.tf`. Both the agent-host AND the control-plane service accounts hold repo-scoped `roles/artifactregistry.reader` on it (`iam.tf`): the Instance pulls the image as agent-host, but Cloud Run verifies image access with the **caller's** permission at create time, so with agent-host only the create fails with `downloadArtifacts` 403 (issues #58 / #64 — verified on live infra). Do NOT drop the control-plane binding as "unused"
 - Cloud SQL PostgreSQL 16 with a private IP (own VPC + Service Networking peering) **plus a public IPv4** — Cloud Run Instances have no VPC connectivity, so the native `cloudSqlInstance` volume path dials the public address (see Step 5); `authorized_networks` stays empty (IAM + short-lived client certificate do the authorization), database `dsh`, user `dsh_app` — `cloudsql.tf`. The public IPv4 is **not** a provider default (`variables.tf` keeps `db_enable_public_ip = false` as a safety valve) — you enable it in Step 2.1 via `TF_VAR_db_enable_public_ip=true`, or by using the minimal profile (`profiles/minimal.tfvars`, Appendix), which sets `db_enable_public_ip = true`.
 - GCS checkpoint bucket (uniform access, versioning, ARCHIVED-object 30-day lifecycle) — `storage.tf`
 - Three service accounts (agent-host, control-plane, and the `ai-agent` operator identity) with least-privilege bindings — `iam.tf`. The `ai-agent` operator identity and its gcloud impersonation setup are documented separately in [`gcp-ai-agent-impersonation.md`](gcp-ai-agent-impersonation.md).
 - Secret Manager placeholders: `github-app-private-key`, `llm-api-key`, `db-password`, `control-plane-database-url` (no values in code — versions are added out-of-band; the control-plane URL's version is added in Step 6) — `secrets.tf`
-- IAP brand + client + `iap.httpsResourceAccessor` members — `iap.tf`
+- Control-plane Cloud Run service with fail-closed public gate — `control-plane.tf` (issue #155; IAP was removed in #156)
 
 **NOT** in Terraform (deliberately — see [ADR-0001](adr/0001-instances-outside-terraform.md)):
 
 - **Cloud Run Instances** — runtime-managed by the control plane, not Terraform ([#28](https://github.com/mpppk/cloud-run-dsh/issues/28): decided to keep them out even once a provider resource ships, so per-workspace short-lived Instances don't pollute `terraform plan` with drift). Created in Step 5 outside Terraform.
-- **The control-plane Cloud Run service** — deployed in Step 6 with `gcloud`.
+- **The control-plane Cloud Run service** — Terraform-managed in Step 6 (`control-plane.tf`, issue #155).
 
 ---
 
@@ -62,7 +62,7 @@ On a brand-new project you own, grant yourself during Step 1:
 - `roles/owner` — simplest for an MVP project; covers Terraform resource creation, IAM, billing linkage, API enablement, and `gcloud secrets versions add`.
 - Additionally, to link billing (Step 1) you need `roles/billing.user` **on the billing account** (and `roles/billing.projectManager` or Owner on the project). A plain project Owner without billing-account rights cannot link billing.
 
-Least-privilege alternative (if your org forbids Owner): the Terraform apply in Step 2 needs, at minimum — `resourcemanager.projectIamAdmin`, `iam.serviceAccountAdmin`, `iam.serviceAccountUser`, `run.admin`, `cloudsql.admin`, `secretmanager.admin`, `storage.admin`, `artifactregistry.admin`, `serviceusage.serviceUsageAdmin`, `compute.networkAdmin` (VPC + Service Networking peering), `iap.admin`. Reproducing this exact set is error-prone; Owner on a scratch project is the pragmatic MVP choice. Do **not** run this against a shared production project.
+Least-privilege alternative (if your org forbids Owner): the Terraform apply in Step 2 needs, at minimum — `resourcemanager.projectIamAdmin`, `iam.serviceAccountAdmin`, `iam.serviceAccountUser`, `run.admin`, `cloudsql.admin`, `secretmanager.admin`, `storage.admin`, `artifactregistry.admin`, `serviceusage.serviceUsageAdmin`, `compute.networkAdmin` (VPC + Service Networking peering). Reproducing this exact set is error-prone; Owner on a scratch project is the pragmatic MVP choice. Do **not** run this against a shared production project.
 
 ### Cloud Run Instance access (Preview)
 
@@ -101,10 +101,6 @@ cd <repo root>
 
 export TF_VAR_project_id="$PROJECT_ID"
 export TF_VAR_region="$REGION"
-# IAP brand requires a support email (variable has no default; omit until Step 6 if you don't want IAP yet)
-export TF_VAR_iap_support_email="you@example.com"
-# Members allowed through IAP (empty = nobody can reach the app through IAP)
-export TF_VAR_iap_members='["user:you@example.com"]'
 # Public IPv4 on Cloud SQL — REQUIRED for bring-up. Cloud Run Instances have NO
 # VPC connectivity at all (no connector, no NAT: `vpcAccess.connector` is
 # rejected and `vpcAccess.networkInterfaces` is silently dropped on Instances),
@@ -192,9 +188,7 @@ You need these later:
 - `sql_connection_name`, `sql_database_name` — migrations + `DATABASE_URL` (Step 4)
 - `checkpoint_bucket_name` — agent-host env (Steps 5/6)
 - `agent_host_service_account_email`, `control_plane_service_account_email` — instance/service deployment (Steps 5/6)
-- `iap_client_id`, `iap_brand_name` — IAP (Step 6)
-
-> ⚠️ **Deprecation / migration risk (observed as real `terraform validate` warnings):** `google_iap_brand` / `google_iap_client` emit `Warning: Deprecated Resource` — *"after July 2025, the `google_iap_brand` Terraform resource will no longer function as intended due to the deprecation of the IAP OAuth Admin API"* — plus a `Deprecated value used` warning. Validation still passes, but **creating a brand on a brand-new project via Terraform may already be broken**: if the first apply fails on the IAP brand, create the OAuth brand manually via the Cloud Console OAuth consent screen, `terraform import` it (`google_iap_brand.brand`), and keep the client under Terraform. Expect the resource addresses (and possibly import semantics) to change in a future provider major; before upgrading `hashicorp/google`, re-plan and check the provider changelog for `iap_brand`/`iap_client` removal or rename. Treat the IAP outputs (`iap_client_id`) as durable values you may need to re-attach by import.
+- `control_plane_service_uri` — public origin / GitHub callback base (Step 6.y)
 
 ---
 
@@ -481,7 +475,7 @@ export CP_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-host/control-plane
 # Control-plane environment — mirrors the 11 `REQUIRED_ENV_KEYS` in apps/control-plane/src/config.ts
 # (8 plain keys via this file + 3 secrets via --set-secrets below = 11).
 # GitHub OAuth login (issues #151/#153, REQUIRED before the #155 public
-# cutover, harmless while IAP still fronts the service) adds 2 plain keys
+# cutover) adds 2 plain keys
 # (APP_ORIGIN, GITHUB_APP_CLIENT_ID) + 1 secret (GITHUB_APP_CLIENT_SECRET) —
 # see "Step 6.x — GitHub OAuth login" below. Until they are set, /auth/login
 # and /auth/callback answer 503 and the CSRF Origin gate stays off.
@@ -574,17 +568,14 @@ once the v2 Instances API shape for secrets is verified is follow-up work
 (the typed client in `packages/cloud-run-instance-client` only sends plain
 values today).
 
-IAP configuration (brand + client were already created by Terraform in Step 2; members via `var.iap_members`):
+Edge authentication (replaces the removed IAP fronting — issue #156):
 
-1. `iap_client_id` / `iap_brand_name` from `terraform output` identify the OAuth brand/client.
-2. Front the service with IAP — either an HTTPS Load Balancer backend (classic, stable) or the newer direct IAP-on-Cloud Run integration, whichever your project's Preview surface supports.
-3. Grant `roles/iap.httpsResourceAccessor` to your users (Terraform does this for `var.iap_members`; add more with `gcloud iap web add-iam-policy-binding`).
-4. IAP is a network-level gate only — it authenticates nothing on the API:
-   the control plane authenticates browsers via the `__Host-dsh_session`
-   cookie (GitHub OAuth login, Step 6.x) and then enforces workspace
-   membership + repository authorization (仕様書 §21, 実装手順書 §25).
-   `x-goog-authenticated-user-*` headers are ignored. IAP being on does not
-   make membership checks optional.
+The public control-plane edge carries no end-user IAM check
+(`invoker_iam_disabled`, Terraform-managed). Browsers authenticate with the
+`__Host-dsh_session` cookie (GitHub OAuth login, Step 6.x), then the app
+enforces workspace membership + repository authorization (仕様書 §21,
+実装手順書 §25). Legacy proxy identity headers are ignored. Anonymous
+`/v1/*` is 401; foreign-Origin mutations are 403.
 
 ---
 
@@ -637,8 +628,8 @@ Workspace creation now additionally requires the caller's GitHub
 read-or-above permission on the target repository (issue #154 — uses the
 existing App key, no new credential).
 
-Transitional posture (before #155): with OAuth configured but IAP still
-fronting, browser login works behind IAP and the CSRF Origin gate is active.
+Transitional posture (before #155): with OAuth configured on a private
+service, browser login works and the CSRF Origin gate is active.
 With OAuth unconfigured, `/auth/login` + `/auth/callback` answer 503 and the
 Origin gate stays off — DO NOT expose the service publicly in that state.
 
@@ -646,7 +637,7 @@ Origin gate stays off — DO NOT expose the service publicly in that state.
 
 ## Step 6.y — Public rollout (issue #155; production E2E gate)
 
-Do this ONLY after Step 6.x is fully working behind IAP (login → session →
+Do this ONLY after Step 6.x is fully working on the private service (login → session →
 workspace 401/403 behavior verified). The service switches from
 internal+LB + invoker IAM check to the internet edge with application-level
 authentication; agent-host Instances stay non-public (Invoker IAM for the
@@ -748,31 +739,31 @@ APP_ORIGIN=<URI> DSH_SESSION=<paste __Host-dsh_session from a logged-in browser>
 Rollback (any problem): `control_plane_public=false` + re-apply — ingress
 returns to internal+LB and the invoker IAM check returns, with zero app
 changes (the Origin gate follows APP_ORIGIN presence; sessions keep working
-behind IAP). The manual `gcloud run deploy` in Step 6 stays as the
+on the private service). The manual `gcloud run deploy` in Step 6 stays as the
 non-Terraform fallback.
 
-**#156 (IAP removal) is GATED on production E2E success above.** Do not
-delete `infra/terraform/iap.tf`, IAP IAM bindings, or IAP wording in this
-runbook until the E2E checklist passes on the public endpoint AND agent-host
-is confirmed still non-public with Invoker IAM intact.
+**#156 (IAP removal) is complete** (IAP brand/client/IAM removed from
+Terraform and all request paths after production E2E succeeded) — there is
+no IAP posture left to roll back to; use `control_plane_public=false`.
 
 ---
 
 ## Step 7 — Smoke check
 
-From a browser/session that goes through IAP:
+From a browser with a logged-in session (public origin from Step 6.y):
 
 ```bash
 export DB_PASSWORD="$(gcloud secrets versions access latest --secret=db-password)"  # as in Step 4
 
-# 1. Control plane is alive (through the IAP-secured endpoint / LB URL).
+# 1. Control plane is alive (public origin from Step 6.y output).
 #    /livez is served before the auth pipeline — no session needed here.
 #    (Never /healthz: Cloud Run reserves that exact path — issue #68.)
 curl -s "https://<control-plane-host>/livez"
 # → expect a 200 with the health payload
 
 # The API authenticates ONLY via the __Host-dsh_session cookie (issues
-# #150–#152). IAP headers are ignored — sending them authenticates nothing.
+# #150–#152). Legacy proxy identity headers are ignored — sending them
+# authenticates nothing.
 # Log in once in a browser (https://<control-plane-host>/auth/login),
 # then put the session value into a curl cookie jar:
 #   (DevTools → Application → Cookies → copy the __Host-dsh_session value
@@ -853,7 +844,7 @@ PGPASSFILE="$PGPASSF" psql "postgresql://dsh_app@127.0.0.1:5433/dsh" \
 gcloud storage ls "gs://$(terraform -chdir=infra/terraform output -raw checkpoint_bucket_name)"
 ```
 
-Pass criteria: `/livez` 200; workspace created (201, server-generated UUID `id`) + opened; an Instance exists for the workspace; the `workspaces` row shows the expected state; no 403 from IAP.
+Pass criteria: `/livez` 200; workspace created (201, server-generated UUID `id`) + opened; an Instance exists for the workspace; the `workspaces` row shows the expected state; anonymous calls stay 401.
 
 ### Recovery: diagnosing `RESTORE_FAILED` (issue #141)
 
@@ -1030,7 +1021,7 @@ else
   echo "num_backends never drained to 0 (last max: $N) - NOT destroying"; exit 1
 fi
 
-# 4. Destroy Terraform-managed resources (SQL, bucket, AR, IAM, secrets, IAP):
+# 4. Destroy Terraform-managed resources (SQL, bucket, AR, IAM, secrets):
 terraform -chdir=infra/terraform destroy
 # If the db-password data source fails on destroy (secret version deleted manually), re-run
 # with TF_VAR_db_password set — same escape hatch as the first apply.
@@ -1096,7 +1087,8 @@ Teardown gotchas (all verified against `infra/terraform`):
 > LLM turn → SSE path (see [architecture.md](architecture.md) and
 > [e2e-verification-report.md](e2e-verification-report.md)). The table is kept
 > as the pre-verification record; treat rows for Steps 4–7 as superseded by
-> that report, except the still-open items: IAP brand/LB wiring (Step 6) and
+> that report, except the still-open items at the time: IAP brand/LB wiring (Step 6,
+> historical — IAP was removed in #156 after production E2E) and
 > `terraform destroy` after migrations (Step 8, open issue #73).
 
 This runbook was authored against a machine with **no gcloud credentials and no configured project**; nothing here was executed against real GCP. Unexecuted and therefore unproven:
@@ -1105,11 +1097,11 @@ This runbook was authored against a machine with **no gcloud credentials and no 
 |---|---|
 | Step 1 | Project creation, billing linkage — no billing account available in this environment. |
 | Step 2 (`plan`/`apply`) | `terraform plan`/`apply` require provider credentials; only `fmt -check`, `init -backend=false`, `validate` were run (see PR verification). The two-phase secret bootstrap sequence is code-reviewed and reconciled with `infra/terraform/README.md`, but never executed end-to-end. |
-| Step 2 (IAP resources) | `google_iap_brand` creation behavior + deprecation warnings observed only in docs; actual warning text/resource behavior unverified. |
+| Step 2 (IAP resources, historical — removed in #156) | `google_iap_brand` creation behavior + deprecation warnings observed only in docs; actual warning text/resource behavior unverified. |
 | Step 3 | `docker build` of the agent-host image was not run here; the Dockerfile's `bun run typecheck` stage depends on the workspace installing cleanly in-container. |
 | Step 4 | **(Superseded 2026-09-05 — see note above.)** Migration runner against real Cloud SQL (proxy, private-IP path, `DATABASE_URL` with the Cloud SQL connection name) — originally untested against a live instance; since executed for real on 2026-09-05. The runner itself is covered by unit tests. |
 | Step 5 | **(Superseded 2026-09-05 — see note above.)** **Highest risk.** The create body shape, `validateOnly` dry-run, and the v2 REST paths were verified against the live discovery document and read-only probes on 2026-09-03 (see PR verification: v1 paths return HTML 404, v2 list returns 200). Originally unproven: an actual create/start/stop against a live instance (billable), and the `gcloud run instances` Preview command-group availability — since executed for real on 2026-09-05. |
-| Step 6 | `gcloud run deploy` + IAP frontend wiring — the deploy itself was proven on the real project on 2026-09-05 (see the update note above); the IAP frontend wiring is still unexecuted. The image builds (see the control-plane Dockerfile) and was verified locally: `docker build` + container start + `/livez` curl (see the P3 PR verification). The RuntimeRegistry is wired (#23): `open` creates-or-starts the workspace Instance, proven live on 2026-09-05. |
+| Step 6 | `gcloud run deploy` + (historical — removed in #156) IAP frontend wiring — the deploy itself was proven on the real project on 2026-09-05 (see the update note above); the IAP frontend wiring is still unexecuted. The image builds (see the control-plane Dockerfile) and was verified locally: `docker build` + container start + `/livez` curl (see the P3 PR verification). The RuntimeRegistry is wired (#23): `open` creates-or-starts the workspace Instance, proven live on 2026-09-05. |
 | Step 7 | **(Superseded 2026-09-05 — see note above.)** Smoke checks — depended on Steps 4–6; since executed for real on 2026-09-05. |
 | Step 8 | `terraform destroy` behavior with real state; Instance stop/delete endpoint names under the Preview API. The step 3b `num_backends` drain gate + retry fallback (issue #115) and the Monitoring-API curl/jq polling loop are authored but unexecuted against live GCP — the coordinator verifies them at the next bring-up teardown. The step 3b `project:instance` filter fix (issue #118) is likewise shell/jq-verified only, not live-verified. The new step 1 enumerate → delete-all → poll-to-empty loop (issue #123) is likewise shell/jq-verified only with dummy JSON (including the `{}` empty-list case), not live-executed — the coordinator verifies it at the next bring-up teardown. |
 

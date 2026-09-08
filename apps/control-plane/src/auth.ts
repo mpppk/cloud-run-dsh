@@ -1,27 +1,16 @@
-// Authentication (仕様書 section 21, 実装手順書 section 25; issue #149).
+// Authentication (仕様書 section 21, 実装手順書 section 25; issues #149, #156).
 //
-// Identity model after #149: the application's internal user principal is
+// Identity model: the application's internal user principal is
 // provider-agnostic in shape but GitHub-backed in this milestone —
 // `AuthenticatedUser.id` is ALWAYS `github:<numeric-id>` (immutable), never
 // a mutable login and never an email. GitHub logins change; numeric ids do
 // not. `login` is display / audit only and MUST NOT be used as an
 // authorization key.
 //
-// TRANSITIONAL (#149 only): the external request edge still parses IAP
-// headers (parseIapHeaders / resolveUser below) because GitHub OAuth lands
-// in #151 and the session-cookie cutover in #152. The IAP-specific
-// `IapIdentity` type lives ONLY at this external edge — it no longer flows
-// into handlers, the forwarder, or the agent-host. #152 removes it entirely.
-
-import { unauthorized } from "./errors.js";
-
-/** External IdP artifact (IAP edge only). Never crosses the domain seam. */
-export interface IapIdentity {
-  /** e.g. "accounts.google.com:1234567890" from x-goog-authenticated-user-id */
-  readonly subject: string;
-  /** e.g. "alice@example.com" from x-goog-authenticated-user-email */
-  readonly email: string;
-}
+// Request authentication is the `__Host-dsh_session` cookie (issue #152,
+// `authenticateSession` in auth-session.ts). Header-based external
+// authentication was removed in #156 together with the proxy infrastructure:
+// no request header authenticates, only the server-side session counts.
 
 /**
  * Internal application principal (issue #149).
@@ -41,8 +30,7 @@ export interface AuthenticatedUser {
 }
 
 /**
- * Back-compat alias. Prefer `AuthenticatedUser` in new code; `InternalUser`
- * remains so existing imports keep compiling during the #149–#152 migration.
+ * Back-compat alias. Prefer `AuthenticatedUser` in new code.
  */
 export type InternalUser = AuthenticatedUser;
 
@@ -55,43 +43,4 @@ export function githubUserId(numericId: number | string): string {
 export function githubUser(numericId: number | string, login: string): AuthenticatedUser {
   const providerUserId = String(numericId);
   return { id: githubUserId(providerUserId), provider: "github", providerUserId, login };
-}
-
-/** Parses the IAP headers injected by Identity-Aware Proxy. Returns null when absent/malformed. */
-export function parseIapHeaders(headers: Headers): IapIdentity | null {
-  const rawSubject = headers.get("x-goog-authenticated-user-id");
-  const email = headers.get("x-goog-authenticated-user-email");
-  if (!rawSubject || !email) return null;
-  const separator = rawSubject.indexOf(":");
-  const subject = separator >= 0 ? rawSubject.slice(separator + 1) : rawSubject;
-  if (!subject) return null;
-  return { subject, email };
-}
-
-export interface AuthDeps {
-  /** Resolves an IAP identity to the internal user. Returns null when unknown. */
-  readonly resolveUser: (identity: IapIdentity) => Promise<AuthenticatedUser | null>;
-}
-
-/**
- * Resolves the request identity from IAP headers. Throws 401 when headers are
- * missing or the identity cannot be resolved to an internal user.
- * Membership/authorization is NOT checked here — every handler must verify
- * workspace membership separately (実装手順書 section 25).
- *
- * TRANSITIONAL: replaced by session-cookie authentication in #152.
- */
-export async function authenticate(
-  headers: Headers,
-  deps: AuthDeps,
-): Promise<AuthenticatedUser> {
-  const identity = parseIapHeaders(headers);
-  if (!identity) {
-    throw unauthorized("missing IAP identity headers");
-  }
-  const user = await deps.resolveUser(identity);
-  if (!user) {
-    throw unauthorized("unknown identity");
-  }
-  return user;
 }

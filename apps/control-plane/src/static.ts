@@ -8,9 +8,8 @@
 //
 // Each UI carries no data — both are empty screens whose API calls go to the
 // same origin. They are served BEFORE authentication (see server.ts) so a
-// browser navigation, which cannot attach custom headers, can load them
-// locally. In production IAP protects the HTML itself. The API (`/v1/*`)
-// is unchanged and still requires IAP headers.
+// browser navigation can load them; the public shell carries no data either
+// way. The API (`/v1/*`) always requires a valid session.
 //
 // The product UI lives at `/app` with one screen per query string:
 // `/app` (home: workspace list) and `/app?ws=<id>` (conversation).

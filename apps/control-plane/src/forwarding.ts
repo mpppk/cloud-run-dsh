@@ -543,7 +543,7 @@ export class HttpAgentHostForwarder implements MessageForwarder {
             // Invoker IAM at the platform edge.
             authorization: `Bearer ${idToken}`,
             // Caller identity for the host's gateway check (issue #149: DSH
-            // internal headers, NOT Google/IAP reserved headers). Trusted
+            // internal headers, never platform-reserved ones). Trusted
             // ONLY because invoker IAM restricts callers to this service
             // account — the headers alone prove nothing.
             "x-dsh-user-id": args.identity.id,

@@ -225,18 +225,6 @@ variable "control_plane_extra_env" {
   default     = {}
 }
 
-variable "iap_support_email" {
-  description = "Support email for the IAP OAuth brand. Required when creating google_iap_brand. Supply out-of-band."
-  type        = string
-  default     = null
-}
-
-variable "iap_members" {
-  description = "List of IAM members (e.g. \"user:alice@example.com\", \"group:eng@example.com\") granted IAP-secured Web App User."
-  type        = list(string)
-  default     = []
-}
-
 variable "checkpoint_live_delete_age_days" {
   description = "If >0, GCS lifecycle will delete LIVE checkpoint objects older than this many days. Defaults to 0 (disabled) to avoid destructive deletion of live checkpoints; spec only requires cleanup of ARCHIVED versions."
   type        = number

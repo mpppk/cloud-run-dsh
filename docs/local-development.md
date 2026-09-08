@@ -193,7 +193,7 @@ is needed.
 - The screen sends no auth headers (issue #152): same-origin `fetch()`
   carries the dev session cookie automatically. To act as a second user,
   disable auto-login (`DSH_DEV_AUTO_LOGIN=0`) and create sessions
-  explicitly — the header box era (pre-#152 IAP headers) is over and its
+  explicitly — the legacy proxy-header box era (pre-#152) is over and its
   inputs are ignored.
 - Your workspaces are listed by `GET /v1/workspaces` (step 1b above);
   created ids are also kept in the browser's
@@ -222,8 +222,7 @@ UI (`/` stays as-is). No build step, no npm dependencies — plain ES modules
   automatically on same-origin requests. Locally the dev server signs in a
   fixed dev principal automatically (cookie-less requests get a real
   server-side session for `github:1`/`dev` plus a `Set-Cookie` response;
-  disable with `DSH_DEV_AUTO_LOGIN=0`, legacy name `DSH_DEV_FAKE_IAP=0`
-  still honored). A 401 (missing/expired session) navigates to `/auth/login`
+  disable with `DSH_DEV_AUTO_LOGIN=0`). A 401 (missing/expired session) navigates to `/auth/login`
   with a `return_to` back to the screen. The auto-login lives only in
   `apps/control-plane/src/dev.ts` — `main.ts` never imports it.
 - **Idle-timer discipline**: the screen's timers only hit `GET` workspace /

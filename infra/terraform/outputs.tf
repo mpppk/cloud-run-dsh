@@ -43,16 +43,6 @@ output "ai_agent_service_account_email" {
   value       = google_service_account.ai_agent.email
 }
 
-output "iap_brand_name" {
-  description = "IAP brand resource name (if created)."
-  value       = try(google_iap_brand.brand[0].name, null)
-}
-
-output "iap_client_id" {
-  description = "IAP OAuth client ID (if created)."
-  value       = try(google_iap_client.dsh[0].client_id, null)
-}
-
 output "control_plane_service_name" {
   description = "Control-plane Cloud Run service name (null when unmanaged: control_plane_image is empty)."
   value       = try(google_cloud_run_v2_service.control_plane[0].name, null)
