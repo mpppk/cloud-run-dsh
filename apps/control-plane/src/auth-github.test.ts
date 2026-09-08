@@ -17,7 +17,12 @@ import {
   type GitHubUserAuthClient,
   type OAuthConfig,
 } from "./auth-github.js";
-import { InMemorySessionStore, SESSION_COOKIE_NAME, hashToken } from "./auth-session.js";
+import {
+  InMemorySessionStore,
+  OAUTH_BINDING_COOKIE_NAME,
+  SESSION_COOKIE_NAME,
+  hashToken,
+} from "./auth-session.js";
 import { SystemClock } from "./deps.js";
 
 const OAUTH: OAuthConfig = {
@@ -102,17 +107,34 @@ function loginRedirectLocation(res: Response): string {
   return res.headers.get("location")!;
 }
 
-/** Runs /auth/login and returns the raw state from the redirect. */
+/** Runs /auth/login and returns the raw state + binding nonce from the redirect. */
 async function doLogin(
   deps: AuthRouteDeps,
   returnTo?: string,
-): Promise<{ response: Response; state: string }> {
+): Promise<{ response: Response; state: string; nonce: string }> {
   const path = returnTo ? `/auth/login?return_to=${encodeURIComponent(returnTo)}` : "/auth/login";
   const response = await handleAuthLogin(new Request(`http://internal${path}`), deps);
   const location = loginRedirectLocation(response);
   const state = new URL(location).searchParams.get("state")!;
   expect(state).toMatch(/^[A-Za-z0-9_-]{43}$/);
-  return { response, state };
+  // A6: the login binds the browser with an HttpOnly nonce cookie.
+  const bindingSetCookie = response.headers.get("set-cookie")!;
+  expect(bindingSetCookie).toContain(`${OAUTH_BINDING_COOKIE_NAME}=`);
+  const nonce = bindingSetCookie.split(";")[0]!.split("=")[1]!;
+  expect(nonce).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  return { response, state, nonce };
+}
+
+/** Builds a callback request, optionally carrying a binding cookie. */
+function callbackRequest(state: string, code: string, cookie: string | null): Request {
+  return new Request(
+    `http://internal/auth/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`,
+    cookie ? { headers: { cookie } } : {},
+  );
+}
+
+function bindingCookie(nonce: string): string {
+  return `${OAUTH_BINDING_COOKIE_NAME}=${nonce}`;
 }
 
 describe("issue #151: /auth/login", () => {
@@ -185,11 +207,8 @@ describe("issue #151: return_to allowlist", () => {
     const sessions = new InMemorySessionStore();
     const fake = new FakeGitHub();
     const d = depsWith(fake, sessions);
-    const { state } = await doLogin(d, "/app?ws=ws-1");
-    const res = await handleAuthCallback(
-      new Request(`http://internal/auth/callback?code=code-1&state=${state}`),
-      d,
-    );
+    const { state, nonce } = await doLogin(d, "/app?ws=ws-1");
+    const res = await handleAuthCallback(callbackRequest(state, "code-1", bindingCookie(nonce)), d);
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/app?ws=ws-1");
   });
@@ -198,11 +217,8 @@ describe("issue #151: return_to allowlist", () => {
     const sessions = new InMemorySessionStore();
     const fake = new FakeGitHub();
     const d = depsWith(fake, sessions);
-    const { state } = await doLogin(d, "https://evil.example/steal");
-    const res = await handleAuthCallback(
-      new Request(`http://internal/auth/callback?code=code-1&state=${state}`),
-      d,
-    );
+    const { state, nonce } = await doLogin(d, "https://evil.example/steal");
+    const res = await handleAuthCallback(callbackRequest(state, "code-1", bindingCookie(nonce)), d);
     expect(res.headers.get("location")).toBe("/app");
   });
 });
@@ -212,16 +228,20 @@ describe("issue #151: /auth/callback", () => {
     const sessions = new InMemorySessionStore();
     const fake = new FakeGitHub();
     const d = depsWith(fake, sessions);
-    const { state } = await doLogin(d);
-    const res = await handleAuthCallback(
-      new Request(`http://internal/auth/callback?code=code-abc&state=${state}`),
-      d,
-    );
+    const { state, nonce } = await doLogin(d);
+    const res = await handleAuthCallback(callbackRequest(state, "code-abc", bindingCookie(nonce)), d);
     expect(res.status).toBe(302);
-    const setCookie = res.headers.get("set-cookie")!;
-    expect(setCookie).toContain(`${SESSION_COOKIE_NAME}=`);
+    const setCookies = res.headers.getSetCookie();
+    expect(setCookies.some((c) => c.startsWith(`${SESSION_COOKIE_NAME}=`))).toBe(true);
+    const setCookie = setCookies.find((c) => c.startsWith(`${SESSION_COOKIE_NAME}=`))!;
     expect(setCookie).toContain("Secure");
     expect(setCookie).toContain("HttpOnly");
+    // The binding nonce is retired in the same redirect.
+    expect(
+      setCookies.some(
+        (c) => c.startsWith(`${OAUTH_BINDING_COOKIE_NAME}=`) && c.includes("Max-Age=0"),
+      ),
+    ).toBe(true);
     // The cookie authenticates as the numeric-id principal.
     const raw = setCookie.split(";")[0]!.split("=")[1]!;
     const record = await sessions.lookupSession(raw, new Date());
@@ -249,14 +269,11 @@ describe("issue #151: /auth/callback", () => {
     // Replay: consume once via a real login, then replay.
     const sessions = new InMemorySessionStore();
     const d2 = depsWith(new FakeGitHub(), sessions);
-    const { state } = await doLogin(d2);
-    const first = await handleAuthCallback(
-      new Request(`http://internal/auth/callback?code=c1&state=${state}`),
-      d2,
-    );
+    const { state, nonce } = await doLogin(d2);
+    const first = await handleAuthCallback(callbackRequest(state, "c1", bindingCookie(nonce)), d2);
     expect(first.status).toBe(302);
     const replay = await handleAuthCallback(
-      new Request(`http://internal/auth/callback?code=c1&state=${state}`),
+      callbackRequest(state, "c1", bindingCookie(nonce)),
       d2,
     ).catch((e) => e as Response);
     expect((replay as Response).status ?? (replay as { status: number }).status).toBe(400);
@@ -265,9 +282,9 @@ describe("issue #151: /auth/callback", () => {
   test("code exchange failure -> generic 502, no token in the body", async () => {
     const sessions = new InMemorySessionStore();
     const d = depsWith(new FakeGitHub({ exchangeError: 400 }), sessions);
-    const { state } = await doLogin(d);
+    const { state, nonce } = await doLogin(d);
     const res = await handleAuthCallback(
-      new Request(`http://internal/auth/callback?code=bad&state=${state}`),
+      callbackRequest(state, "bad", bindingCookie(nonce)),
       d,
     ).catch((e) => e as Response);
     const status = res instanceof Response ? res.status : (res as { status: number }).status;
@@ -285,9 +302,9 @@ describe("issue #151: /auth/callback", () => {
     ]) {
       const sessions = new InMemorySessionStore();
       const d = depsWith(new FakeGitHub({ user: user as { id: unknown; login: unknown } }), sessions);
-      const { state } = await doLogin(d);
+      const { state, nonce } = await doLogin(d);
       const res = await handleAuthCallback(
-        new Request(`http://internal/auth/callback?code=c&state=${state}`),
+        callbackRequest(state, "c", bindingCookie(nonce)),
         d,
       ).catch((e) => e as Response);
       const status = res instanceof Response ? res.status : (res as { status: number }).status;
@@ -299,11 +316,8 @@ describe("issue #151: /auth/callback", () => {
     // The fake returns no email at all — login must succeed regardless.
     const sessions = new InMemorySessionStore();
     const d = depsWith(new FakeGitHub({ user: { id: 99, login: "private-email-user" } }), sessions);
-    const { state } = await doLogin(d);
-    const res = await handleAuthCallback(
-      new Request(`http://internal/auth/callback?code=c&state=${state}`),
-      d,
-    );
+    const { state, nonce } = await doLogin(d);
+    const res = await handleAuthCallback(callbackRequest(state, "c", bindingCookie(nonce)), d);
     expect(res.status).toBe(302);
     const raw = res.headers.get("set-cookie")!.split(";")[0]!.split("=")[1]!;
     expect((await sessions.lookupSession(raw, new Date()))?.user.id).toBe("github:99");
@@ -313,11 +327,8 @@ describe("issue #151: /auth/callback", () => {
     const sessions = new InMemorySessionStore();
     const fake = new FakeGitHub({ accessToken: "ghu_super-secret-token-123" });
     const d = depsWith(fake, sessions);
-    const { state } = await doLogin(d);
-    await handleAuthCallback(
-      new Request(`http://internal/auth/callback?code=c&state=${state}`),
-      d,
-    );
+    const { state, nonce } = await doLogin(d);
+    await handleAuthCallback(callbackRequest(state, "c", bindingCookie(nonce)), d);
     // The only rows are the session + (consumed) flow; the token string
     // appears nowhere in the store's reachable state. Sessions are keyed by
     // hash, so assert via lookup behavior + size instead of internals: one
@@ -328,16 +339,103 @@ describe("issue #151: /auth/callback", () => {
   });
 });
 
+describe("A6: OAuth browser binding (session-planting defense)", () => {
+  test("login issues a 256-bit binding nonce; only its hash is stored", async () => {
+    const sessions = new InMemorySessionStore();
+    const d = depsWith(new FakeGitHub(), sessions);
+    const { response, state, nonce } = await doLogin(d);
+    const setCookie = response.headers.get("set-cookie")!;
+    expect(setCookie).toContain("Max-Age=300");
+    expect(setCookie).toContain("Secure");
+    expect(setCookie).toContain("HttpOnly");
+    expect(setCookie).toContain("SameSite=Lax");
+    // The store holds the hash, never the raw nonce.
+    const consumed = await sessions.consumeLoginFlow(state, new Date());
+    expect(consumed?.bindingHash).toBe(hashToken(nonce).toString("hex"));
+    expect(consumed?.bindingHash).not.toContain(nonce);
+  });
+
+  test("callback without a binding cookie -> 400, flow consumed, GitHub never called", async () => {
+    const sessions = new InMemorySessionStore();
+    const fake = new FakeGitHub();
+    const d = depsWith(fake, sessions);
+    const { state } = await doLogin(d);
+    const status = await handleAuthCallback(callbackRequest(state, "c", null), d)
+      .then((r) => r.status)
+      .catch((e) => (e as { status?: number }).status ?? 500);
+    expect(status).toBe(400);
+    expect(fake.exchanges).toHaveLength(0);
+    expect(fake.userCalls).toHaveLength(0);
+    expect(sessions.size()).toEqual({ sessions: 0, flows: 0 });
+  });
+
+  test("callback with a mismatched binding nonce -> 400, no session, GitHub never called", async () => {
+    const sessions = new InMemorySessionStore();
+    const fake = new FakeGitHub();
+    const d = depsWith(fake, sessions);
+    // Attacker knows `state` (e.g. from logs) but not the victim's HttpOnly nonce.
+    const { state } = await doLogin(d);
+    const { nonce: otherNonce } = await doLogin(d);
+    const status = await handleAuthCallback(
+      callbackRequest(state, "c", bindingCookie(otherNonce)),
+      d,
+    )
+      .then((r) => r.status)
+      .catch((e) => (e as { status?: number }).status ?? 500);
+    expect(status).toBe(400);
+    expect(fake.exchanges).toHaveLength(0);
+    expect(sessions.size()).toEqual({ sessions: 0, flows: 1 });
+  });
+
+  test("callback with duplicated binding cookies -> 400", async () => {
+    const sessions = new InMemorySessionStore();
+    const fake = new FakeGitHub();
+    const d = depsWith(fake, sessions);
+    const { state, nonce } = await doLogin(d);
+    const dup = `${bindingCookie(nonce)}; ${bindingCookie(nonce)}`;
+    const status = await handleAuthCallback(callbackRequest(state, "c", dup), d)
+      .then((r) => r.status)
+      .catch((e) => (e as { status?: number }).status ?? 500);
+    expect(status).toBe(400);
+    expect(fake.exchanges).toHaveLength(0);
+  });
+
+  test("callback with an empty binding value -> 400", async () => {
+    const sessions = new InMemorySessionStore();
+    const d = depsWith(new FakeGitHub(), sessions);
+    const { state } = await doLogin(d);
+    const status = await handleAuthCallback(
+      callbackRequest(state, "c", `${OAUTH_BINDING_COOKIE_NAME}=`),
+      d,
+    )
+      .then((r) => r.status)
+      .catch((e) => (e as { status?: number }).status ?? 500);
+    expect(status).toBe(400);
+  });
+
+  test("replay with the same binding after success -> 400 (flow is one-time)", async () => {
+    const sessions = new InMemorySessionStore();
+    const fake = new FakeGitHub();
+    const d = depsWith(fake, sessions);
+    const { state, nonce } = await doLogin(d);
+    const cookie = bindingCookie(nonce);
+    expect((await handleAuthCallback(callbackRequest(state, "c1", cookie), d)).status).toBe(302);
+    const replay = await handleAuthCallback(callbackRequest(state, "c1", cookie), d).catch(
+      (e) => e as { status?: number },
+    );
+    expect((replay as { status?: number }).status).toBe(400);
+    // Exactly one session was issued across both attempts.
+    expect(sessions.size()).toEqual({ sessions: 1, flows: 0 });
+  });
+});
+
 describe("issue #151: /auth/logout + /auth/session", () => {
   test("logout revokes server-side and clears the cookie", async () => {
     const sessions = new InMemorySessionStore();
     const fake = new FakeGitHub();
     const d = depsWith(fake, sessions);
-    const { state } = await doLogin(d);
-    const cb = await handleAuthCallback(
-      new Request(`http://internal/auth/callback?code=c&state=${state}`),
-      d,
-    );
+    const { state, nonce } = await doLogin(d);
+    const cb = await handleAuthCallback(callbackRequest(state, "c", bindingCookie(nonce)), d);
     const raw = cb.headers.get("set-cookie")!.split(";")[0]!.split("=")[1]!;
     expect(await sessions.lookupSession(raw, new Date())).not.toBeNull();
 
@@ -461,6 +559,51 @@ describe("issue #151: FetchGitHubUserAuthClient", () => {
     await expect(
       new FetchGitHubUserAuthClient(bad({ id: "x", login: "y" })).getUser("t"),
     ).rejects.toBeInstanceOf(GitHubOAuthError);
+  });
+
+  test("A2: hung GitHub fails at the timeout (exchange + getUser), signal aborted", async () => {
+    const hangForever = ((_url: string, init?: RequestInit) => {
+      // Ignores the abort signal entirely — the timer race must still win.
+      void init;
+      return new Promise<Response>(() => {});
+    }) as typeof fetch;
+    const exchangeClient = new FetchGitHubUserAuthClient(hangForever, undefined, undefined, {
+      timeoutMs: 50,
+    });
+    const start = Date.now();
+    const exchangeErr = await exchangeClient
+      .exchangeCode({ code: "c", codeVerifier: "v", redirectUri: "r", clientId: "i", clientSecret: "s" })
+      .then(
+        () => null,
+        (e) => e as Error,
+      );
+    expect(exchangeErr).toBeInstanceOf(GitHubOAuthError);
+    expect(String(exchangeErr?.message)).toContain("timed out");
+    expect(Date.now() - start).toBeLessThan(5000);
+
+    const userClient = new FetchGitHubUserAuthClient(hangForever, undefined, undefined, {
+      timeoutMs: 50,
+    });
+    await expect(userClient.getUser("t")).rejects.toThrow(/timed out/);
+
+    // A signal-respecting fetch observes the abort.
+    let observedSignal: AbortSignal | null = null;
+    const aborting = ((async (_url: string, init?: RequestInit) => {
+      observedSignal = (init?.signal as AbortSignal) ?? null;
+      return new Promise<Response>((_, reject) => {
+        observedSignal?.addEventListener("abort", () =>
+          reject(new DOMException("aborted", "AbortError")),
+        );
+      });
+    }) as unknown) as typeof fetch;
+    const abortClient = new FetchGitHubUserAuthClient(aborting, undefined, undefined, {
+      timeoutMs: 30,
+    });
+    await expect(
+      abortClient.exchangeCode({ code: "c", codeVerifier: "v", redirectUri: "r", clientId: "i", clientSecret: "s" }),
+    ).rejects.toThrow(/timed out/);
+    expect(observedSignal).not.toBeNull();
+    expect(observedSignal!.aborted).toBe(true);
   });
 });
 

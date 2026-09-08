@@ -15,13 +15,19 @@
 
 import { badGateway, badRequest, unauthorized, unavailable } from "./errors.js";
 import {
+  bindingMatches,
+  buildOAuthBindingClearCookie,
+  buildOAuthBindingSetCookie,
   buildSessionClearCookie,
   buildSessionSetCookie,
   generateCodeVerifier,
   generateRawToken,
+  hashToken,
+  parseOAuthBindingCookies,
   parseSessionCookies,
   pkceChallenge,
   LOGIN_STATE_BYTES,
+  OAUTH_BINDING_BYTES,
   type SessionStore,
 } from "./auth-session.js";
 import { githubUser } from "./auth.js";
@@ -54,29 +60,71 @@ export interface GitHubUserAuthClient {
  * Secret posture: client_secret travels only in the token-exchange POST
  * body. Failures log status codes, never response bodies (an error body
  * must be assumed to be able to carry reflected material).
+ *
+ * Every call races an AbortController timeout (A2, default 10s): a hung
+ * GitHub must fail the callback fast instead of parking it until the
+ * platform request timeout. The timer is always cleared on settle.
  */
 export class FetchGitHubUserAuthClient implements GitHubUserAuthClient {
+  private readonly timeoutMs: number;
+
   constructor(
     private readonly fetchFn: typeof fetch = fetch,
     private readonly apiBaseUrl: string = "https://api.github.com",
     private readonly oauthBaseUrl: string = "https://github.com",
-  ) {}
+    opts: { timeoutMs?: number } = {},
+  ) {
+    this.timeoutMs = opts.timeoutMs ?? 10_000;
+  }
+
+  /**
+   * Runs `fn` with an abort signal that fires at `timeoutMs`, raced against
+   * a timer rejection: real fetches are aborted via the signal, while a
+   * signal-ignoring transport still loses the race. The timer is always
+   * cleared on settle.
+   */
+  private async withTimeout<T>(label: string, fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        fn(controller.signal),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new GitHubOAuthError(`${label} timed out after ${this.timeoutMs}ms`));
+          }, this.timeoutMs);
+        }),
+      ]);
+    } catch (e) {
+      if (e instanceof Error && e.name === "AbortError") {
+        throw new GitHubOAuthError(`${label} timed out after ${this.timeoutMs}ms`);
+      }
+      throw e;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
 
   async exchangeCode(input: CodeExchangeInput): Promise<{ accessToken: string }> {
     let res: Response;
     try {
-      res = await this.fetchFn(`${this.oauthBaseUrl}/login/oauth/access_token`, {
-        method: "POST",
-        headers: { "content-type": "application/json", accept: "application/json" },
-        body: JSON.stringify({
-          client_id: input.clientId,
-          client_secret: input.clientSecret,
-          code: input.code,
-          redirect_uri: input.redirectUri,
-          code_verifier: input.codeVerifier,
+      res = await this.withTimeout("token endpoint", (signal) =>
+        this.fetchFn(`${this.oauthBaseUrl}/login/oauth/access_token`, {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify({
+            client_id: input.clientId,
+            client_secret: input.clientSecret,
+            code: input.code,
+            redirect_uri: input.redirectUri,
+            code_verifier: input.codeVerifier,
+          }),
+          signal,
         }),
-      });
+      );
     } catch (e) {
+      if (e instanceof GitHubOAuthError) throw e;
       throw new GitHubOAuthError(`token endpoint unreachable: ${shortError(e)}`);
     }
     if (!res.ok) {
@@ -101,15 +149,19 @@ export class FetchGitHubUserAuthClient implements GitHubUserAuthClient {
   async getUser(accessToken: string): Promise<GitHubUserProfile> {
     let res: Response;
     try {
-      res = await this.fetchFn(`${this.apiBaseUrl}/user`, {
-        method: "GET",
-        headers: {
-          authorization: `Bearer ${accessToken}`,
-          accept: "application/vnd.github+json",
-          "X-GitHub-Api-Version": "2022-11-28",
-        },
-      });
+      res = await this.withTimeout("GitHub API", (signal) =>
+        this.fetchFn(`${this.apiBaseUrl}/user`, {
+          method: "GET",
+          headers: {
+            authorization: `Bearer ${accessToken}`,
+            accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+          },
+          signal,
+        }),
+      );
     } catch (e) {
+      if (e instanceof GitHubOAuthError) throw e;
       throw new GitHubOAuthError(`GitHub API unreachable: ${shortError(e)}`);
     }
     if (!res.ok) {
@@ -213,9 +265,9 @@ function requireOAuth(deps: AuthRouteDeps): { config: OAuthConfig; client: GitHu
   return { config: deps.oauth, client: deps.githubAuth };
 }
 
-function redirect(to: string, setCookie?: string): Response {
-  const headers: Record<string, string> = { location: to };
-  if (setCookie) headers["set-cookie"] = setCookie;
+function redirect(to: string, setCookies: string[] = []): Response {
+  const headers = new Headers({ location: to });
+  for (const value of setCookies) headers.append("set-cookie", value);
   return new Response(null, { status: 302, headers });
 }
 
@@ -227,12 +279,20 @@ export async function handleAuthLogin(request: Request, deps: AuthRouteDeps): Pr
   // The raw state + verifier are generated here and kept in scope: the store
   // persists ONLY hashes/verifier material server-side, while the redirect
   // carries the raw state (to be hashed on callback) and the S256 challenge.
+  //
+  // A6 browser binding: a second 256-bit nonce is issued as an HttpOnly
+  // `__Host-dsh_oauth` cookie; only its hash joins the flow row. The
+  // callback must present the same browser's nonce, which closes
+  // session-planting via crafted callback URLs (the attacker knows `state`
+  // but never the victim's HttpOnly cookie).
   const rawState = generateRawToken(LOGIN_STATE_BYTES);
   const codeVerifier = generateCodeVerifier();
+  const rawNonce = generateRawToken(OAUTH_BINDING_BYTES);
   await deps.sessions.createLoginFlow({
     rawState,
     codeVerifier,
     returnTo,
+    bindingHash: hashToken(rawNonce).toString("hex"),
     now: deps.clock.now(),
   });
   return redirect(
@@ -242,6 +302,7 @@ export async function handleAuthLogin(request: Request, deps: AuthRouteDeps): Pr
       state: rawState,
       codeChallenge: pkceChallenge(codeVerifier),
     }),
+    [buildOAuthBindingSetCookie(rawNonce)],
   );
 }
 
@@ -258,6 +319,14 @@ export async function handleAuthCallback(request: Request, deps: AuthRouteDeps):
   if (!flow) {
     // Unknown / expired / already-consumed state (replay) — one bucket, no oracle.
     throw badRequest("invalid or expired OAuth state");
+  }
+  // A6: the callback must come from the browser that started the flow.
+  // Exactly one non-empty binding nonce, constant-time compared against the
+  // consumed flow's hash. Missing / duplicated / mismatched bindings fail
+  // closed here — the flow is already consumed, so there is no retry oracle.
+  const bindings = parseOAuthBindingCookies(request.headers.get("cookie"));
+  if (bindings.length !== 1 || !bindings[0] || !bindingMatches(bindings[0]!, flow.bindingHash)) {
+    throw badRequest("invalid OAuth browser binding");
   }
   let profile: GitHubUserProfile;
   try {
@@ -284,7 +353,11 @@ export async function handleAuthCallback(request: Request, deps: AuthRouteDeps):
     githubUser(profile.id, profile.login),
     deps.clock.now(),
   );
-  return redirect(resolveReturnTo(flow.returnTo), buildSessionSetCookie(created.rawToken));
+  // Issue the session and retire the binding nonce in the same redirect.
+  return redirect(resolveReturnTo(flow.returnTo), [
+    buildSessionSetCookie(created.rawToken),
+    buildOAuthBindingClearCookie(),
+  ]);
 }
 
 /** POST /auth/logout: revokes presented session(s), clears the cookie. Always 200. */

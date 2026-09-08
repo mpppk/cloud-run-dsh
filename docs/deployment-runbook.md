@@ -641,26 +641,33 @@ From a browser/session that goes through IAP:
 export DB_PASSWORD="$(gcloud secrets versions access latest --secret=db-password)"  # as in Step 4
 
 # 1. Control plane is alive (through the IAP-secured endpoint / LB URL).
-#    /livez is served before the auth pipeline — no IAP headers needed here.
+#    /livez is served before the auth pipeline — no session needed here.
 #    (Never /healthz: Cloud Run reserves that exact path — issue #68.)
 curl -s "https://<control-plane-host>/livez"
 # → expect a 200 with the health payload
 
-# IAP injects BOTH headers below in front of Cloud Run; the API returns 401
-# "missing IAP identity headers" unless BOTH are present
-# (parseIapHeaders in apps/control-plane/src/auth.ts requires user-id AND
-# user-email). Set them once:
-IAP_ID='x-goog-authenticated-user-id: accounts.google.com:<sub>'
-IAP_EMAIL='x-goog-authenticated-user-email: <email@example.com>'
+# The API authenticates ONLY via the __Host-dsh_session cookie (issues
+# #150–#152). IAP headers are ignored — sending them authenticates nothing.
+# Log in once in a browser (https://<control-plane-host>/auth/login),
+# then put the session value into a curl cookie jar:
+#   (DevTools → Application → Cookies → copy the __Host-dsh_session value
+#   into $DSH_SESSION, then run the printf below — tab-separated Netscape
+#   jar format; replace <control-plane-host> with the bare hostname.)
+JAR="$(mktemp)"; trap 'rm -f "$JAR"' EXIT
+printf '<control-plane-host>\tTRUE\t/\tTRUE\t2000000000\t__Host-dsh_session\t%s\n' "$DSH_SESSION" > "$JAR"
+curl -s -c "$JAR" -b "$JAR" "https://<control-plane-host>/auth/session"
+# → 200 {"user":{"id":"github:<numeric-id>","login":"…"}} proves the jar works.
+# (Requests without a valid session get 401 "missing/invalid session".)
+#
+# All API calls below add -c "$JAR" -b "$JAR". The jar refreshes on use.
 
-# 2. Create a workspace (both IAP headers must be present).
+# 2. Create a workspace (session cookie jar required; issue #154: the caller
+#    additionally needs GitHub read-or-above on the target repo, else 403).
 #    NOTE: the server GENERATES the workspace id (crypto.randomUUID() in
 #    handlers.ts createWorkspace) and requires repositoryOwner/repositoryName;
 #    you do NOT send an id. baseBranch is optional and defaults to "main".
-CREATE_RESPONSE="$(curl -s -X POST "https://<control-plane-host>/v1/workspaces" \
+CREATE_RESPONSE="$(curl -s -c "$JAR" -b "$JAR" -X POST "https://<control-plane-host>/v1/workspaces" \
   -H "Content-Type: application/json" \
-  -H "$IAP_ID" \
-  -H "$IAP_EMAIL" \
   -d '{"repositoryOwner":"<repo-owner>","repositoryName":"<repo-name>","baseBranch":"main"}')"
 echo "$CREATE_RESPONSE"
 # → 201 with the workspace DTO { id, ownerId, repositoryOwner, repositoryName, baseBranch, runtimeState, ... }
@@ -674,13 +681,11 @@ WORKSPACE_ID="$(echo "$CREATE_RESPONSE" | jq -r '.id')"
 #    the agent-host persists READY on the shared row when its recovery
 #    completes (minutes on a cold boot, ~3 min for stop-then-open per #121).
 #    NEVER wait on this call — poll GET until runtime_state reads READY:
-curl -s -X POST "https://<control-plane-host>/v1/workspaces/${WORKSPACE_ID}/open" \
-  -H "$IAP_ID" \
-  -H "$IAP_EMAIL"
+curl -s -c "$JAR" -b "$JAR" -X POST "https://<control-plane-host>/v1/workspaces/${WORKSPACE_ID}/open"
 # → 202 {"workspaceId":"…","state":"STARTING"}
 
 for _ in $(seq 1 60); do
-  STATE="$(curl -s -H "$IAP_ID" -H "$IAP_EMAIL" \
+  STATE="$(curl -s -c "$JAR" -b "$JAR" \
     "https://<control-plane-host>/v1/workspaces/${WORKSPACE_ID}" | jq -r '.runtimeState')"
   echo "runtimeState=$STATE"
   [ "$STATE" = "READY" ] && break
@@ -779,9 +784,7 @@ The way out is re-sending the stop — `STOPPING` re-entry is allowed
 (`prepareStop` resumes the sequence instead of throwing):
 
 ```bash
-curl -s -X POST "https://<control-plane-host>/v1/workspaces/${WORKSPACE_ID}/stop" \
-  -H "$IAP_ID" \
-  -H "$IAP_EMAIL"
+curl -s -c "$JAR" -b "$JAR" -X POST "https://<control-plane-host>/v1/workspaces/${WORKSPACE_ID}/stop"
 # → 200 {"state":"STOPPED"}, then open again as in step 3 above.
 ```
 

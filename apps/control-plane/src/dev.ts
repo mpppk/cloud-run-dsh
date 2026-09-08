@@ -24,7 +24,7 @@ import type {
 } from "@cloud-run-dsh/session-persistence-postgres";
 import type { ActivityKind } from "@cloud-run-dsh/workspace-runtime";
 import { createControlPlaneDeps, createFetchHandler } from "./index.js";
-import { buildSessionSetCookie, parseSessionCookies } from "./auth-session.js";
+import { buildSessionSetCookie, parseSessionCookies, SESSION_COOKIE_NAME } from "./auth-session.js";
 import { githubUser } from "./auth.js";
 import { SERVER_IDLE_TIMEOUT_SECONDS } from "./server.js";
 import type { RunningControlPlane } from "./index.js";
@@ -332,15 +332,24 @@ export function createDevFetchHandler(
         !!presented[0] &&
         (await deps.sessions.lookupSession(presented[0]!, deps.clock.now())) !== null;
       if (!hasValid) {
+        // A5: recover instead of stacking — an expired/invalid/stale cookie
+        // is REPLACED, never appended. Appending would produce a 2-value
+        // Cookie header that the exactly-one rule 401s; replacing yields a
+        // single fresh dev session either way.
         const created = await deps.sessions.createSession(DEV_USER, deps.clock.now());
         const headers = new Headers(request.headers);
         const existing = headers.get("cookie");
-        headers.set(
-          "cookie",
-          existing
-            ? `${existing}; __Host-dsh_session=${created.rawToken}`
-            : `__Host-dsh_session=${created.rawToken}`,
-        );
+        const kept = existing
+          ? existing
+              .split(";")
+              .map((part) => part.trim())
+              .filter((part) => {
+                const eq = part.indexOf("=");
+                return eq < 0 || part.slice(0, eq).trim() !== SESSION_COOKIE_NAME;
+              })
+          : [];
+        kept.push(`${SESSION_COOKIE_NAME}=${created.rawToken}`);
+        headers.set("cookie", kept.join("; "));
         request = new Request(request, { headers });
         setCookie = buildSessionSetCookie(created.rawToken);
       }

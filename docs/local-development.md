@@ -78,7 +78,7 @@ read, listing never extends the idle timer:
 
 ```bash
 curl -s -c "$JAR" -b "$JAR" "$BASE/v1/workspaces"
-# {"workspaces":[{"id":"…","ownerId":"alice",…,"runtimeState":"STOPPED",…}]}
+# {"workspaces":[{"id":"…","ownerId":"github:1",…,"runtimeState":"STOPPED",…}]}
 ```
 
 ### 2. Open the workspace (202, async)

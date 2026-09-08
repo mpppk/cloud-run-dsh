@@ -30,10 +30,13 @@ import {
   createRepositoryAuthorizer,
 } from "@cloud-run-dsh/github-credential-broker";
 import { FetchGitHubUserAuthClient } from "./auth-github.js";
-import { PostgresSessionStore } from "./auth-session.js";
+import { CLEANUP_DEFAULT_LIMIT, PostgresSessionStore } from "./auth-session.js";
 import { OwnerMembershipStore } from "./prod-adapters.js";
 import { createProductionRuntimeRegistry } from "./runtime-factory.js";
 import { startStoppedInstanceSweeper } from "./instance-gc.js";
+
+/** A1: cadence of the expired auth-session/login-flow sweeper (hourly). */
+export const SESSION_GC_INTERVAL_MS = 60 * 60 * 1000;
 
 async function main(): Promise<void> {
   const config = readControlPlaneConfig();
@@ -78,6 +81,8 @@ async function main(): Promise<void> {
     gcsClient: new FetchGcsClient({ tokenProvider }),
     messageForwarder,
   });
+  // Issue #150: server-side sessions in Cloud SQL (SHA-256 hashes only).
+  const sessionStore = new PostgresSessionStore(executor);
   const deps = createControlPlaneDeps({
     repo,
     leases: new ControllerLeaseService({
@@ -86,7 +91,7 @@ async function main(): Promise<void> {
     }),
     membership: new OwnerMembershipStore(executor),
     // Issue #150: server-side sessions in Cloud SQL (SHA-256 hashes only).
-    sessions: new PostgresSessionStore(executor),
+    sessions: sessionStore,
     // Issue #154: workspace creation verifies the caller's repository
     // permission through the GitHub App (installation token, short-lived,
     // never persisted). Shares the App id + private key the Instances use
@@ -164,9 +169,35 @@ async function main(): Promise<void> {
     logger.info("stopped-instance GC sweeper disabled (INSTANCE_GC_INTERVAL_MS=0)");
   }
 
+  // A1: hourly bounded sweep of expired auth sessions + login flows. The
+  // opportunistic sweep inside createLoginFlow caps anonymous-junk growth;
+  // this covers the long tail (abandoned sessions past their 7-day TTL).
+  // Bounded per pass (500 rows/table), unref'd so it never holds the
+  // process open, stopped on shutdown. Correctness never depends on it —
+  // lookups enforce expiry regardless.
+  const sessionGc = setInterval(() => {
+    void sessionStore
+      .cleanupExpired(new Date(), CLEANUP_DEFAULT_LIMIT)
+      .then((cleaned) => {
+        if (cleaned.sessions > 0 || cleaned.flows > 0) {
+          logger.info("auth sessions GC swept", {
+            sessions: cleaned.sessions,
+            flows: cleaned.flows,
+          });
+        }
+      })
+      .catch((e) => {
+        logger.error("auth sessions GC failed", {
+          error: e instanceof Error ? e.message : String(e),
+        });
+      });
+  }, SESSION_GC_INTERVAL_MS);
+  (sessionGc as unknown as { unref?: () => void }).unref?.();
+
   const shutdown = (signal: string): void => {
     logger.info(`${signal} received; shutting down`);
     sweeper?.stop();
+    clearInterval(sessionGc);
     server.stop();
     void executor.close().finally(() => process.exit(0));
   };
