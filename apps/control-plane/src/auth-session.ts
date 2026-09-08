@@ -10,13 +10,22 @@
 // `state` is hashed before storage and consumed exactly once (atomic
 // DELETE ... RETURNING, so a replayed callback finds nothing).
 
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { QueryExecutor } from "@cloud-run-dsh/session-persistence-postgres";
 import { githubUser, type AuthenticatedUser } from "./auth.js";
 import { unauthorized } from "./errors.js";
 
 /** Session cookie name. The `__Host-` prefix forces Secure + Path=/ + no Domain. */
 export const SESSION_COOKIE_NAME = "__Host-dsh_session";
+/**
+ * OAuth login binding cookie (A6): ties the callback request's BROWSER to
+ * the server-side login flow, closing session-planting via crafted callback
+ * URLs. Same `__Host-` discipline as the session cookie; short-lived
+ * (matches the 5-minute login-flow lifetime).
+ */
+export const OAUTH_BINDING_COOKIE_NAME = "__Host-dsh_oauth";
+/** Raw binding-nonce size: 256 bits, base64url-encoded. */
+export const OAUTH_BINDING_BYTES = 32;
 /** Raw token size: 256 bits, base64url-encoded (~43 chars). */
 export const SESSION_TOKEN_BYTES = 32;
 /** Raw OAuth state size: 256 bits. */
@@ -70,6 +79,51 @@ export function buildSessionClearCookie(): string {
   return `${SESSION_COOKIE_NAME}=; Max-Age=0; ${SESSION_COOKIE_ATTRIBUTES}`;
 }
 
+/** `Set-Cookie` value binding the browser to a login flow (A6). */
+export function buildOAuthBindingSetCookie(rawNonce: string): string {
+  return `${OAUTH_BINDING_COOKIE_NAME}=${rawNonce}; Max-Age=${LOGIN_FLOW_LIFETIME_MS / 1000}; ${SESSION_COOKIE_ATTRIBUTES}`;
+}
+
+/** `Set-Cookie` value clearing the login binding (callback done). */
+export function buildOAuthBindingClearCookie(): string {
+  return `${OAUTH_BINDING_COOKIE_NAME}=; Max-Age=0; ${SESSION_COOKIE_ATTRIBUTES}`;
+}
+
+/**
+ * Extracts `__Host-dsh_oauth` values from a `Cookie` header. Same
+ * exactly-one rule as sessions: the callback fails closed unless precisely
+ * one non-empty value is present.
+ */
+export function parseOAuthBindingCookies(cookieHeader: string | null): string[] {
+  if (!cookieHeader) return [];
+  const found: string[] = [];
+  for (const part of cookieHeader.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 0) continue;
+    if (part.slice(0, eq).trim() !== OAUTH_BINDING_COOKIE_NAME) continue;
+    found.push(part.slice(eq + 1).trim());
+  }
+  return found;
+}
+
+/**
+ * Compares a presented binding nonce against the stored hex hash in
+ * constant time. Both sides derive from 256-bit nonces (32-byte digests),
+ * so lengths always agree for well-formed inputs; mismatched lengths deny.
+ */
+export function bindingMatches(rawNonce: string, expectedHex: string): boolean {
+  if (!rawNonce || !expectedHex) return false;
+  const actual = hashToken(rawNonce);
+  let expected: Buffer;
+  try {
+    expected = Buffer.from(expectedHex, "hex");
+  } catch {
+    return false;
+  }
+  if (expected.length !== actual.length) return false;
+  return timingSafeEqual(actual, expected);
+}
+
 /**
  * Extracts `__Host-dsh_session` values from a `Cookie` header.
  *
@@ -114,6 +168,8 @@ export interface CreatedLoginFlow {
 export interface ConsumedLoginFlow {
   readonly codeVerifier: string;
   readonly returnTo: string | null;
+  /** Hex SHA-256 of the browser binding nonce issued with the flow (A6). */
+  readonly bindingHash: string;
 }
 
 export interface SessionStore {
@@ -125,6 +181,8 @@ export interface SessionStore {
     rawState: string;
     codeVerifier: string;
     returnTo: string | null;
+    /** Hex SHA-256 of the caller-generated browser binding nonce (A6). */
+    bindingHash: string;
     now: Date;
   }): Promise<CreatedLoginFlow>;
   /**
@@ -133,7 +191,22 @@ export interface SessionStore {
    */
   consumeLoginFlow(rawState: string, now: Date): Promise<ConsumedLoginFlow | null>;
   revokeLoginFlow?(rawState: string): Promise<void>;
+  /**
+   * Deletes expired rows, bounded by `limit` per table (default 500).
+   * Correctness never depends on this (lookups enforce expiry); it only
+   * bounds junk-row growth from anonymous login attempts and abandoned
+   * sessions (A1).
+   */
+  cleanupExpired(now: Date, limit?: number): Promise<ExpiredCleanup>;
 }
+
+export interface ExpiredCleanup {
+  readonly sessions: number;
+  readonly flows: number;
+}
+
+/** Default per-table bound for one cleanup pass (A1). */
+export const CLEANUP_DEFAULT_LIMIT = 500;
 
 // ---------------------------------------------------------------------------
 // In-memory implementation (dev / tests)
@@ -177,11 +250,13 @@ export class InMemorySessionStore implements SessionStore {
     rawState: string;
     codeVerifier: string;
     returnTo: string | null;
+    bindingHash: string;
     now: Date;
   }): Promise<CreatedLoginFlow> {
     this.flows.set(hashToken(input.rawState).toString("hex"), {
       codeVerifier: input.codeVerifier,
       returnTo: input.returnTo,
+      bindingHash: input.bindingHash,
       expiresAtMs: input.now.getTime() + LOGIN_FLOW_LIFETIME_MS,
     });
     return { expiresAt: new Date(input.now.getTime() + LOGIN_FLOW_LIFETIME_MS) };
@@ -195,12 +270,33 @@ export class InMemorySessionStore implements SessionStore {
     this.flows.delete(key);
     if (!flow) return null;
     if (flow.expiresAtMs <= now.getTime()) return null;
-    return { codeVerifier: flow.codeVerifier, returnTo: flow.returnTo };
+    return { codeVerifier: flow.codeVerifier, returnTo: flow.returnTo, bindingHash: flow.bindingHash };
   }
 
   async revokeLoginFlow(rawState: string): Promise<void> {
     if (!rawState) return;
     this.flows.delete(hashToken(rawState).toString("hex"));
+  }
+
+  async cleanupExpired(now: Date, limit: number = CLEANUP_DEFAULT_LIMIT): Promise<ExpiredCleanup> {
+    const atMs = now.getTime();
+    let sessions = 0;
+    for (const [key, record] of this.sessions) {
+      if (sessions >= limit) break;
+      if (record.expiresAt.getTime() <= atMs) {
+        this.sessions.delete(key);
+        sessions++;
+      }
+    }
+    let flows = 0;
+    for (const [key, flow] of this.flows) {
+      if (flows >= limit) break;
+      if (flow.expiresAtMs <= atMs) {
+        this.flows.delete(key);
+        flows++;
+      }
+    }
+    return { sessions, flows };
   }
 
   /** Test seam: how many live rows exist. */
@@ -264,16 +360,27 @@ export class PostgresSessionStore implements SessionStore {
     rawState: string;
     codeVerifier: string;
     returnTo: string | null;
+    bindingHash: string;
     now: Date;
   }): Promise<CreatedLoginFlow> {
     const expiresAt = new Date(input.now.getTime() + LOGIN_FLOW_LIFETIME_MS);
+    // A1 opportunistic GC: anonymous /login hits are the junk-row vector,
+    // so each flow creation first sweeps a bounded batch of expired rows.
+    // Best-effort only — cleanup must never fail the login itself (expiry
+    // is enforced at lookup regardless).
+    try {
+      await this.cleanupExpired(input.now);
+    } catch {
+      // ignore — the INSERT below is the load-bearing write.
+    }
     await this.executor.exec(
-      `INSERT INTO oauth_login_flows(state_hash, code_verifier, return_to, created_at, expires_at)
-       VALUES ($1, $2, $3, $4, $5)`,
+      `INSERT INTO oauth_login_flows(state_hash, code_verifier, return_to, binding_hash, created_at, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
       [
         hashToken(input.rawState),
         input.codeVerifier,
         input.returnTo,
+        Buffer.from(input.bindingHash, "hex"),
         input.now.toISOString(),
         expiresAt.toISOString(),
       ],
@@ -287,15 +394,22 @@ export class PostgresSessionStore implements SessionStore {
     // checks expiry, so a replayed (or concurrent) callback finds nothing.
     const rows = await this.executor.query<Record<string, unknown>>(
       `DELETE FROM oauth_login_flows WHERE state_hash = $1 AND expires_at > $2
-       RETURNING code_verifier, return_to`,
+       RETURNING code_verifier, return_to, binding_hash`,
       [hashToken(rawState), now.toISOString()],
     );
     if (rows.length === 0) return null;
     const row = rows[0]!;
     const returnTo = row["return_to"];
+    const bindingHash = row["binding_hash"];
     return {
       codeVerifier: String(row["code_verifier"]),
       returnTo: returnTo === null || returnTo === undefined ? null : String(returnTo),
+      bindingHash:
+        typeof bindingHash === "string"
+          ? bindingHash
+          : Buffer.isBuffer(bindingHash)
+            ? (bindingHash as Buffer).toString("hex")
+            : String(bindingHash ?? ""),
     };
   }
 
@@ -304,6 +418,26 @@ export class PostgresSessionStore implements SessionStore {
     await this.executor.exec(`DELETE FROM oauth_login_flows WHERE state_hash = $1`, [
       hashToken(rawState),
     ]);
+  }
+
+  async cleanupExpired(now: Date, limit: number = CLEANUP_DEFAULT_LIMIT): Promise<ExpiredCleanup> {
+    // Bounded deletes via id-subselect + LIMIT (A1): each pass removes at
+    // most `limit` expired rows per table, using the expires_at indexes —
+    // never a full-table sweep. Returns per-table deletion counts.
+    const iso = now.toISOString();
+    const deadSessions = await this.executor.query<{ id: string }>(
+      `DELETE FROM auth_sessions WHERE id IN (
+         SELECT id FROM auth_sessions WHERE expires_at < $1 ORDER BY expires_at LIMIT $2
+       ) RETURNING id`,
+      [iso, limit],
+    );
+    const deadFlows = await this.executor.query<{ state_hash: unknown }>(
+      `DELETE FROM oauth_login_flows WHERE state_hash IN (
+         SELECT state_hash FROM oauth_login_flows WHERE expires_at < $1 ORDER BY expires_at LIMIT $2
+       ) RETURNING state_hash`,
+      [iso, limit],
+    );
+    return { sessions: deadSessions.length, flows: deadFlows.length };
   }
 }
 

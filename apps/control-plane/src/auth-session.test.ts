@@ -5,13 +5,19 @@
 import { describe, expect, test } from "bun:test";
 import type { QueryExecutor } from "@cloud-run-dsh/session-persistence-postgres";
 import {
+  bindingMatches,
+  buildOAuthBindingClearCookie,
+  buildOAuthBindingSetCookie,
   buildSessionClearCookie,
   buildSessionSetCookie,
+  CLEANUP_DEFAULT_LIMIT,
   generateCodeVerifier,
   generateRawToken,
   hashToken,
   InMemorySessionStore,
   LOGIN_FLOW_LIFETIME_MS,
+  OAUTH_BINDING_COOKIE_NAME,
+  parseOAuthBindingCookies,
   parseSessionCookies,
   pkceChallenge,
   PostgresSessionStore,
@@ -161,11 +167,16 @@ describe("issue #150: SessionStore contract (both backends)", () => {
         rawState: rawState1,
         codeVerifier: "verifier-1",
         returnTo: "/app?ws=1",
+        bindingHash: hashToken("nonce-1").toString("hex"),
         now,
       });
       void flow;
       const first = await store.consumeLoginFlow(rawState1, now);
-      expect(first).toEqual({ codeVerifier: "verifier-1", returnTo: "/app?ws=1" });
+      expect(first).toEqual({
+        codeVerifier: "verifier-1",
+        returnTo: "/app?ws=1",
+        bindingHash: hashToken("nonce-1").toString("hex"),
+      });
       // Replay of the same state finds nothing.
       expect(await store.consumeLoginFlow(rawState1, now)).toBeNull();
 
@@ -174,6 +185,7 @@ describe("issue #150: SessionStore contract (both backends)", () => {
         rawState: rawState2,
         codeVerifier: "verifier-2",
         returnTo: null,
+        bindingHash: hashToken("nonce-2").toString("hex"),
         now,
       });
       const late = new Date(now.getTime() + LOGIN_FLOW_LIFETIME_MS + 1000);
@@ -211,19 +223,28 @@ describe("issue #150: Postgres store never persists raw material", () => {
     const exec = new RecordingExecutor();
     const store = new PostgresSessionStore(exec);
     const rawState = generateRawToken();
+    const bindingHash = hashToken("binding-nonce").toString("hex");
     await store.createLoginFlow({
       rawState,
       codeVerifier: "v",
       returnTo: null,
+      bindingHash,
       now: new Date(),
     });
     expect(exec.allParamsText()).not.toContain(rawState);
+    // binding_hash stored as raw bytes (hex in the fake's serialization).
+    expect(exec.allParamsText()).toContain(bindingHash);
+    const insert = exec.statements.find((s) => s.sql.includes("INSERT INTO oauth_login_flows"))!;
+    expect(insert.sql).toContain("binding_hash");
     exec.statements.length = 0;
-    exec.queuedRows.push([{ code_verifier: "v", return_to: null }]);
+    exec.queuedRows.push([
+      { code_verifier: "v", return_to: null, binding_hash: Buffer.from(bindingHash, "hex") },
+    ]);
     const consumed = await store.consumeLoginFlow(rawState, new Date());
-    expect(consumed).toEqual({ codeVerifier: "v", returnTo: null });
+    expect(consumed).toEqual({ codeVerifier: "v", returnTo: null, bindingHash });
     expect(exec.statements[0]!.sql).toContain("DELETE FROM oauth_login_flows");
     expect(exec.statements[0]!.sql).toContain("RETURNING");
+    expect(exec.statements[0]!.sql).toContain("binding_hash");
   });
 
   test("lookup maps the row back to github:<numeric-id> principal", async () => {
@@ -246,5 +267,137 @@ describe("issue #150: Postgres store never persists raw material", () => {
       providerUserId: "4279342",
       login: "mpppk",
     });
+  });
+});
+
+describe("A6: OAuth browser-binding cookie", () => {
+  test("__Host- prefix, Secure/HttpOnly/SameSite=Lax/Path=/, 5-minute Max-Age", () => {
+    expect(OAUTH_BINDING_COOKIE_NAME.startsWith("__Host-")).toBe(true);
+    expect(OAUTH_BINDING_COOKIE_NAME).not.toBe(SESSION_COOKIE_NAME);
+    const set = buildOAuthBindingSetCookie("raw-nonce-value");
+    expect(set.startsWith(`${OAUTH_BINDING_COOKIE_NAME}=raw-nonce-value`)).toBe(true);
+    for (const attr of ["Path=/", "Secure", "HttpOnly", "SameSite=Lax", "Max-Age=300"]) {
+      expect(set).toContain(attr);
+    }
+    expect(set).not.toContain("Domain=");
+    const clear = buildOAuthBindingClearCookie();
+    expect(clear).toContain("Max-Age=0");
+  });
+
+  test("binding cookie parsing: exactly-one rule", () => {
+    expect(parseOAuthBindingCookies(null)).toEqual([]);
+    expect(parseOAuthBindingCookies(`${SESSION_COOKIE_NAME}=abc`)).toEqual([]);
+    expect(parseOAuthBindingCookies(`${OAUTH_BINDING_COOKIE_NAME}=n1`)).toEqual(["n1"]);
+    expect(
+      parseOAuthBindingCookies(`a=1; ${OAUTH_BINDING_COOKIE_NAME}=n1; ${SESSION_COOKIE_NAME}=s`),
+    ).toEqual(["n1"]);
+    expect(
+      parseOAuthBindingCookies(`${OAUTH_BINDING_COOKIE_NAME}=a; ${OAUTH_BINDING_COOKIE_NAME}=b`),
+    ).toEqual(["a", "b"]);
+    expect(parseOAuthBindingCookies(`${OAUTH_BINDING_COOKIE_NAME}=`)).toEqual([""]);
+  });
+
+  test("bindingMatches: constant-time hash compare, fail closed", () => {
+    const nonce = generateRawToken();
+    const hex = hashToken(nonce).toString("hex");
+    expect(bindingMatches(nonce, hex)).toBe(true);
+    expect(bindingMatches(`${nonce.slice(0, -2)}AA`, hex)).toBe(false);
+    expect(bindingMatches(nonce, hashToken("other").toString("hex"))).toBe(false);
+    expect(bindingMatches("", hex)).toBe(false);
+    expect(bindingMatches(nonce, "")).toBe(false);
+    expect(bindingMatches(nonce, "not-hex!")).toBe(false);
+    expect(bindingMatches(nonce, "abcd")).toBe(false);
+  });
+});
+
+describe("A1: expired-row cleanup", () => {
+  test("in-memory cleanupExpired deletes only expired rows and reports counts", async () => {
+    const store = new InMemorySessionStore();
+    const now = new Date();
+    const live = await store.createSession(githubUser(1, "a"), now);
+    const dead = await store.createSession(
+      githubUser(2, "b"),
+      new Date(now.getTime() - SESSION_LIFETIME_MS - 1000),
+    );
+    const rawFlowLive = generateRawToken();
+    await store.createLoginFlow({
+      rawState: rawFlowLive,
+      codeVerifier: "v",
+      returnTo: null,
+      bindingHash: hashToken("n").toString("hex"),
+      now,
+    });
+    const rawFlowDead = generateRawToken();
+    await store.createLoginFlow({
+      rawState: rawFlowDead,
+      codeVerifier: "v",
+      returnTo: null,
+      bindingHash: hashToken("n").toString("hex"),
+      now: new Date(now.getTime() - LOGIN_FLOW_LIFETIME_MS - 1000),
+    });
+    expect(store.size()).toEqual({ sessions: 2, flows: 2 });
+    expect(await store.cleanupExpired(now)).toEqual({ sessions: 1, flows: 1 });
+    expect(await store.lookupSession(live.rawToken, now)).not.toBeNull();
+    expect(await store.lookupSession(dead.rawToken, now)).toBeNull();
+    expect(await store.consumeLoginFlow(rawFlowLive, now)).not.toBeNull();
+    expect(store.size()).toEqual({ sessions: 1, flows: 0 });
+    // Nothing left to clean.
+    expect(await store.cleanupExpired(now)).toEqual({ sessions: 0, flows: 0 });
+  });
+
+  test("in-memory cleanupExpired honors the per-table limit", async () => {
+    const store = new InMemorySessionStore();
+    const now = new Date();
+    const past = new Date(now.getTime() - SESSION_LIFETIME_MS - 1000);
+    for (let i = 0; i < 5; i++) {
+      await store.createSession(githubUser(i, `u${i}`), past);
+    }
+    expect(await store.cleanupExpired(now, 2)).toEqual({ sessions: 2, flows: 0 });
+    expect(store.size().sessions).toBe(3);
+    expect(await store.cleanupExpired(now)).toEqual({ sessions: 3, flows: 0 });
+  });
+
+  test("Postgres cleanupExpired issues bounded DELETE..RETURNING per table", async () => {
+    const exec = new RecordingExecutor();
+    const store = new PostgresSessionStore(exec);
+    exec.queuedRows.push([{ id: "s1" }, { id: "s2" }]);
+    exec.queuedRows.push([{ state_hash: Buffer.from("aa", "hex") }]);
+    expect(await store.cleanupExpired(new Date(), 100)).toEqual({ sessions: 2, flows: 1 });
+    expect(exec.statements).toHaveLength(2);
+    expect(exec.statements[0]!.sql).toContain("DELETE FROM auth_sessions");
+    expect(exec.statements[0]!.sql).toContain("expires_at < $1");
+    expect(exec.statements[0]!.sql).toContain("LIMIT $2");
+    expect(exec.statements[0]!.params[1]).toBe(100);
+    expect(exec.statements[1]!.sql).toContain("DELETE FROM oauth_login_flows");
+    expect(exec.statements[1]!.sql).toContain("LIMIT $2");
+  });
+
+  test("Postgres createLoginFlow opportunistically sweeps expired rows first", async () => {
+    const exec = new RecordingExecutor();
+    const store = new PostgresSessionStore(exec);
+    // Two cleanup passes (sessions + flows) answer empty, then the INSERT.
+    exec.queuedRows.push([]);
+    exec.queuedRows.push([]);
+    await store.createLoginFlow({
+      rawState: generateRawToken(),
+      codeVerifier: "v",
+      returnTo: null,
+      bindingHash: hashToken("n").toString("hex"),
+      now: new Date(),
+    });
+    expect(exec.statements).toHaveLength(3);
+    expect(exec.statements[0]!.sql).toContain("DELETE FROM auth_sessions");
+    expect(exec.statements[1]!.sql).toContain("DELETE FROM oauth_login_flows");
+    expect(exec.statements[2]!.sql).toContain("INSERT INTO oauth_login_flows");
+  });
+
+  test("cleanup honors CLEANUP_DEFAULT_LIMIT when no limit is passed", async () => {
+    expect(CLEANUP_DEFAULT_LIMIT).toBe(500);
+    const exec = new RecordingExecutor();
+    const store = new PostgresSessionStore(exec);
+    exec.queuedRows.push([]);
+    exec.queuedRows.push([]);
+    await store.cleanupExpired(new Date());
+    expect(exec.statements[0]!.params[1]).toBe(CLEANUP_DEFAULT_LIMIT);
   });
 });

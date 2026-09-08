@@ -119,4 +119,36 @@ describe("dev auto-login (issue #152)", () => {
       delete process.env["DSH_DEV_AUTO_LOGIN"];
     }
   });
+
+  test("A5: expired cookie recovers to a fresh dev session (no 401, no duplicate)", async () => {
+    // A session minted at epoch is long expired; auto-login must replace it
+    // with exactly one fresh value instead of appending a second one.
+    const stale = await deps.sessions.createSession(
+      { id: "github:1", provider: "github", providerUserId: "1", login: "dev" },
+      new Date(0),
+    );
+    const res = await fetch(`${base}/v1/workspaces`, {
+      headers: { cookie: `other=1; ${SESSION_COOKIE_NAME}=${stale.rawToken}` },
+    });
+    expect(res.status).toBe(200);
+    const setCookie = res.headers.get("set-cookie")!;
+    expect(setCookie).toContain(SESSION_COOKIE_NAME);
+    const freshRaw = setCookie.split(";")[0]!.split("=")[1]!;
+    expect(freshRaw).not.toBe(stale.rawToken);
+    expect(await deps.sessions.lookupSession(freshRaw, new Date())).not.toBeNull();
+  });
+
+  test("A5: garbage / duplicated session cookies recover to one fresh session", async () => {
+    for (const cookie of [
+      `${SESSION_COOKIE_NAME}=garbage-value`,
+      `${SESSION_COOKIE_NAME}=a; ${SESSION_COOKIE_NAME}=b`,
+      `${SESSION_COOKIE_NAME}=`,
+    ]) {
+      const res = await fetch(`${base}/v1/workspaces`, { headers: { cookie } });
+      expect(res.status, cookie).toBe(200);
+      // The response carries exactly one session Set-Cookie (replace, not stack).
+      const issued = res.headers.getSetCookie().filter((c) => c.startsWith(`${SESSION_COOKIE_NAME}=`));
+      expect(issued).toHaveLength(1);
+    }
+  });
 });

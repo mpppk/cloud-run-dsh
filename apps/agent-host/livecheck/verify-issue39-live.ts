@@ -29,8 +29,10 @@ import {
   HttpAgentHostForwarder,
   RuntimeRegistry,
   SystemClock,
+  SESSION_COOKIE_NAME,
   createControlPlaneDeps,
   createFetchHandler,
+  githubUser,
   InMemoryMembershipStore,
   type WorkspaceRuntimeHandle,
 } from "../../control-plane/src/index.js";
@@ -90,8 +92,6 @@ const runtimes = new RuntimeRegistry(() => {
 });
 const logger = createLogger({ defaultFields: { component: "verify-i39-live" } });
 const cpDeps = createControlPlaneDeps({
-  resolveUser: async (identity) =>
-    identity.subject === "alice" ? { id: "alice", email: "alice@example.com" } : null,
   repo,
   leases,
   membership,
@@ -105,10 +105,15 @@ const cpDeps = createControlPlaneDeps({
 });
 const cpServer = Bun.serve({ port: 0, fetch: createFetchHandler(cpDeps) });
 
+// The control plane authenticates ONLY via session cookie (issues #150–#152).
+// Mint a real server-side session for the live user and send it as a cookie.
+// NOTE: `x-dsh-user-*` headers are agent-host-only (control-plane →
+// agent-host internal protocol, trusted via invoker IAM) — they authenticate
+// nothing on the control-plane API and must not be sent here.
+const liveSession = await cpDeps.sessions.createSession(githubUser(1, "dev"), new Date());
 const cpFetch = (path: string, init: RequestInit = {}) => {
   const headers = new Headers(init.headers);
-  headers.set("x-dsh-user-id", "github:1");
-  headers.set("x-dsh-user-login", "alice");
+  headers.set("cookie", `${SESSION_COOKIE_NAME}=${liveSession.rawToken}`);
   return fetch(`${cpServer.url.origin}${path}`, { ...init, headers });
 };
 

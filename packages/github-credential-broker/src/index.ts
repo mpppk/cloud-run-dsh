@@ -343,9 +343,12 @@ export function assertNoTokenInValue(value: string, token?: string): void {
 // logged-in user holds on the repository:
 //
 //   GET /repos/{owner}/{repo}/collaborators/{username}/permission
-//     -> { permission: "admin" | "maintain" | "write" | "triage" | "read" }
+//     -> { permission: "admin" | "maintain" | "write" | "triage" | "read",
+//          user: { id: <numeric> } }
 //
-// Read or above authorizes. Anything else — 404 (repo unknown, App not
+// Read or above authorizes, AND the response `user.id` must equal the
+// session's stable numeric id (A4: the lookup is keyed by mutable login;
+// a renamed/reused login resolving elsewhere denies closed). Anything else — 404 (repo unknown, App not
 // installed, or user without access: deliberately ONE bucket so the answer
 // never oracles private-repo existence), permission "none" — denies.
 //
@@ -444,13 +447,40 @@ export function createRepositoryAuthorizer(options: RepositoryAuthorizerOptions)
   const apiBase = (options.apiBaseUrl ?? "https://api.github.com").replace(/\/+$/, "");
   const timeoutMs = options.timeoutMs ?? 10_000;
 
+  /**
+   * Races `work` against `timeoutMs`. The timer is ALWAYS cleared in
+   * `finally` (a leaked one-shot timer per authorization would accumulate
+   * under load). On timeout the in-flight transport promise is left to
+   * settle on its own — its result is discarded.
+   */
+  async function withTimeout<T>(label: string, work: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        work,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                new RepositoryAuthorizerTransientError(`${label} timed out after ${timeoutMs}ms`),
+              ),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
   async function permissionLevel(
     token: string,
     url: string,
-  ): Promise<{ status: number; permission?: string }> {
+  ): Promise<{ status: number; permission?: string; userId?: string }> {
     let res: HttpResponse;
     try {
-      res = await Promise.race([
+      res = await withTimeout(
+        "GitHub permission lookup",
         options.transport({
           method: "GET",
           url,
@@ -463,18 +493,7 @@ export function createRepositoryAuthorizer(options: RepositoryAuthorizerOptions)
             "X-GitHub-Api-Version": "2022-11-28",
           },
         }),
-        new Promise<never>((_, reject) => {
-          setTimeout(
-            () =>
-              reject(
-                new RepositoryAuthorizerTransientError(
-                  `GitHub permission lookup timed out after ${timeoutMs}ms`,
-                ),
-              ),
-            timeoutMs,
-          );
-        }),
-      ]);
+      );
     } catch (e) {
       if (e instanceof RepositoryAuthorizerTransientError) throw e;
       throw new RepositoryAuthorizerTransientError(
@@ -497,7 +516,23 @@ export function createRepositoryAuthorizer(options: RepositoryAuthorizerOptions)
       typeof parsed === "object" && parsed !== null
         ? (parsed as Record<string, unknown>)["permission"]
         : undefined;
-    return typeof permission === "string" ? { status: 200, permission } : { status: 200 };
+    // A4: the response carries the resolved principal (`user.id`). The
+    // lookup is keyed by mutable login, so the allow decision MUST bind to
+    // the stable numeric id — a renamed/reused login resolving to a
+    // different account denies closed.
+    const user =
+      typeof parsed === "object" && parsed !== null
+        ? (parsed as Record<string, unknown>)["user"]
+        : undefined;
+    const userId =
+      typeof user === "object" && user !== null && typeof (user as Record<string, unknown>)["id"] === "number"
+        ? String((user as Record<string, unknown>)["id"])
+        : undefined;
+    return {
+      status: 200,
+      ...(typeof permission === "string" ? { permission } : {}),
+      ...(userId !== undefined ? { userId } : {}),
+    };
   }
 
   return {
@@ -514,12 +549,20 @@ export function createRepositoryAuthorizer(options: RepositoryAuthorizerOptions)
       // call and is then dropped. It is never written to the database,
       // never logged, never embedded in an error. The permission lookup
       // itself runs over the injected options.transport (same seam the
-      // broker uses for issuance), race-guarded by timeoutMs.
-      let outcome: { status: number; permission?: string };
+      // broker uses for issuance).
+      //
+      // Timeout covers the WHOLE check — installation lookup, token
+      // issuance, and the permission lookup — via one outer race (A3). The
+      // inner permissionLevel race additionally bounds the lookup alone;
+      // both timers are cleared on settle (see withTimeout).
+      let outcome: { status: number; permission?: string; userId?: string };
       try {
-        outcome = await options.broker.withInstallationToken(
-          { owner: input.owner, name: input.repo },
-          async (token) => permissionLevel(token, url),
+        outcome = await withTimeout(
+          "GitHub repository authorization",
+          options.broker.withInstallationToken(
+            { owner: input.owner, name: input.repo },
+            async (token) => permissionLevel(token, url),
+          ),
         );
       } catch (e) {
         if (e instanceof RepositoryAuthorizerTransientError) throw e;
@@ -542,6 +585,13 @@ export function createRepositoryAuthorizer(options: RepositoryAuthorizerOptions)
         throw new RepositoryAuthorizerTransientError(
           `GitHub permission lookup answered ${outcome.status}`,
         );
+      }
+      // A4: allow ONLY when the response principal matches the session's
+      // stable numeric id. A login that now resolves to a different account
+      // (rename + reuse), or a response without a verifiable principal,
+      // denies — fail closed, same single bucket as other denies.
+      if (outcome.userId === undefined || outcome.userId !== input.githubUserId) {
+        return false;
       }
       return (
         typeof outcome.permission === "string" && SUFFICIENT_PERMISSIONS.has(outcome.permission)
