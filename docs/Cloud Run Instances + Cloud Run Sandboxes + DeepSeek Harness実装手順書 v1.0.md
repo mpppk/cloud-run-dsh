@@ -47,7 +47,6 @@ Cloud SQL Admin API
 Secret Manager API
 Artifact Registry API
 Cloud Storage API
-IAP API
 Cloud Logging / Monitoring
 ```
 
@@ -594,7 +593,11 @@ Harness内部HTTP Serverを直接Internetへ公開しない。
 
 ---
 
-# 25. IAP
+# 25. IAP (removed in #156 — historical record below)
+
+> v1.0 では Cloud Run アクセスの前段で IAP を利用していた。#149–#156 で
+> GitHub App OAuth + opaque server-side session に移行し、IAP 基盤・
+> ヘッダー解析はすべて削除された。membership 必須の原則は不変である。
 
 Cloud Runアクセスの前段でIAPを利用する。
 
@@ -930,7 +933,7 @@ Agent Loop
 Cloud SQL
 GCS checkpoint
 GitHub App
-IAP
+IAP (removed in #156)
 Controller lease
 Idle stop
 Restart recovery

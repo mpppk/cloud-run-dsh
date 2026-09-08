@@ -157,7 +157,7 @@ sequenceDiagram
 
 | 段階 | 実装 | GCP で実行 | 補足 |
 |---|---|---|---|
-| 認可（IAP identity + メンバーシップ） | あり | **実行** | 2026-09-05 に実機で `POST /v1/workspaces` が 201。 |
+| 認可（GitHub session + メンバーシップ） | あり | **実行** | 2026-09-05 に実機で `POST /v1/workspaces` が 201（当時は IAP ヘッダー経由。#152 以降は session Cookie、IAP は #156 で削除）。 |
 | コントローラリース | あり | **実行** | `acquire` 200。agent-host が同じ ID を引き継ぐ形に変更（[#60](https://github.com/mpppk/cloud-run-dsh/issues/60)）。 |
 | Instance の作成・起動 | あり | **実行** | control-plane が実際に create → start した。`launchStage: BETA` と `cloudSqlInstance` ボリュームが必須（[#53](https://github.com/mpppk/cloud-run-dsh/issues/53) / [#56](https://github.com/mpppk/cloud-run-dsh/issues/56)）。 |
 | clone・checkout・チェックポイント復元 | あり | **実行** | ENTRYPOINT を上書きせず `index.ts` が起動し `workspace.restore.completed` に到達（[#24](https://github.com/mpppk/cloud-run-dsh/issues/24)）。git 認証は `Basic x-access-token`（[#62](https://github.com/mpppk/cloud-run-dsh/issues/62)）。 |
@@ -176,11 +176,10 @@ sequenceDiagram
 
 ### 図に載らない規則
 
-- **IAP だけでは認可しない（#155 以降は認証にも使わない）。** IAP はネットワーク層の
-  ゲートに過ぎず、API の認証は `__Host-dsh_session` Cookie（GitHub OAuth ログイン）
-  が担う。`x-goog-authenticated-user-*` ヘッダーは無視される。いずれの場合も、
-  ユーザーが誰かを示すだけでは足りず、そのワークスペースのメンバーであるかを
-  control-plane が別途確認する。IAP 基盤の削除（#156）は production E2E 成功が条件。
+- **プロキシのヘッダーだけでは認可しない（#156 で IAP 自体を削除済み）。** かつて IAP
+  はユーザーが誰かを示すだけで、そのワークスペースのメンバーであるかは
+  control-plane が別途確認する、という規則だった。現在は認証そのものが
+  GitHub OAuth + session Cookie であり、プロキシヘッダーは無視される。
 - **open は合流する。** 同じワークスペースへの同時 open が複数届いても、起動する Instance は1つ。
   2つ目以降は同じ起動処理の完了を待つ。
 - **SSE のハートビートは活動ではない。** これを活動として数えると、画面を開いているだけで
@@ -343,8 +342,8 @@ control-plane SA → Cloud Run ID token + Invoker IAM → agent-host Instance（
   （fail-closed: `control_plane_public=false`）。
 - agent-host は anonymous を受け付けない非対称性を維持する。control-plane
   SA 以外の invoker を足してはならない。
-- IAP 基盤の削除（#156）は production E2E 成功が条件。それまでは IAP を
-  残し、ロールバック先（`control_plane_public=false`）として使う。
+- IAP 基盤の削除（#156）は production E2E 成功後に完了した。ロールバック先が
+  要る場合は `control_plane_public=false` を使う。
 
 > **これは least-privilege ではない。** `ai-agent` になりすませる者は、agent-host *として*動くコンテナを
 > デプロイし、全てのシークレットとチェックポイントバケットを読める。単一オーナーのプロジェクトとして
@@ -633,7 +632,7 @@ gcloud 呼び出しが失敗するので解除する。
 | stop → restart → 復元の実機確認 | ローカルでは全経路をテスト済み。GCP 実機での stop → restart → 復元は未実施（要 GCP 再構築＝課金）。 | [#72](https://github.com/mpppk/cloud-run-dsh/issues/72) |
 | マイグレーション後の `terraform destroy` | テーブルが `dsh_app` ロールを参照するため一度失敗する。撤収が失敗する＝課金が止まらない。 | [#73](https://github.com/mpppk/cloud-run-dsh/issues/73) |
 | cancel / approval の実機動作 | ローカルでは実キーで確認済み。GCP 上では未確認。 | [#39](https://github.com/mpppk/cloud-run-dsh/issues/39)（実装はマージ済み） |
-| IAP ブランド / ロードバランサ | 未作成。一度作ると削除できないため見送っている。`iap_support_email` を与えたときのみ作られる。現在 Instance を守っているのは invoker IAM のみ。 | — |
+| IAP ブランド / ロードバランサ | 撤去済み（#156）。IAP 前提時代は未作成のまま見送られ、公開 rollout 後に Terraform から削除した。現在 Instance を守っているのは invoker IAM のみ。 | — |
 
 > control-plane は自分の未完成さについて意図的に正直に振る舞う。仕事ができないデプロイが自分を
 > ready と称するべきではないため、依存が揃わない間 `/readyz` は 503 を返す。

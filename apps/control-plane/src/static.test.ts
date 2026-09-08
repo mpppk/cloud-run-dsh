@@ -140,7 +140,7 @@ describe("static UI delivery (issue #128)", () => {
 
   test("auth still runs before route existence: unauthenticated GET /nope -> 401", async () => {
     // The allowlist must NOT become a catch-all: /nope is not a UI path, so
-    // it falls through to authenticate() exactly as before.
+    // it falls through to authenticateSession() exactly as before.
     const res = await fetch(`${base}/nope`);
     expect(res.status).toBe(401);
   });

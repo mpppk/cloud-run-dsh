@@ -47,7 +47,7 @@ class SeamedTurnStarter extends RecordingTurnStarter {
   }
 }
 
-const IAP = { "x-dsh-user-id": "github:1", "x-dsh-user-login": "alice" };
+const DSH_IDENTITY = { "x-dsh-user-id": "github:1", "x-dsh-user-login": "alice" };
 
 async function gatewayWithReadyHost() {
   const th = await composeTestHost();
@@ -81,7 +81,7 @@ describe("AgentGateway", () => {
     // proves the move; on GCP the platform answers /healthz before us).
     // NOTE: with DSH caller identity — without it the gateway 401s before route
     // matching, which would prove nothing about the path.
-    const reserved = await th.host.gateway.handle(request("GET", "/healthz", IAP));
+    const reserved = await th.host.gateway.handle(request("GET", "/healthz", DSH_IDENTITY));
     expect(reserved.status).toBe(404);
   });
 
@@ -96,7 +96,7 @@ describe("AgentGateway", () => {
   test("workspace mismatch is refused", async () => {
     const th = await gatewayWithReadyHost();
     const res = await th.host.gateway.handle(
-      request("POST", "/workspaces/other/sessions/s1/messages", IAP),
+      request("POST", "/workspaces/other/sessions/s1/messages", DSH_IDENTITY),
     );
     expect(res.status).toBe(403);
   });
@@ -105,7 +105,7 @@ describe("AgentGateway", () => {
     const th = await composeTestHost();
     await seedWorkspace(th);
     const res = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/sessions/s1/messages", IAP),
+      request("POST", "/workspaces/ws-1/sessions/s1/messages", DSH_IDENTITY),
     );
     // Not READY (RESTORING) AND lease not yet held — both refuse.
     expect([409]).toContain(res.status);
@@ -117,7 +117,7 @@ describe("AgentGateway", () => {
     await seedWorkspace(th);
     await th.host.recover();
     const message = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/sessions/s1/messages", IAP, {
+      request("POST", "/workspaces/ws-1/sessions/s1/messages", DSH_IDENTITY, {
         sessionId: "s1",
         seq: 3,
         content: "hello",
@@ -130,11 +130,11 @@ describe("AgentGateway", () => {
     ]);
 
     const approval = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/sessions/s1/approvals", IAP),
+      request("POST", "/workspaces/ws-1/sessions/s1/approvals", DSH_IDENTITY),
     );
     expect(approval.status).toBe(202);
     const cancel = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/cancel", IAP),
+      request("POST", "/workspaces/ws-1/cancel", DSH_IDENTITY),
     );
     expect(cancel.status).toBe(202);
     // Approvals/cancel never touch the turn starter (messages-only seam).
@@ -145,7 +145,7 @@ describe("AgentGateway", () => {
     // Release the lease: the gateway must refuse controller-gated actions.
     await th.host.lease.release("ws-1", "ctrl-1");
     const res = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/sessions/s1/messages", IAP),
+      request("POST", "/workspaces/ws-1/sessions/s1/messages", DSH_IDENTITY),
     );
     expect(res.status).toBe(409);
   });
@@ -154,7 +154,7 @@ describe("AgentGateway", () => {
     const th = await gatewayWithReadyHost();
     const idleBefore = th.host.idle.getIdleMs();
     const res = await th.host.gateway.handle(
-      request("GET", "/workspaces/ws-1/sessions/s1/events", IAP),
+      request("GET", "/workspaces/ws-1/sessions/s1/events", DSH_IDENTITY),
     );
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toBe("text/event-stream");
@@ -164,7 +164,7 @@ describe("AgentGateway", () => {
 
   test("unknown paths 404, wrong methods 405", async () => {
     const th = await gatewayWithReadyHost();
-    expect((await th.host.gateway.handle(request("GET", "/nope", IAP))).status).toBe(404);
+    expect((await th.host.gateway.handle(request("GET", "/nope", DSH_IDENTITY))).status).toBe(404);
     expect(
       (await th.host.gateway.handle(request("DELETE", AGENT_HOST_HEALTH_PATH))).status,
     ).toBe(405);
@@ -176,7 +176,7 @@ describe("AgentGateway", () => {
     await seedWorkspace(th);
     await th.host.recover();
     const res = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/sessions/s1/messages", IAP, {
+      request("POST", "/workspaces/ws-1/sessions/s1/messages", DSH_IDENTITY, {
         sessionId: "s1",
         seq: 0,
         content: "hi",
@@ -196,20 +196,20 @@ describe("AgentGateway", () => {
     await th.host.recover();
 
     const sessionCancel = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/sessions/s1/cancel", IAP),
+      request("POST", "/workspaces/ws-1/sessions/s1/cancel", DSH_IDENTITY),
     );
     expect(sessionCancel.status).toBe(202);
     expect(await sessionCancel.json()).toMatchObject({ accepted: true, turnsCancelled: 1 });
 
     const workspaceCancel = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/cancel", IAP),
+      request("POST", "/workspaces/ws-1/cancel", DSH_IDENTITY),
     );
     expect(workspaceCancel.status).toBe(202);
     expect(await workspaceCancel.json()).toMatchObject({ turnsCancelled: 1 });
     expect(starter.cancelled).toEqual(["s1", undefined]);
 
     const approval = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/sessions/s1/approvals", IAP, {
+      request("POST", "/workspaces/ws-1/sessions/s1/approvals", DSH_IDENTITY, {
         approvalId: "ask-1",
         decision: "rejected",
       }),
@@ -220,7 +220,7 @@ describe("AgentGateway", () => {
 
     // Unknown approval ids still 202 (acceptance stands) but report unresolved.
     const unknownApproval = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/sessions/s1/approvals", IAP, {
+      request("POST", "/workspaces/ws-1/sessions/s1/approvals", DSH_IDENTITY, {
         approvalId: "unknown",
         decision: "approved",
       }),
@@ -229,7 +229,7 @@ describe("AgentGateway", () => {
 
     // A body-less approval keeps the historical accept-only 202 shape.
     const bodyless = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/sessions/s1/approvals", IAP),
+      request("POST", "/workspaces/ws-1/sessions/s1/approvals", DSH_IDENTITY),
     );
     expect(bodyless.status).toBe(202);
     const bodylessJson = (await bodyless.json()) as Record<string, unknown>;
@@ -251,7 +251,7 @@ describe("AgentGateway", () => {
     ]);
 
     const res = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/sessions/s1/messages", IAP, {
+      request("POST", "/workspaces/ws-1/sessions/s1/messages", DSH_IDENTITY, {
         sessionId: "s1",
         seq: 0,
         content: "hi",
@@ -270,7 +270,7 @@ describe("AgentGateway", () => {
     await seedWorkspace(th);
     await th.host.recover();
     const res = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/sessions/s1/messages", IAP, {
+      request("POST", "/workspaces/ws-1/sessions/s1/messages", DSH_IDENTITY, {
         sessionId: "other",
         seq: 0,
         content: "hi",
@@ -293,7 +293,7 @@ describe("AgentGateway", () => {
     ];
     for (const body of bad) {
       const res = await th.host.gateway.handle(
-        request("POST", "/workspaces/ws-1/sessions/s1/messages", IAP, body),
+        request("POST", "/workspaces/ws-1/sessions/s1/messages", DSH_IDENTITY, body),
       );
       expect(res.status).toBe(400);
     }
@@ -307,7 +307,7 @@ describe("AgentGateway", () => {
     await seedWorkspace(th);
     await th.host.recover();
     const res = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/sessions/s1/messages", IAP, {
+      request("POST", "/workspaces/ws-1/sessions/s1/messages", DSH_IDENTITY, {
         sessionId: "s1",
         seq: 0,
         content: "hi",
@@ -320,7 +320,7 @@ describe("AgentGateway", () => {
 describe("lifecycle routes (issues #72/#75)", () => {
   test("POST prepare-stop drains, checkpoints and stays STOPPING without stopping the instance", async () => {
     const th = await gatewayWithReadyHost();
-    const res = await th.host.gateway.handle(request("POST", "/workspaces/ws-1/prepare-stop", IAP));
+    const res = await th.host.gateway.handle(request("POST", "/workspaces/ws-1/prepare-stop", DSH_IDENTITY));
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ prepared: true, state: "STOPPING" });
     expect(th.host.runtime.getState()).toBe("STOPPING");
@@ -334,11 +334,11 @@ describe("lifecycle routes (issues #72/#75)", () => {
   test("prepare-stop is a lifecycle route, not agent input: no session, no starter, works while STOPPING-gated", async () => {
     const th = await gatewayWithReadyHost();
     // No sessionId in the path and no TurnStarter wired — still 200.
-    const res = await th.host.gateway.handle(request("POST", "/workspaces/ws-1/prepare-stop", IAP));
+    const res = await th.host.gateway.handle(request("POST", "/workspaces/ws-1/prepare-stop", DSH_IDENTITY));
     expect(res.status).toBe(200);
     // A second call re-enters STOPPING instead of 409 (unfinished-stop retry).
     const retry = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/prepare-stop", IAP),
+      request("POST", "/workspaces/ws-1/prepare-stop", DSH_IDENTITY),
     );
     expect(retry.status).toBe(200);
     expect(await retry.json()).toMatchObject({ prepared: true, state: "STOPPING" });
@@ -350,16 +350,16 @@ describe("lifecycle routes (issues #72/#75)", () => {
       (await th.host.gateway.handle(request("POST", "/workspaces/ws-1/prepare-stop"))).status,
     ).toBe(401);
     expect(
-      (await th.host.gateway.handle(request("POST", "/workspaces/other/prepare-stop", IAP)))
+      (await th.host.gateway.handle(request("POST", "/workspaces/other/prepare-stop", DSH_IDENTITY)))
         .status,
     ).toBe(403);
     expect(
-      (await th.host.gateway.handle(request("GET", "/workspaces/ws-1/prepare-stop", IAP)))
+      (await th.host.gateway.handle(request("GET", "/workspaces/ws-1/prepare-stop", DSH_IDENTITY)))
         .status,
     ).toBe(405);
     await th.host.lease.release("ws-1", "ctrl-1");
     const fenced = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/prepare-stop", IAP),
+      request("POST", "/workspaces/ws-1/prepare-stop", DSH_IDENTITY),
     );
     expect(fenced.status).toBe(409);
     expect(await fenced.json()).toMatchObject({ error: "controller lease not held by this host" });
@@ -371,7 +371,7 @@ describe("lifecycle routes (issues #72/#75)", () => {
     // checkpoint fails and the caller must NOT stop the instance.
     th.git.responses.set("status", { exitCode: 1, stdout: "", stderr: "disk gone" });
     const res = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/prepare-stop", IAP),
+      request("POST", "/workspaces/ws-1/prepare-stop", DSH_IDENTITY),
     );
     expect(res.status).toBe(502);
     expect(await res.json()).toMatchObject({ prepared: false, state: "CHECKPOINT_FAILED" });
@@ -399,7 +399,7 @@ describe("lifecycle routes (issues #72/#75)", () => {
       lease: th.host.lease,
       logger: th.host.logger,
     });
-    const res = await racing.handle(request("POST", "/workspaces/ws-1/prepare-stop", IAP));
+    const res = await racing.handle(request("POST", "/workspaces/ws-1/prepare-stop", DSH_IDENTITY));
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ prepared: false });
   });
@@ -407,7 +407,7 @@ describe("lifecycle routes (issues #72/#75)", () => {
   test("POST checkpoint on a clean tree -> 200 checkpointed:true skipped:true (success, not a bug)", async () => {
     const th = await gatewayWithReadyHost();
     const keysBefore = th.storage.keys();
-    const res = await th.host.gateway.handle(request("POST", "/workspaces/ws-1/checkpoint", IAP));
+    const res = await th.host.gateway.handle(request("POST", "/workspaces/ws-1/checkpoint", DSH_IDENTITY));
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({
       checkpointed: true,
@@ -422,7 +422,7 @@ describe("lifecycle routes (issues #72/#75)", () => {
   test("POST checkpoint on a dirty tree writes a real bundle -> 200 checkpointed:true skipped:false", async () => {
     const th = await gatewayWithReadyHost();
     th.git.responses.set("status", { exitCode: 0, stdout: " M notes.txt\n", stderr: "" });
-    const res = await th.host.gateway.handle(request("POST", "/workspaces/ws-1/checkpoint", IAP));
+    const res = await th.host.gateway.handle(request("POST", "/workspaces/ws-1/checkpoint", DSH_IDENTITY));
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({
       checkpointed: true,
@@ -435,7 +435,7 @@ describe("lifecycle routes (issues #72/#75)", () => {
   test("POST checkpoint failure -> 502 checkpointed:false (never a fake true)", async () => {
     const th = await gatewayWithReadyHost();
     th.git.responses.set("status", { exitCode: 1, stdout: "", stderr: "disk gone" });
-    const res = await th.host.gateway.handle(request("POST", "/workspaces/ws-1/checkpoint", IAP));
+    const res = await th.host.gateway.handle(request("POST", "/workspaces/ws-1/checkpoint", DSH_IDENTITY));
     expect(res.status).toBe(502);
     expect(await res.json()).toMatchObject({ checkpointed: false });
   });
@@ -449,7 +449,7 @@ describe("lifecycle routes (issues #72/#75)", () => {
       lease: th.host.lease,
       logger: th.host.logger,
     });
-    const res = await bare.handle(request("POST", "/workspaces/ws-1/checkpoint", IAP));
+    const res = await bare.handle(request("POST", "/workspaces/ws-1/checkpoint", DSH_IDENTITY));
     expect(res.status).toBe(503);
     expect(await res.json()).toMatchObject({
       code: "checkpoint_not_implemented",
@@ -463,7 +463,7 @@ describe("lifecycle routes (issues #72/#75)", () => {
       (await th.host.gateway.handle(request("POST", "/workspaces/ws-1/checkpoint"))).status,
     ).toBe(401);
     expect(
-      (await th.host.gateway.handle(request("POST", "/workspaces/other/checkpoint", IAP))).status,
+      (await th.host.gateway.handle(request("POST", "/workspaces/other/checkpoint", DSH_IDENTITY))).status,
     ).toBe(403);
   });
 });
@@ -482,7 +482,7 @@ describe("unexpected error observability (issue #48)", () => {
       throw new Error(`lease store unreachable ${secret} ${token}`);
     };
     const res = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/sessions/s1/messages", IAP, {
+      request("POST", "/workspaces/ws-1/sessions/s1/messages", DSH_IDENTITY, {
         sessionId: "s1",
         seq: 0,
         content: "hi",
@@ -518,7 +518,7 @@ describe("unexpected error observability (issue #48)", () => {
     await seedWorkspace(th);
     await th.host.recover();
     const res = await th.host.gateway.handle(
-      request("POST", "/workspaces/ws-1/sessions/s1/messages", IAP, {
+      request("POST", "/workspaces/ws-1/sessions/s1/messages", DSH_IDENTITY, {
         sessionId: "s1",
         seq: 0,
         content: "hi",

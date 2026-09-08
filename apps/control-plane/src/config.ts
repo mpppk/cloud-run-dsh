@@ -152,8 +152,8 @@ export interface ControlPlaneConfig {
   /**
    * GitHub OAuth login (issue #151). All three must be set together; when
    * absent, OAuth login is disabled (/auth/login + /auth/callback answer
-   * 503) so IAP-fronted deployments boot without OAuth credentials until
-   * the #155 cutover.
+   * 503) so deployments without OAuth credentials boot with login disabled
+   * (until the operator configures the OAuth trio for public rollout).
    *
    * - APP_ORIGIN: the public control-plane origin
    *   (e.g. https://dsh-control-abc.run.app). The OAuth callback URL is

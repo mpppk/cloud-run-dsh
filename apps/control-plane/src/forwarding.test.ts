@@ -326,9 +326,10 @@ describe("HttpAgentHostForwarder", () => {
     expect(seenAudiences).toEqual(["https://dsh-ws-1.run.app"]);
   });
 
-  test("issue #149: internal forward carries no x-goog-authenticated-user-* headers", async () => {
-    // The DSH internal protocol uses x-dsh-user-*; Google/IAP reserved
-    // headers must never appear on control-plane -> agent-host traffic.
+  test("issue #149/#156: internal forward carries only x-dsh-user-* identity headers", async () => {
+    // The DSH internal protocol uses x-dsh-user-*; platform-reserved
+    // identity headers must never appear on control-plane -> agent-host
+    // traffic.
     const { calls, forwarder } = successSetup();
     await forwarder.forward(forwardArgs({}));
     const headers = calls[0]!.init!.headers as Record<string, string>;

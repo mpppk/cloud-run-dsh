@@ -69,7 +69,7 @@ curl -s http://localhost:8080/livez   # {"status":"ok"}
 ## Authentication: GitHub OAuth + server-side sessions (issues #149–#154)
 
 - Internal principals are `github:<numeric-id>` (immutable) with a
-  display-only login — never emails, never IAP headers (`src/auth.ts`).
+  display-only login — never emails, never proxy identity headers (`src/auth.ts`).
 - Browsers authenticate with the `__Host-dsh_session` cookie (opaque
   256-bit token; only its SHA-256 is stored in `auth_sessions`,
   `infra/migrations/0003_auth_sessions.sql`). Login is the GitHub App
@@ -83,10 +83,10 @@ curl -s http://localhost:8080/livez   # {"status":"ok"}
 - Control-plane → agent-host forwarding identifies the caller with
   `x-dsh-user-*` internal headers; the trust root stays the Instance's
   Invoker IAM (`src/forwarding.ts`, `apps/agent-host/src/gateway.ts`).
-- OAuth is optional until the #155 cutover: unset `APP_ORIGIN` /
+- OAuth is optional: unset `APP_ORIGIN` /
   `GITHUB_APP_CLIENT_ID` / `GITHUB_APP_CLIENT_SECRET` disables login
-  (`/auth/*` → 503) and the Origin gate. IAP infrastructure is untouched
-  (removal is #156, after production E2E).
+  (`/auth/*` → 503) and the Origin gate. IAP infrastructure was removed in
+  #156 after production E2E; there is no proxy-gated posture to return to.
 
 ## Runtime registry: wired to Cloud Run Instances
 

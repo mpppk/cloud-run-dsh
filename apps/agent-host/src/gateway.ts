@@ -17,7 +17,7 @@ import { healthResponse } from "./health.js";
 
 /**
  * DSH internal caller-identity headers (issue #149). The control plane sets
- * these when forwarding; they are NOT Google/IAP reserved headers.
+ * these when forwarding; they are NOT Google-reserved headers.
  *
  * TRUST ROOT: the Instance's Cloud Run Invoker IAM, which admits ONLY the
  * control-plane service account. These headers ALONE prove nothing — a
@@ -201,9 +201,8 @@ export class AgentGateway {
     // PLANE's responsibility (T9); this host deliberately does not duplicate
     // membership resolution.
     //
-    // (No IAP brand / load balancer exists in this milestone — see issue
-    // #31 user tasks. The only thing guarding this host today is invoker
-    // IAM.)
+    // (No external identity proxy fronts this host — the only thing
+    // guarding it is invoker IAM.)
     const identity = request.headers.get(DSH_USER_ID_HEADER);
     if (!identity) {
       return this.json(401, { error: "unauthenticated: missing DSH caller identity" });

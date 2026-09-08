@@ -6,7 +6,7 @@ Cloud Run Instances + Cloud Run Sandboxes + DeepSeek Harness — AI Coding Agent
 
 ## Architecture (spec v1.0)
 
-- **Control Plane** (`apps/control-plane`): Workspace API, Instance controller, IAP auth, membership checks.
+- **Control Plane** (`apps/control-plane`): Workspace API, Instance controller, GitHub App OAuth + session auth, membership checks.
 - **Agent Host** (`apps/agent-host`): Runs inside Cloud Run Instance — Agent Gateway, Harness runtime, SandboxManager, CheckpointManager, IdleManager, GitHubCredentialBroker.
 - **Execution Plane**: Cloud Run Sandbox (isolated via `sandbox run --allow-egress --write --mount type=bind,source=/workspace`).
 - **Packages**:

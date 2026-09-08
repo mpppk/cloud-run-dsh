@@ -1,5 +1,9 @@
 # GCP 実機動作確認レポート — 2026-09-05
 
+> Historical record (2026-09-05): IAP への言及は当時の検証条件の事実記録であり、
+> current design ではない。現在の認証は GitHub App OAuth + opaque
+> `__Host-dsh_session` であり、IAP 基盤は #156 で削除された。
+
 `docs/architecture.md` の「ワークスペースを開く流れ」を、実際の GCP プロジェクト
 `cloud-run-dsh` の上で端から端まで通した記録。
 

@@ -15,7 +15,6 @@ import type { ControllerLeaseService } from "@cloud-run-dsh/controller-lease";
 import type { WorkspaceRuntime } from "@cloud-run-dsh/workspace-runtime";
 import type { ActivityKind } from "@cloud-run-dsh/workspace-runtime";
 import type { Logger } from "@cloud-run-dsh/observability";
-import type { AuthDeps } from "./auth.js";
 import type { SessionStore } from "./auth-session.js";
 import type { GitHubUserAuthClient, OAuthConfig } from "./auth-github.js";
 import type {
@@ -313,7 +312,7 @@ export interface ControlPlaneReadiness {
   readonly reason?: string;
 }
 
-export interface ControlPlaneDeps extends AuthDeps {
+export interface ControlPlaneDeps {
   /** T4 repository (workspace/session/event persistence). */
   readonly repo: SessionPersistenceRepository;
   /** T6 controller lease service (controllersPerWorkspace = 1). */
@@ -328,8 +327,8 @@ export interface ControlPlaneDeps extends AuthDeps {
   /**
    * GitHub OAuth configuration (issue #151: APP_ORIGIN + App client
    * credentials). Absent means OAuth login is disabled — /auth/login and
-   * /auth/callback answer 503. Optional so local / IAP-fronted deployments
-   * boot without OAuth credentials until the #155 cutover.
+   * /auth/callback answer 503. Optional so local deployments boot without
+   * OAuth credentials.
    */
   readonly oauth?: OAuthConfig;
   /** GitHub OAuth/API client seam (issue #151). Tests inject fakes. */

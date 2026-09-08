@@ -42,7 +42,7 @@ Cloud Run Instanceは通常のCloud Run Serviceとは異なり、個別にaddres
 | Harness filesystem policy | `workspace-write` |
 | MVP Sandbox egress | Enabled |
 | Production Sandbox egress | Network / Execution sandbox分離 |
-| User authentication | IAP |
+| User authentication | GitHub App OAuth + opaque server-side session (IAP was the v1.0 design; removed in #156 after production E2E) |
 | CPU | 4 vCPU |
 | Memory | 8 GiB |
 | Instance start | workspaceを開いた時 |
@@ -66,7 +66,7 @@ Cloud Run SandboxはHostとCPU / memory allocationを共有するため、4 vCPU
 ```text
                          Browser
                             │
-                            │ IAP
+                            │ GitHub App OAuth + session Cookie (#156: IAP removed)
                             ▼
                 ┌─────────────────────┐
                 │ Control Plane       │
@@ -743,7 +743,12 @@ takeover時は旧controllerをobserverへ降格する。
 
 # 21. Authentication
 
-ユーザー認証はIAPを基本とする。
+> v1.0 ではユーザー認証は IAP を基本としていたが、#149–#156 で GitHub App
+> OAuth + opaque server-side session (`__Host-dsh_session`) に移行し、IAP
+> 基盤は削除された。以下の membership 必須の原則は不変である。
+
+ユーザー認証は GitHub App OAuth + opaque server-side session を基本とする
+（v1.0 初版では IAP）。
 
 Application側では認証済identityから内部user IDを解決し、
 
@@ -755,7 +760,8 @@ user
 
 を必ず検証する。
 
-IAPはinternal user向けCloud Run authenticationの推奨方式である。citeturn644489search8
+IAPは v1.0 時点の internal user向け Cloud Run authentication の推奨方式だった
+（#156 で削除）。citeturn644489search8
 
 ---
 
@@ -937,7 +943,7 @@ tests/build
 session persistence
 checkpoint/restore
 GitHub App
-IAP
+IAP (removed in #156; auth is GitHub App OAuth + session)
 SSE
 approval
 controller lease

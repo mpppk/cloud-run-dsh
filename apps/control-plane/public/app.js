@@ -92,8 +92,8 @@ function saveWorkspaces(ids) {
 /**
  * Extra headers for API calls. Issue #152: none — the session cookie
  * authenticates every request and custom headers would only risk CORS
- * preflights. (The pre-#152 IAP header inputs are gone; the server ignores
- * `x-goog-authenticated-user-*`.)
+ * preflights. (Legacy proxy header inputs are gone; the server ignores any
+ * caller-supplied identity headers.)
  */
 function authHeaders() {
   return {};

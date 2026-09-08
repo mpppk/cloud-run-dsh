@@ -25,19 +25,16 @@ let deps: ControlPlaneDeps;
 let server: RunningControlPlane;
 let base: string;
 
-function iap(user: string): Record<string, string> {
-  return {
-    "x-goog-authenticated-user-id": `accounts.google.com:${user}`,
-    "x-goog-authenticated-user-email": `${user}@example.com`,
-  };
-}
+// NOTE (issue #156): requests carry no identity headers — the dev fetch
+// handler signs every request in with its auto-login dev session, so plain
+// fetches below exercise the same authenticated path the browser takes.
 
 /** Polls GET until runtimeState matches (or the deadline passes). */
 async function waitForState(workspaceId: string, want: string, timeoutMs: number): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   let seen = "";
   for (;;) {
-    const read = await fetch(`${base}/v1/workspaces/${workspaceId}`, { headers: iap("alice") });
+    const read = await fetch(`${base}/v1/workspaces/${workspaceId}`);
     expect(read.status).toBe(200);
     seen = ((await read.json()) as { runtimeState: string }).runtimeState;
     if (seen === want || Date.now() > deadline) return seen;
@@ -48,21 +45,21 @@ async function waitForState(workspaceId: string, want: string, timeoutMs: number
 async function openWorkspace(): Promise<{ workspaceId: string; sessionId: string }> {
   const created = await fetch(`${base}/v1/workspaces`, {
     method: "POST",
-    headers: { "content-type": "application/json", ...iap("alice") },
+        headers: { "content-type": "application/json" },
     body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo", baseBranch: "main" }),
   });
   expect(created.status).toBe(201);
   const ws = (await created.json()) as { id: string };
   const opened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
     method: "POST",
-    headers: { "content-type": "application/json", ...iap("alice") },
+        headers: { "content-type": "application/json" },
     body: JSON.stringify({}),
   });
   expect([200, 202]).toContain(opened.status);
   expect(await waitForState(ws.id, "READY", 15_000)).toBe("READY");
   const made = await fetch(`${base}/v1/workspaces/${ws.id}/sessions`, {
     method: "POST",
-    headers: { "content-type": "application/json", ...iap("alice") },
+        headers: { "content-type": "application/json" },
     body: JSON.stringify({}),
   });
   expect(made.status).toBe(201);
@@ -95,7 +92,7 @@ describe("dev recorded-turn replay (issue #147)", () => {
     const { sessionId } = await openWorkspace();
     const sent = await fetch(`${base}/v1/sessions/${sessionId}/messages`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ content: "devからの送信テスト" }),
     });
     expect(sent.status).toBe(201);
@@ -134,7 +131,7 @@ describe("dev recorded-turn replay (issue #147)", () => {
       const { sessionId } = await openWorkspace();
       const sent = await fetch(`${base}/v1/sessions/${sessionId}/messages`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...iap("alice") },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({ content: "replay off" }),
       });
       expect(sent.status).toBe(201);

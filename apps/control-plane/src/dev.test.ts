@@ -66,7 +66,7 @@ describe("dev composition (src/dev.ts)", () => {
     expect(server.port).not.toBe(8787);
   });
 
-  test("401 without IAP headers", async () => {
+  test("401 without session cookie", async () => {
     const res = await fetch(`${base}/v1/workspaces`, { method: "POST" });
     expect(res.status).toBe(401);
     const body = await res.json();
@@ -104,7 +104,7 @@ describe("dev composition (src/dev.ts)", () => {
     expect(created.status).toBe(201);
     const ws = (await created.json()) as { id: string };
 
-    // carol is a known identity (dev resolves any IAP identity) but not a member.
+    // carol holds a valid session here but is not a member.
     const res = await fetch(`${base}/v1/workspaces/${ws.id}`, {
       method: "GET",
       headers: await sess("carol"),

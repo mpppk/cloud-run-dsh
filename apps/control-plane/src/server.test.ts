@@ -373,13 +373,6 @@ function startHarness(
   };
 
   const deps = createControlPlaneDeps({
-    resolveUser: async (identity) => {
-      // Legacy IAP seam (issues #149/#152 transitional): the request path no
-      // longer calls this — authentication is session-cookie based. Kept so
-      // the seam type stays satisfied until #156 removes it.
-      void identity;
-      return null;
-    },
     repo,
     leases,
     membership,
@@ -416,8 +409,9 @@ function startHarness(
       }
       headers.set("cookie", `${SESSION_COOKIE_NAME}=${raw}`);
     }
-    // Unknown users (e.g. "mallory") get no session cookie: IAP-style
-    // headers alone must NOT authenticate (issue #152 acceptance).
+    // Unknown users (e.g. "mallory") get no session cookie: arbitrary
+    // caller-supplied identity headers alone must NOT authenticate
+    // (issue #152 acceptance).
     return fetch(url(path), { ...init, headers });
   };
 
@@ -475,11 +469,13 @@ describe("authentication", () => {
     expect(res.status).toBe(401);
   });
 
-  test("issue #152: IAP headers without a session authenticate nothing", async () => {
+  test("issue #152/#156: legacy proxy identity headers authenticate nothing", async () => {
+    // No header authenticates on the request path — only the session cookie
+    // does. Forged caller-identity headers must still 401 without a session.
     const res = await fetch(h.url("/v1/workspaces"), {
       headers: {
-        "x-goog-authenticated-user-id": "accounts.google.com:alice",
-        "x-goog-authenticated-user-email": "alice",
+        "x-legacy-proxy-user-id": "accounts.example.com:alice",
+        "x-legacy-proxy-user-email": "alice",
       },
     });
     expect(res.status).toBe(401);

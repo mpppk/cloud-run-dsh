@@ -1,5 +1,9 @@
 # GCP 実機動作確認レポート — stop → restart → 復元（2026-09-05）
 
+> Historical record (2026-09-05): IAP への言及は当時の検証条件の事実記録であり、
+> current design ではない。現在の認証は GitHub App OAuth + opaque
+> `__Host-dsh_session` であり、IAP 基盤は #156 で削除された。
+
 [前回のレポート](./e2e-verification-report.md)は「ワークスペースを開く流れ」を実機で通した記録だった。
 本レポートはその続きで、**仕様書 §1 の看板機能「Instance 停止・再起動を跨いだ Session /
 workspace 復元」を実機で通した記録**である。

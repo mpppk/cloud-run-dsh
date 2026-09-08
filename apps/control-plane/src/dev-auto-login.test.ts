@@ -1,5 +1,4 @@
-// Tests for the dev-only auto-login (issue #152; replaces the pre-#152
-// fake-IAP header injection).
+// Tests for the dev-only auto-login (issue #152).
 //
 // The product UI (/app) has no login screen in this milestone and the dev
 // server has no GitHub OAuth credentials, so the dev server issues a real
@@ -22,11 +21,9 @@ describe("dev auto-login (issue #152)", () => {
   let server: RunningControlPlane;
   let base: string;
   const savedAutoLogin = process.env["DSH_DEV_AUTO_LOGIN"];
-  const savedFakeIap = process.env["DSH_DEV_FAKE_IAP"];
 
   beforeAll(() => {
     delete process.env["DSH_DEV_AUTO_LOGIN"];
-    delete process.env["DSH_DEV_FAKE_IAP"];
     deps = createDevControlPlaneDeps();
     server = startDevControlPlane(deps, 0);
     base = `http://127.0.0.1:${server.port}`;
@@ -35,17 +32,14 @@ describe("dev auto-login (issue #152)", () => {
   afterAll(() => {
     if (savedAutoLogin === undefined) delete process.env["DSH_DEV_AUTO_LOGIN"];
     else process.env["DSH_DEV_AUTO_LOGIN"] = savedAutoLogin;
-    if (savedFakeIap === undefined) delete process.env["DSH_DEV_FAKE_IAP"];
-    else process.env["DSH_DEV_FAKE_IAP"] = savedFakeIap;
     server.stop();
   });
 
-  test("isDevAutoLoginEnabled defaults on, honors both env names", () => {
+  test("isDevAutoLoginEnabled defaults on and honors off values", () => {
     expect(isDevAutoLoginEnabled({})).toBe(true);
     expect(isDevAutoLoginEnabled({ DSH_DEV_AUTO_LOGIN: "0" })).toBe(false);
-    // Legacy name still works (transitional compat).
-    expect(isDevAutoLoginEnabled({ DSH_DEV_FAKE_IAP: "0" })).toBe(false);
-    expect(isDevAutoLoginEnabled({ DSH_DEV_AUTO_LOGIN: "1", DSH_DEV_FAKE_IAP: "0" })).toBe(true);
+    expect(isDevAutoLoginEnabled({ DSH_DEV_AUTO_LOGIN: "false" })).toBe(false);
+    expect(isDevAutoLoginEnabled({ DSH_DEV_AUTO_LOGIN: "1" })).toBe(true);
   });
 
   test("headerless API requests run as the dev identity with a Set-Cookie (no 401)", async () => {
@@ -82,16 +76,17 @@ describe("dev auto-login (issue #152)", () => {
     expect(res.headers.get("set-cookie")).toBeNull();
   });
 
-  test("IAP-style headers alone authenticate nothing on the dev server", async () => {
-    // Regression guard for the #152 cutover: the pre-#152 fake-IAP headers
-    // are ignored. Auto-login is enabled here, so the request still
-    // succeeds — but as the DEV identity, never as the header's "alice".
+  test("legacy proxy identity headers alone authenticate nothing on the dev server", async () => {
+    // Only the session cookie authenticates: arbitrary caller-supplied
+    // identity headers are ignored. Auto-login is enabled here, so the
+    // request still succeeds — but as the DEV identity, never as the
+    // header's "alice".
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "x-goog-authenticated-user-id": "accounts.google.com:alice",
-        "x-goog-authenticated-user-email": "alice@example.com",
+        "x-legacy-proxy-user-id": "accounts.example.com:alice",
+        "x-legacy-proxy-user-email": "alice@example.com",
       },
       body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo2" }),
     });

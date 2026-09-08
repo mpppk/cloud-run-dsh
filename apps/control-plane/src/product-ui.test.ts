@@ -12,8 +12,9 @@
 // - the exact API sequence behind the one-action start and the transparent
 //   resume works against the dev server.
 //
-// Boots the dev composition with the dev fetch handler (fake IAP), i.e. the
-// same path `bun run dev:control-plane` serves.
+// Boots the dev composition with the dev fetch handler (auto-login sessions),
+// i.e. the same path `bun run dev:control-plane` serves. Plain fetches below
+// run as the dev identity — no identity headers are ever attached.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { join } from "node:path";
@@ -29,13 +30,6 @@ import type { ControlPlaneDeps, WorkspaceRuntimeHandle } from "./index.js";
 let deps: ControlPlaneDeps;
 let server: RunningControlPlane;
 let base: string;
-
-function iap(user: string): Record<string, string> {
-  return {
-    "x-goog-authenticated-user-id": `accounts.google.com:${user}`,
-    "x-goog-authenticated-user-email": `${user}@example.com`,
-  };
-}
 
 /** Polls GET until runtimeState matches (or the deadline passes). */
 async function waitForState(workspaceId: string, want: string, timeoutMs: number): Promise<string> {
@@ -130,21 +124,21 @@ describe("product UI static delivery (/app, issue #138)", () => {
   });
 
   test("static is GET/HEAD only: POST /app and DELETE /app/app.js -> 404", async () => {
-    const post = await fetch(`${base}/app`, { method: "POST", headers: iap("alice") });
+    const post = await fetch(`${base}/app`, { method: "POST" });
     expect(post.status).toBe(404);
-    const del = await fetch(`${base}/app/app.js`, { method: "DELETE", headers: iap("alice") });
+    const del = await fetch(`${base}/app/app.js`, { method: "DELETE" });
     expect(del.status).toBe(404);
   });
 
   test("dynamic /app/<id> pathnames are NOT served (screen uses ?ws=<id>)", async () => {
     // Falls through to routing, never the product HTML. (This file boots
-    // the dev handler, so the headerless request runs as the fake-IAP dev
+    // the dev handler, so the headerless request runs as the auto-login dev
     // identity and answers 404 instead of 401 — either way, never HTML.)
     const anon = await fetch(`${base}/app/some-workspace-id`);
     expect(anon.status).toBe(404);
     expect(anon.headers.get("content-type")).toContain("application/json");
     // Authenticated: unknown route, JSON 404 — never the product HTML.
-    const authed = await fetch(`${base}/app/some-workspace-id`, { headers: iap("alice") });
+    const authed = await fetch(`${base}/app/some-workspace-id`);
     expect(authed.status).toBe(404);
     expect(authed.headers.get("content-type")).toContain("application/json");
   });
@@ -168,7 +162,7 @@ describe("product UI static delivery (/app, issue #138)", () => {
   test("serving product files never calls recordActivity (idle timer untouched)", async () => {
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo", baseBranch: "main" }),
     });
     const ws = (await created.json()) as { id: string };
@@ -263,7 +257,7 @@ describe("product UI polling never extends the idle timer", () => {
   test("workspace + controller + list + sessions + SSE stay recordActivity-free", async () => {
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo", baseBranch: "main" }),
     });
     const ws = (await created.json()) as { id: string };
@@ -272,27 +266,26 @@ describe("product UI polling never extends the idle timer", () => {
 
     // Everything the product UI fires on its own (timers + stream + the
     // one-shot reads behind a screen render).
-    expect((await fetch(`${base}/v1/workspaces`, { headers: iap("alice") })).status).toBe(200);
-    expect((await fetch(`${base}/v1/workspaces/${ws.id}`, { headers: iap("alice") })).status).toBe(
+    expect((await fetch(`${base}/v1/workspaces`)).status).toBe(200);
+    expect((await fetch(`${base}/v1/workspaces/${ws.id}`)).status).toBe(
       200,
     );
     expect(
-      (await fetch(`${base}/v1/workspaces/${ws.id}/controller`, { headers: iap("alice") })).status,
+      (await fetch(`${base}/v1/workspaces/${ws.id}/controller`)).status,
     ).toBe(200);
     expect(
-      (await fetch(`${base}/v1/workspaces/${ws.id}/sessions`, { headers: iap("alice") })).status,
+      (await fetch(`${base}/v1/workspaces/${ws.id}/sessions`)).status,
     ).toBe(200);
 
     // The SSE stream: connect, read the opening bytes, then disconnect.
     const sessionRes = await fetch(`${base}/v1/workspaces/${ws.id}/sessions`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({}),
     });
     const session = (await sessionRes.json()) as { id: string };
     const abort = new AbortController();
     const stream = await fetch(`${base}/v1/sessions/${session.id}/events?seq=0`, {
-      headers: iap("alice"),
       signal: abort.signal,
     });
     expect(stream.status).toBe(200);
@@ -306,7 +299,7 @@ describe("product UI polling never extends the idle timer", () => {
   test("sanity: a user-sent message DOES record activity (the spy is wired)", async () => {
     const created = await fetch(`${base}/v1/workspaces`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ repositoryOwner: "mpppk", repositoryName: "demo", baseBranch: "main" }),
     });
     const ws = (await created.json()) as { id: string };
@@ -316,19 +309,19 @@ describe("product UI polling never extends the idle timer", () => {
     // stand-in answers 202 and flips to READY on its timer.
     const opened = await fetch(`${base}/v1/workspaces/${ws.id}/open`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({}),
     });
     expect([200, 202]).toContain(opened.status);
     const sessionRes = await fetch(`${base}/v1/workspaces/${ws.id}/sessions`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({}),
     });
     const session = (await sessionRes.json()) as { id: string };
     const sent = await fetch(`${base}/v1/sessions/${session.id}/messages`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...iap("alice") },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ content: "hello" }),
     });
     expect(sent.status).toBe(201);

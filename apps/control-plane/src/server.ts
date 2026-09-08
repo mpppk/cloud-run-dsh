@@ -91,9 +91,9 @@ function match(
  *    (exact match). Missing / "null" / foreign origins are 403. The Host
  *    header is NEVER a trust anchor, and there is no Referer fallback.
  *    Enforced only when APP_ORIGIN is configured (deps.oauth.appOrigin):
- *    pre-#155 IAP-fronted deployments without OAuth config keep working,
- *    while every OAuth-configured (hence public-bound) deployment is
- *    gated. GET/HEAD are never state-changing and are exempt, as are the
+ *    deployments without OAuth config skip the gate (login is disabled
+ *    there anyway), while every OAuth-configured (hence public-bound)
+ *    deployment is gated. GET/HEAD are never state-changing and are exempt, as are the
  *    OAuth flow routes (GET /auth/login initiates; GET /auth/callback is a
  *    cross-site redirect by design, protected by state + PKCE instead).
  * 2. JSON content-type enforcement: a mutation carrying a non-JSON
@@ -351,9 +351,8 @@ export function createFetchHandler(deps: ControlPlaneDeps): (request: Request) =
       }
 
       // 1. Authentication: session cookie -> internal user (issue #152).
-      // IAP headers are never consulted: they authenticate nothing on this
-      // path (an attacker can set arbitrary request headers; only the
-      // server-side session counts).
+      // No other header authenticates on this path (an attacker can set
+      // arbitrary request headers; only the server-side session counts).
       user = await authenticateSession(request, deps);
 
       const found = match(request.method, pathSegments);

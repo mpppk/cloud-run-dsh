@@ -22,7 +22,6 @@ describe("terraform baseline file existence", () => {
     "storage.tf",
     "iam.tf",
     "secrets.tf",
-    "iap.tf",
     "outputs.tf",
     "README.md",
   ];
@@ -74,8 +73,9 @@ describe("content checks", () => {
     expect(hardcodedProject.map((m) => m[0]).join("\n")).toBe("");
     expect(c).toMatch(/variable "project_id"/);
     expect(c).toMatch(/variable "region"/);
-    expect(c).toMatch(/variable "iap_support_email"/);
-    expect(c).toMatch(/variable "iap_members"/);
+    // Issue #156: IAP variables are gone (brand/client/grants removed).
+    expect(c).not.toMatch(/variable "iap_support_email"/);
+    expect(c).not.toMatch(/variable "iap_members"/);
   });
 
   // The canonical API list lives in apis.tf (local.required_apis); this
@@ -83,8 +83,7 @@ describe("content checks", () => {
   // length — not a second hardcoded number — so enabling or dropping an API
   // cannot silently drift the name again (issue #82: the name said 11 while
   // apis.tf already had 12, and compute.googleapis.com was never asserted).
-  // The exact-set assertion below fails first on any list change, including
-  // the G6 compute API that once blocked the first apply.
+  // Issue #156 dropped iap.googleapis.com (11 now); re-add with a reason.
   const EXPECTED_APIS = [
     "cloudresourcemanager.googleapis.com",
     "compute.googleapis.com",
@@ -94,7 +93,6 @@ describe("content checks", () => {
     "secretmanager.googleapis.com",
     "artifactregistry.googleapis.com",
     "storage.googleapis.com",
-    "iap.googleapis.com",
     "logging.googleapis.com",
     "monitoring.googleapis.com",
     "servicenetworking.googleapis.com",
@@ -271,12 +269,18 @@ describe("content checks", () => {
     expect(c).not.toMatch(/secret_data/);
   });
 
-  test("iap.tf wires brand/client and members", () => {
-    const c = tfContents["iap.tf"];
-    expect(c).toContain("google_iap_brand");
-    expect(c).toContain("google_iap_client");
-    expect(c).toContain("iap_members");
-    expect(c).toContain("iap.httpsResourceAccessor");
+  test("issue #156: IAP is fully removed from Terraform", () => {
+    // iap.tf deleted; no brand/client resources, grants, vars, outputs, or API.
+    expect(files).not.toContain("iap.tf");
+    expect(allTf).not.toContain("google_iap_brand");
+    expect(allTf).not.toContain("google_iap_client");
+    expect(allTf).not.toMatch(/iap\.httpsResourceAccessor/);
+    expect(allTf).not.toMatch(/["']allUsers["']/);
+    expect(allTf).not.toContain("iap_support_email");
+    expect(allTf).not.toContain("iap_members");
+    expect(allTf).not.toContain("iap_brand_name");
+    expect(allTf).not.toContain("iap_client_id");
+    expect(allTf).not.toContain("iap.googleapis.com");
   });
 
   test("outputs.tf exposes required outputs", () => {

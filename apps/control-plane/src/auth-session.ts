@@ -455,9 +455,9 @@ export interface SessionAuthDeps {
  *
  * Exactly one non-empty cookie value must be present; the token resolves
  * through the server-side store with an expiry check. Anything else —
- * absent / duplicated / empty / unknown / expired — is a 401. IAP headers
- * are NEVER consulted here: sending them without a session authenticates
- * nothing. Membership/authorization is NOT checked — handlers verify
+ * absent / duplicated / empty / unknown / expired — is a 401. No other
+ * request header authenticates anything on this path: only the server-side
+ * session counts. Membership/authorization is NOT checked — handlers verify
  * workspace membership separately.
  */
 export async function authenticateSession(

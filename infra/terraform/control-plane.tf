@@ -20,8 +20,9 @@
 #   field instead (https://cloud.google.com/run/docs/authenticating/public),
 #   which needs no IAM grant and survives domain-restricted-sharing policies.
 # - Rollback to private = set `control_plane_public = false` and re-apply
-#   (ingress back to internal+LB, IAM check back on). #156 (IAP removal)
-#   stays gated until production E2E succeeds — see docs/deployment-runbook.md.
+#   (ingress back to internal+LB, IAM check back on). IAP was removed in
+#   #156 once the public application-auth rollout passed production E2E —
+#   there is no IAP-fronted posture to return to.
 #
 # Two-phase bootstrap (service URI is only known after phase 1):
 #   1. Set control_plane_image (+ App ID/agent-host image), keep public=false.
@@ -70,8 +71,7 @@ resource "google_cloud_run_v2_service" "control_plane" {
   labels   = var.labels
 
   # Fail-closed ingress: public mode serves the internet edge, everything
-  # else keeps the pre-#155 internal+LB posture for the (still IAP-fronted)
-  # bootstrap phase and for rollback.
+  # else keeps the restrictive internal+LB posture (rollback position).
   ingress = local.cp_public ? "INGRESS_TRAFFIC_ALL" : "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
   # Official recommended public-access mechanism (no allUsers binding):
   # https://cloud.google.com/run/docs/authenticating/public

@@ -286,8 +286,7 @@ export function createDevControlPlaneDeps(): ControlPlaneDeps {
 }
 
 /**
- * Dev-only auto-login (issue #152; replaces the pre-#152 fake IAP header
- * injection).
+ * Dev-only auto-login (issue #152).
  *
  * The product UI (`/app`) has no login screen in this milestone, and the
  * local dev server has no GitHub OAuth credentials, so the dev server signs
@@ -307,7 +306,7 @@ export const DEV_USER = githubUser(1, "dev");
 export function isDevAutoLoginEnabled(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
-  const raw = env["DSH_DEV_AUTO_LOGIN"] ?? env["DSH_DEV_FAKE_IAP"];
+  const raw = env["DSH_DEV_AUTO_LOGIN"];
   if (raw === undefined) return true;
   const lowered = raw.trim().toLowerCase();
   return lowered !== "0" && lowered !== "false" && lowered !== "no";

@@ -90,9 +90,6 @@ describe("control-plane -> agent-host forwarding over HTTP (issue #22)", () => {
     });
     const logger = new InMemoryLogger();
     const deps = createControlPlaneDeps({
-      // Legacy IAP seam: unused on the request path since #152
-      // (session-cookie authentication); kept for the seam type.
-      resolveUser: async () => null,
       repo,
       leases,
       membership,
@@ -231,9 +228,6 @@ describe("control-plane -> agent-host forwarding over HTTP (issue #22)", () => {
     });
     const logger = new InMemoryLogger();
     const deps = createControlPlaneDeps({
-      // Legacy IAP seam: unused on the request path since #152
-      // (session-cookie authentication); kept for the seam type.
-      resolveUser: async () => null,
       repo,
       leases,
       membership,
