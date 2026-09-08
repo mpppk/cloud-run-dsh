@@ -17,9 +17,10 @@
  *   E2E_REPO_NAME     workspace repo name for create (default: demo)
  *   E2E_TIMEOUT_MS    READY poll budget in ms (default: 600000)
  *   E2E_REQUEST_MS    per-request timeout in ms (default: 30000)
- *   AGENT_HOST_URL    workspace Instance base URL (optional): when set, the
- *                     tool asserts anonymous requests are denied (401/403),
- *                     proving the agent-host asymmetry.
+ *   AGENT_HOST_URL    workspace Instance base URL. REQUIRED for production
+ *                     acceptance: run with --strict, which fails fast (before
+ *                     mutating anything) when it is unset. Without --strict the
+ *                     denial probe is a labeled skip (ad-hoc runs only).
  *
  * Exit 0 when every applicable check passes, 1 otherwise. The session value
  * is never printed (redact() covers check details).
@@ -29,7 +30,7 @@
  * dev session (production has no auto-login, so the same checks 401/403
  * there). Run the real thing against the deployed public origin.
  *
- * Run: APP_ORIGIN=… DSH_SESSION=… bun run scripts/verify-issue155-e2e.ts
+ * Run: APP_ORIGIN=… DSH_SESSION=… bun run scripts/verify-issue155-e2e.ts [--strict]
  */
 
 export interface CheckResult {
@@ -185,16 +186,41 @@ export async function verifyE2E(ctx: Ctx): Promise<CheckResult[]> {
     `GET /auth/login -> ${login.status} (${login.status === 503 ? "OAuth unconfigured — rollout incomplete" : "redirects to GitHub"})`,
   );
 
-  // 2. Anonymous API denial.
+  // 2. Anonymous API denial. Middleware order matters: checkMutationGuards
+  // runs BEFORE authenticateSession, so each boundary gets its own explicit
+  // shape — auth (401) and CSRF (403) are never conflated.
   const anonGet = await request(ctx, "GET", "/v1/workspaces", { cookie: false });
   push("anonymous-v1-401", anonGet.status === 401, `GET /v1/workspaces -> ${anonGet.status}`);
+  // Auth boundary: same-origin POST without a session reaches the session
+  // gate (past the Origin guard) and 401s.
   const anonPost = await request(
+    ctx,
+    "POST",
+    "/v1/workspaces",
+    {
+      body: { repositoryOwner: ctx.repoOwner, repositoryName: ctx.repoName },
+      cookie: false,
+      origin: ctx.sameOrigin,
+    },
+  );
+  push(
+    "anonymous-post-401",
+    anonPost.status === 401,
+    `same-origin POST /v1/workspaces without session -> ${anonPost.status}`,
+  );
+  // Guard order pin: the SAME anonymous POST without Origin never reaches
+  // auth — the CSRF guard answers 403 first on an OAuth-configured plane.
+  const anonPostNoOrigin = await request(
     ctx,
     "POST",
     "/v1/workspaces",
     { body: { repositoryOwner: ctx.repoOwner, repositoryName: ctx.repoName }, cookie: false },
   );
-  push("anonymous-post-401", anonPost.status === 401, `POST /v1/workspaces -> ${anonPost.status}`);
+  push(
+    "anonymous-post-no-origin-403",
+    anonPostNoOrigin.status === 403,
+    `no-Origin anonymous POST -> ${anonPostNoOrigin.status} (guard precedes auth)`,
+  );
 
   // 3. Foreign-origin mutation refused (with a VALID session + origin).
   const forged = await request(
@@ -321,6 +347,10 @@ export async function verifyE2E(ctx: Ctx): Promise<CheckResult[]> {
   );
 
   // 6. Agent-host asymmetry: anonymous requests to the Instance must be denied.
+  // AGENT_HOST_URL is REQUIRED for production acceptance (--strict): the
+  // control-plane-SA-only invoker asymmetry is load-bearing, so acceptance
+  // must never pass without probing it. Ad-hoc runs without --strict keep
+  // the labeled skip.
   if (ctx.agentHostUrl) {
     let status = -1;
     try {
@@ -355,12 +385,57 @@ function readEnv(name: string, fallback = ""): string {
   return process.env[name] ?? fallback;
 }
 
+export interface CliFlags {
+  readonly strict: boolean;
+}
+
+/** Parses argv: only `--strict` is recognized (unknown flags are an error). */
+export function parseArgs(argv: readonly string[]): CliFlags {
+  const strict = argv.includes("--strict");
+  const unknown = argv.filter((a) => a !== "--strict");
+  if (unknown.length > 0) {
+    throw new Error(`unknown flags: ${unknown.join(" ")} (only --strict is supported)`);
+  }
+  return { strict };
+}
+
+/**
+ * Production gate for the asymmetry probe: in --strict mode a missing
+ * AGENT_HOST_URL fails the run BEFORE any resource is mutated (no workspace
+ * is created, no session is used). Returns the failing check, or null when
+ * the run may proceed.
+ */
+export function requireAgentHostUrl(strict: boolean, agentHostUrl: string | null): CheckResult | null {
+  if (strict && !agentHostUrl) {
+    return checkResult(
+      "agent-host-url-required",
+      false,
+      "AGENT_HOST_URL is required in --strict production mode; refusing to run without probing the agent-host asymmetry",
+    );
+  }
+  return null;
+}
+
 async function main(): Promise<void> {
   const origin = readEnv("APP_ORIGIN").replace(/\/$/, "");
   const session = readEnv("DSH_SESSION");
   if (!origin || !session) {
     console.error("APP_ORIGIN and DSH_SESSION are required (session via env only, never argv).");
     process.exit(2);
+  }
+  let flags: CliFlags;
+  try {
+    flags = parseArgs(process.argv.slice(2));
+  } catch (e) {
+    console.error(e instanceof Error ? e.message : String(e));
+    process.exit(2);
+  }
+  const agentHostUrl = readEnv("AGENT_HOST_URL") || null;
+  // Fail fast in strict mode: before any check, before any mutation.
+  const gate = requireAgentHostUrl(flags.strict, agentHostUrl);
+  if (gate) {
+    console.log(formatReport([gate]));
+    process.exit(1);
   }
   const ctx: Ctx = {
     origin,
@@ -370,7 +445,7 @@ async function main(): Promise<void> {
     repoName: readEnv("E2E_REPO_NAME", "demo"),
     requestMs: Number(readEnv("E2E_REQUEST_MS", "30000")),
     readyMs: Number(readEnv("E2E_TIMEOUT_MS", "600000")),
-    agentHostUrl: readEnv("AGENT_HOST_URL") || null,
+    agentHostUrl,
     secrets: [session],
   };
   const results = await verifyE2E(ctx);

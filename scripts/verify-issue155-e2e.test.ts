@@ -6,7 +6,9 @@ import { describe, expect, test } from "bun:test";
 import {
   checkResult,
   formatReport,
+  parseArgs,
   redact,
+  requireAgentHostUrl,
   sessionCookieHeader,
 } from "./verify-issue155-e2e.js";
 
@@ -37,5 +39,21 @@ describe("verify-issue155-e2e helpers", () => {
     const detail = redact(`GET /auth/session -> 200 id=github:1 (cookie ${session})`, [session]);
     expect(detail).not.toContain(session);
     expect(detail).toContain("[REDACTED]");
+  });
+
+  test("parseArgs accepts only --strict", () => {
+    expect(parseArgs([])).toEqual({ strict: false });
+    expect(parseArgs(["--strict"])).toEqual({ strict: true });
+    expect(() => parseArgs(["--bogus"])).toThrow(/unknown flags/);
+  });
+
+  test("requireAgentHostUrl fails fast in strict mode without the URL, passes otherwise", () => {
+    const gate = requireAgentHostUrl(true, null);
+    expect(gate).not.toBeNull();
+    expect(gate!.ok).toBe(false);
+    expect(gate!.name).toBe("agent-host-url-required");
+    expect(requireAgentHostUrl(true, "https://host.example")).toBeNull();
+    // Ad-hoc mode keeps the labeled skip path (no fail-fast).
+    expect(requireAgentHostUrl(false, null)).toBeNull();
   });
 });

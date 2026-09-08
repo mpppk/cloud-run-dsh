@@ -464,4 +464,17 @@ describe("issue #155: control-plane service with fail-closed public gate", () =>
     expect(c).toMatch(/#156/);
     expect(c).toMatch(/ADR-0001/);
   });
+
+  test("runbook Step 6.y documents the manual-service import adoption path", () => {
+    const c = readFileSync(join(import.meta.dir, "../docs/deployment-runbook.md"), "utf8");
+    // Exact import address with the count index (the resource uses count).
+    expect(c).toContain("google_cloud_run_v2_service.control_plane[0]");
+    expect(c).toContain("projects/<project>/locations/<region>/services/control-plane");
+    // Fresh-project path and the stop signal on replace plans.
+    expect(c).toMatch(/Fresh project/i);
+    expect(c).toMatch(/DELETE\/replace/i);
+    // Preview Instances must never be imported (ADR-0001).
+    expect(c).toMatch(/Never import preview Instances/i);
+    expect(c).toMatch(/ADR-0001/);
+  });
 });

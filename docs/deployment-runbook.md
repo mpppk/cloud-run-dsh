@@ -660,6 +660,43 @@ policies cannot break the rollout.
 
 Two-phase bootstrap (the service URI only exists after phase 1):
 
+### Adoption: existing manual service vs fresh project (read first)
+
+Step 6 deploys a manual service named `control-plane` (`gcloud run deploy
+control-plane`). Phase 1 `terraform apply` with the default
+`control_plane_service_name = "control-plane"` (same project/region) would
+CREATE the same name → API 409 AlreadyExists. Pick one path BEFORE phase 1:
+
+- **(a) Import the manual service (recommended).** Converges it under
+  Terraform on the next apply; the URI (hence APP_ORIGIN and the GitHub
+  callback) stays unchanged. The resource uses `count`, so the address
+  carries the `[0]` index — set the image vars first (otherwise count is 0
+  and the address does not exist):
+
+  ```bash
+  # Same vars phase 1 needs (image/App/agent-host image), then import:
+  terraform -chdir=infra/terraform import \
+    'google_cloud_run_v2_service.control_plane[0]' \
+    'projects/<project>/locations/<region>/services/control-plane'
+  # Verify state, then plan BEFORE applying:
+  terraform -chdir=infra/terraform state show 'google_cloud_run_v2_service.control_plane[0]' | head -20
+  terraform -chdir=infra/terraform plan [... same -var flags as phase 1 ...]
+  # Expect: no-op, or in-place updates converging manual drift (ingress, env,
+  # probes). A plan that proposes to DELETE/replace the service is a STOP
+  # signal — do not apply; reconcile the name/project/region first.
+  ```
+
+- **(b) Fresh project (no manual service).** Nothing to import: `gcloud run
+  services list` shows zero services, so phase 1 CREATEs cleanly. (Verified
+  2026-09-08: project `cloud-run-dsh`, region `asia-northeast1` lists zero
+  services — this path applies there today.)
+
+- **Never import preview Instances.** Agent-host Instances (`dsh-<uuid>`)
+  are per-workspace runtime objects owned by the application (ADR-0001) —
+  importing one would turn every workspace open into plan drift. The
+  asymmetry probe in the E2E script (AGENT_HOST_URL) checks them read-only
+  instead.
+
 ```bash
 # Phase 1 — private service (defaults: public=false). Learn the URI.
 terraform -chdir=infra/terraform apply \
@@ -687,8 +724,12 @@ anonymous denial, resource cleanup):
 
 ```bash
 APP_ORIGIN=<URI> DSH_SESSION=<paste __Host-dsh_session from a logged-in browser> \
-  bun run scripts/verify-issue155-e2e.ts
-# Optional: AGENT_HOST_URL=<instance base URL> adds the anonymous-denial probe.
+  AGENT_HOST_URL=<instance base URL> \
+  bun run scripts/verify-issue155-e2e.ts --strict
+# --strict is REQUIRED for production acceptance: it fails fast (before
+# mutating anything) when AGENT_HOST_URL is unset, because the agent-host
+# anonymous-denial asymmetry is load-bearing. Without --strict the probe is
+# a labeled skip (ad-hoc runs only).
 # Optional: E2E_REPO_OWNER/E2E_REPO_NAME pick the create target (default mpppk/demo).
 ```
 
