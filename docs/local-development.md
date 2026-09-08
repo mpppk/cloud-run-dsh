@@ -15,7 +15,7 @@ Cloud SQL, or Cloud Run required) and drive it with `curl`.
 | Workspace membership | `InMemoryMembershipStore` (the workspace owner is added automatically) |
 | Runtime handles | `RuntimeRegistry` + `LoggingWorkspaceRuntimeHandle` — `open` answers `STARTING` at once and flips to `READY` ~3s later (the async agent-host leg, played by a timer), `stop` flips to `STOPPED`, and every activity kind is printed to the console |
 | Clock | `SystemClock` |
-| Identity | **any** IAP identity is accepted; the subject becomes the internal user id |
+| Identity | dev auto-login: cookie-less requests get a real server-side session for the fixed dev principal (`github:1` / `dev`); disable with `DSH_DEV_AUTO_LOGIN=0` |
 
 ## Start it
 

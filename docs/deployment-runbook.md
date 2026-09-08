@@ -574,7 +574,12 @@ IAP configuration (brand + client were already created by Terraform in Step 2; m
 1. `iap_client_id` / `iap_brand_name` from `terraform output` identify the OAuth brand/client.
 2. Front the service with IAP — either an HTTPS Load Balancer backend (classic, stable) or the newer direct IAP-on-Cloud Run integration, whichever your project's Preview surface supports.
 3. Grant `roles/iap.httpsResourceAccessor` to your users (Terraform does this for `var.iap_members`; add more with `gcloud iap web add-iam-policy-binding`).
-4. The control plane **never trusts the IAP identity alone** — it resolves IAP identity → internal user → workspace membership → authorization (仕様書 §21, 実装手順書 §25). IAP being on does not make membership checks optional.
+4. IAP is a network-level gate only — it authenticates nothing on the API:
+   the control plane authenticates browsers via the `__Host-dsh_session`
+   cookie (GitHub OAuth login, Step 6.x) and then enforces workspace
+   membership + repository authorization (仕様書 §21, 実装手順書 §25).
+   `x-goog-authenticated-user-*` headers are ignored. IAP being on does not
+   make membership checks optional.
 
 ---
 
@@ -660,6 +665,13 @@ curl -s -c "$JAR" -b "$JAR" "https://<control-plane-host>/auth/session"
 # (Requests without a valid session get 401 "missing/invalid session".)
 #
 # All API calls below add -c "$JAR" -b "$JAR". The jar refreshes on use.
+#
+# Origin gate (issue #153): every POST/PUT/PATCH/DELETE to /v1/* or
+# /auth/logout requires `Origin` to EXACTLY equal APP_ORIGIN
+# (https://<control-plane-host> here) — missing/foreign origins get 403
+# "cross-origin request refused" even with a valid session. Every mutation
+# curl below therefore sends -H "Origin: https://<control-plane-host>".
+# GETs are exempt and need no Origin header.
 
 # 2. Create a workspace (session cookie jar required; issue #154: the caller
 #    additionally needs GitHub read-or-above on the target repo, else 403).
@@ -668,6 +680,7 @@ curl -s -c "$JAR" -b "$JAR" "https://<control-plane-host>/auth/session"
 #    you do NOT send an id. baseBranch is optional and defaults to "main".
 CREATE_RESPONSE="$(curl -s -c "$JAR" -b "$JAR" -X POST "https://<control-plane-host>/v1/workspaces" \
   -H "Content-Type: application/json" \
+  -H "Origin: https://<control-plane-host>" \
   -d '{"repositoryOwner":"<repo-owner>","repositoryName":"<repo-name>","baseBranch":"main"}')"
 echo "$CREATE_RESPONSE"
 # → 201 with the workspace DTO { id, ownerId, repositoryOwner, repositoryName, baseBranch, runtimeState, ... }
@@ -681,7 +694,8 @@ WORKSPACE_ID="$(echo "$CREATE_RESPONSE" | jq -r '.id')"
 #    the agent-host persists READY on the shared row when its recovery
 #    completes (minutes on a cold boot, ~3 min for stop-then-open per #121).
 #    NEVER wait on this call — poll GET until runtime_state reads READY:
-curl -s -c "$JAR" -b "$JAR" -X POST "https://<control-plane-host>/v1/workspaces/${WORKSPACE_ID}/open"
+curl -s -c "$JAR" -b "$JAR" -X POST "https://<control-plane-host>/v1/workspaces/${WORKSPACE_ID}/open" \
+  -H "Origin: https://<control-plane-host>"
 # → 202 {"workspaceId":"…","state":"STARTING"}
 
 for _ in $(seq 1 60); do
@@ -784,7 +798,8 @@ The way out is re-sending the stop — `STOPPING` re-entry is allowed
 (`prepareStop` resumes the sequence instead of throwing):
 
 ```bash
-curl -s -c "$JAR" -b "$JAR" -X POST "https://<control-plane-host>/v1/workspaces/${WORKSPACE_ID}/stop"
+curl -s -c "$JAR" -b "$JAR" -X POST "https://<control-plane-host>/v1/workspaces/${WORKSPACE_ID}/stop" \
+  -H "Origin: https://<control-plane-host>"
 # → 200 {"state":"STOPPED"}, then open again as in step 3 above.
 ```
 

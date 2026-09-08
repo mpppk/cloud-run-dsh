@@ -28,14 +28,6 @@ CREATE TABLE oauth_login_flows (
   state_hash BYTEA PRIMARY KEY,
   code_verifier TEXT NOT NULL,
   return_to TEXT,
-  -- A6 browser binding: SHA-256 of the `__Host-dsh_oauth` nonce issued
-  -- with the flow. The callback must present the raw nonce; the flow is
-  -- consumed one-time and the binding is compared constant-time.
-  binding_hash BYTEA NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at TIMESTAMPTZ NOT NULL
 );
-
--- A1: supports bounded expiry cleanup (`DELETE ... WHERE expires_at < now()`).
-CREATE INDEX oauth_login_flows_expires_at
-  ON oauth_login_flows(expires_at);
