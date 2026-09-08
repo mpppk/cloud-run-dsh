@@ -164,6 +164,67 @@ variable "github_app_client_secret_id" {
   default     = "github-app-client-secret"
 }
 
+# ---------------------------------------------------------------------------
+# Control-plane Cloud Run service (issue #155). All defaults keep the
+# service unmanaged (image "") and private (public=false): nothing is
+# created or publicized unexpectedly. See control-plane.tf header for the
+# two-phase bootstrap and rollback.
+# ---------------------------------------------------------------------------
+
+variable "control_plane_image" {
+  description = "Full container image URL for the control-plane service (e.g. <region>-docker.pkg.dev/<project>/agent-host/control-plane:v1). Empty means the service is NOT Terraform-managed."
+  type        = string
+  default     = ""
+}
+
+variable "control_plane_service_name" {
+  description = "Cloud Run service name for the control plane."
+  type        = string
+  default     = "control-plane"
+}
+
+variable "control_plane_public" {
+  description = "Public rollout gate (issue #155). false = restrictive ingress (internal+LB) with the invoker IAM check ON (bootstrap/rollback posture). true = INGRESS_TRAFFIC_ALL with invoker_iam_disabled (official recommended public mechanism, no allUsers binding) — requires app_origin (https), github_client_id, github_app_id and agent_host_image (lifecycle preconditions fail the plan otherwise)."
+  type        = bool
+  default     = false
+}
+
+variable "control_plane_app_origin" {
+  description = "Public origin of the control plane (e.g. https://dsh-control-abc.run.app). Required in public mode: must equal the service URI (or custom domain) AND the GitHub App callback <APP_ORIGIN>/auth/callback. Leave empty in private/bootstrap mode."
+  type        = string
+  default     = ""
+}
+
+variable "control_plane_github_client_id" {
+  description = "GitHub App OAuth Web-flow client ID (Iv1.…). Required in public mode; empty disables OAuth login (app 503s /auth/*)."
+  type        = string
+  default     = ""
+}
+
+variable "control_plane_github_app_id" {
+  description = "GitHub App numeric ID (GITHUB_APP_ID, not a secret). Required whenever the service is managed."
+  type        = string
+  default     = ""
+}
+
+variable "control_plane_agent_host_image" {
+  description = "Agent-host container image URL injected into created Instances (AGENT_HOST_IMAGE). Required whenever the service is managed."
+  type        = string
+  default     = ""
+}
+
+variable "control_plane_deletion_protection" {
+  description = "Deletion protection for the control-plane service. Keep true in production; set false for verification profiles that terraform-destroy afterwards."
+  type        = bool
+  default     = true
+}
+
+variable "control_plane_extra_env" {
+  description = "Optional plain-text env passthrough (LLM_BASE_URL/MODEL/APPROVAL_POLICY, INSTANCE_GC_*, DB_POOL_*). WARNING: values land in Terraform state — never put secrets here; credentials are secret_key_refs in control-plane.tf."
+  type        = map(string)
+  default     = {}
+}
+
 variable "iap_support_email" {
   description = "Support email for the IAP OAuth brand. Required when creating google_iap_brand. Supply out-of-band."
   type        = string

@@ -33,18 +33,18 @@ agent-host は、ワークスペース1つにつき1つの Cloud Run Instance。
 
 ```mermaid
 flowchart TB
-  U["ユーザー（ブラウザ）"] -->|IAP 認証| CP
+  U["ユーザー（ブラウザ）"] -->|GitHub OAuth + session Cookie<br/>+ Origin gate| CP
 
   subgraph GCP["GCP プロジェクト cloud-run-dsh · asia-northeast1"]
     CP["control-plane<br/>Cloud Run Service<br/>REST + SSE"]
     AH["agent-host<br/>Cloud Run Instance<br/>ワークスペースごとに1つ"]
     SQL[("Cloud SQL PostgreSQL 16<br/>ワークスペース・セッション・イベント")]
     GCS[("GCS バケット<br/>チェックポイント")]
-    SM[("Secret Manager<br/>db-password / github-app-key / llm-api-key")]
+    SM[("Secret Manager<br/>db-password / github-app-key / llm-api-key<br/>+ control-plane-database-url / github-app-client-secret")]
     AR[("Artifact Registry<br/>linux/amd64 イメージ")]
   end
 
-  GH["GitHub<br/>App インストールトークン"]
+  GH["GitHub<br/>App インストールトークン + OAuth ログイン"]
   LLM["LLM プロバイダ"]
 
   CP -->|"作成・起動・停止<br/>run.googleapis.com v2"| AH
@@ -111,7 +111,7 @@ sequenceDiagram
   participant GCS as GCS
 
   U->>CP: POST /v1/workspaces/:id/open
-  Note over U,CP: IAP 認証済み。ただし identity だけでは不十分
+  Note over U,CP: session Cookie + Origin gate 済み。ただし identity だけでは不十分
   CP->>DB: メンバーシップ確認
   CP->>DB: コントローラリース取得
   Note over CP,DB: ワークスペースあたり1つ。<br/>先行コントローラが生きていれば拒否
@@ -176,8 +176,11 @@ sequenceDiagram
 
 ### 図に載らない規則
 
-- **IAP だけでは認可しない。** IAP はユーザーが誰かを示すだけで、そのワークスペースのメンバーであるかは
-  control-plane が別途確認する。
+- **IAP だけでは認可しない（#155 以降は認証にも使わない）。** IAP はネットワーク層の
+  ゲートに過ぎず、API の認証は `__Host-dsh_session` Cookie（GitHub OAuth ログイン）
+  が担う。`x-goog-authenticated-user-*` ヘッダーは無視される。いずれの場合も、
+  ユーザーが誰かを示すだけでは足りず、そのワークスペースのメンバーであるかを
+  control-plane が別途確認する。IAP 基盤の削除（#156）は production E2E 成功が条件。
 - **open は合流する。** 同じワークスペースへの同時 open が複数届いても、起動する Instance は1つ。
   2つ目以降は同じ起動処理の完了を待つ。
 - **SSE のハートビートは活動ではない。** これを活動として数えると、画面を開いているだけで
@@ -318,6 +321,30 @@ Cloud Run 側からここを通る経路は無い。サブネットも VPC コ�
 | `dev-dsh-agent-host` | `cloudsql.client`、logging、monitoring、3つのシークレット（`github-app-private-key` / `llm-api-key` / `db-password`）に対する `secretAccessor`、チェックポイントバケットの object admin。 |
 | `dev-dsh-control-plane` | 上記に加えて `control-plane-database-url` の `secretAccessor`（control-plane 専用の4つ目。#93）、`run.admin`、agent-host への `actAs`。Instance を作るために必要。 |
 | `ai-agent` | ローカルの AI 作業用オペレータ ID。`run.admin` + `artifactregistry.writer` とスコープ付き `actAs`。ユーザー管理鍵は持たない。 |
+
+### 公開エッジと非対称性（#155）
+
+control-plane は通常の public HTTPS endpoint として公開される。認証は
+Cloud Run の end-user IAM ではなく application-level（GitHub OAuth →
+`__Host-dsh_session` Cookie → workspace membership / repository authorization、
+mutation には strict Origin 検証）が担う。
+
+```text
+Internet → Cloud Run public edge (INGRESS_TRAFFIC_ALL, invoker IAM check OFF)
+  → control-plane application auth → membership / repo authorization
+control-plane SA → Cloud Run ID token + Invoker IAM → agent-host Instance（非公開のまま）
+```
+
+- Terraform が stable な control-plane Service のみを管理する
+ （`infra/terraform/control-plane.tf`）。agent-host Instance は ADR-0001 の
+ 通り管理外のまま。
+- 公開は公式推奨の `invoker_iam_disabled` で行い、`allUsers` への IAM 付与は
+  リポジトリ全体で禁止（テストで固定）。既定は非公開のまま
+  （fail-closed: `control_plane_public=false`）。
+- agent-host は anonymous を受け付けない非対称性を維持する。control-plane
+  SA 以外の invoker を足してはならない。
+- IAP 基盤の削除（#156）は production E2E 成功が条件。それまでは IAP を
+  残し、ロールバック先（`control_plane_public=false`）として使う。
 
 > **これは least-privilege ではない。** `ai-agent` になりすませる者は、agent-host *として*動くコンテナを
 > デプロイし、全てのシークレットとチェックポイントバケットを読める。単一オーナーのプロジェクトとして

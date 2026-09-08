@@ -52,3 +52,18 @@ output "iap_client_id" {
   description = "IAP OAuth client ID (if created)."
   value       = try(google_iap_client.dsh[0].client_id, null)
 }
+
+output "control_plane_service_name" {
+  description = "Control-plane Cloud Run service name (null when unmanaged: control_plane_image is empty)."
+  value       = try(google_cloud_run_v2_service.control_plane[0].name, null)
+}
+
+output "control_plane_service_uri" {
+  description = "Control-plane service HTTPS URI. Phase-1 bootstrap output: register GitHub App callback <URI>/auth/callback and set control_plane_app_origin to this before enabling public mode."
+  value       = try(google_cloud_run_v2_service.control_plane[0].uri, null)
+}
+
+output "control_plane_public" {
+  description = "Whether the control-plane service is in public rollout mode (ingress ALL + invoker IAM check disabled)."
+  value       = try(google_cloud_run_v2_service.control_plane[0].invoker_iam_disabled, false)
+}

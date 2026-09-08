@@ -14,6 +14,7 @@ Terraform for the Google Cloud baseline described in 実装手順書 §2 and 仕
 | `storage.tf` | GCS checkpoint bucket (uniform access, versioning, lifecycle) |
 | `iam.tf` | Runtime service accounts, AI-agent operator account, and least-privilege bindings |
 | `secrets.tf` | Secret Manager placeholders (no values in code) |
+| `control-plane.tf` | Control-plane Cloud Run service with fail-closed public gate (issue #155; ADR-0001 still excludes agent-host Instances) |
 | `iap.tf` | IAP brand/client + `iap.httpsResourceAccessor` members |
 | `outputs.tf` | Bucket, SQL connection, registry URL, SA emails |
 
@@ -47,6 +48,15 @@ Terraform for the Google Cloud baseline described in 実装手順書 §2 and 仕
 | `checkpoint_live_delete_age_days` | number | `0` | no | Days after which LIVE objects are deleted. `0` = disabled (safe default). |
 | `iap_support_email` | string | `null` | conditional | Support email for IAP brand. Required to create `google_iap_brand`. |
 | `iap_members` | list(string) | `[]` | no | Members granted `roles/iap.httpsResourceAccessor` (e.g. `user:alice@example.com`). |
+| `control_plane_image` | string | `""` | no | Full control-plane image URL. Empty = service NOT managed (fail-closed default). |
+| `control_plane_service_name` | string | `control-plane` | no | Cloud Run service name. |
+| `control_plane_public` | bool | `false` | no | Public gate: `false` = internal+LB ingress with invoker IAM check ON; `true` = `INGRESS_TRAFFIC_ALL` + `invoker_iam_disabled` (official recommended public mechanism, no `allUsers`). Requires https `control_plane_app_origin`, `control_plane_github_client_id`, `control_plane_github_app_id`, `control_plane_agent_host_image` (plan preconditions). |
+| `control_plane_app_origin` | string | `""` | conditional | Public origin (== service URI, == GitHub callback `<origin>/auth/callback`). Required in public mode. |
+| `control_plane_github_client_id` | string | `""` | conditional | GitHub App OAuth client ID. Required in public mode. |
+| `control_plane_github_app_id` | string | `""` | conditional | GitHub App numeric ID. Required whenever the service is managed. |
+| `control_plane_agent_host_image` | string | `""` | conditional | Agent-host image URL for created Instances. Required whenever the service is managed. |
+| `control_plane_deletion_protection` | bool | `true` | no | Deletion protection; `false` for verification profiles that destroy afterwards. |
+| `control_plane_extra_env` | map(string) | `{}` | no | Optional plain-text env (LLM/GC/pool tuning). Never secrets — values land in state. |
 | `labels` | map(string) | `{}` | no | Common labels on all resources. |
 
 ## How to init / plan
@@ -140,6 +150,7 @@ These are never stored in code and must be injected via Secret Manager / env:
   - `llm-api-key` — LLM provider API key
   - `db-password` — PostgreSQL `dsh_app` password (also drives `google_sql_user.app.password` via `data.google_secret_manager_secret_version`)
   - `control-plane-database-url` — control-plane Cloud Run service `DATABASE_URL` in `/cloudsql` socket form (its version is added in the runbook's Step 6, which is where the connection name and encoded password are at hand)
+  - `github-app-client-secret` — GitHub App OAuth client secret (its version is added in the runbook's Step 6.x; referenced by the control-plane service only in public mode)
 
 Example:
 
@@ -201,6 +212,47 @@ Cloud Run Instances (`run.googleapis.com` Instance API: create/start/stop/delete
 In short: Instances are per-workspace resources whose lifecycle belongs to the application (the control plane creates / starts / stops them at runtime; it intentionally never deletes them — stopped Instances cost nothing, see [#85](https://github.com/mpppk/cloud-run-dsh/issues/85)). Managing them declaratively would turn every runtime-created Instance into `terraform plan` drift, while making "open a workspace" an infrastructure change. Terraform owns the static foundation (APIs, Cloud SQL, GCS, Secrets, IAM, service accounts) — nothing more.
 
 Instance lifecycle is handled at runtime by the control plane's `InstanceRuntime` adapter (see 実装手順書 §5) which calls the Cloud Run REST API directly. Do **not** fake it with `google_cloud_run_v2_service`, and do not add a `run_instances.tf` even if `hashicorp/google`(-beta) ships a `google_cloud_run_instance` resource — revisit ADR-0001 first.
+
+## Control-plane service with fail-closed public gate (issue #155)
+
+`control-plane.tf` manages ONLY the stable control-plane Cloud Run service —
+agent-host Instances stay outside Terraform per ADR-0001 above (no
+agent-host service/instance/worker-pool resource may be added; the baseline
+test pins exactly one `google_cloud_run_v2_service`, `control_plane`).
+
+Fail-closed by default: with stock variable values nothing is created
+(`control_plane_image` is empty) and nothing is public
+(`control_plane_public` is false → internal+LB ingress, invoker IAM check
+on). Public mode uses the official recommended mechanism
+(`invoker_iam_disabled = true`,
+https://cloud.google.com/run/docs/authenticating/public) — there is no
+`allUsers` IAM binding anywhere in this repo, so domain-restricted-sharing
+policies cannot break the rollout. Requesting public mode without its
+mandatory config (https `control_plane_app_origin`,
+`control_plane_github_client_id`, `control_plane_github_app_id`,
+`control_plane_agent_host_image`) fails the plan via lifecycle
+preconditions, not the container at boot.
+
+Two-phase bootstrap (the service URI only exists after phase 1):
+
+```bash
+# Phase 1 — private service; learn the URI.
+terraform apply -var='control_plane_image=<region>-docker.pkg.dev/<project>/agent-host/control-plane:v1' \
+  -var='control_plane_github_app_id=<gh-app-id>' \
+  -var='control_plane_agent_host_image=<region>-docker.pkg.dev/<project>/agent-host/agent-host:v1'
+terraform output -raw control_plane_service_uri
+# Phase 2 — out-of-band: secret versions (runbook Step 6.x), GitHub App
+# callback <URI>/auth/callback with APP_ORIGIN=<URI>, migrations 0001-0004.
+# Then re-apply in public mode and verify with scripts/verify-issue155-e2e.ts:
+terraform apply -var='control_plane_public=true' \
+  -var='control_plane_app_origin=<URI>' \
+  -var='control_plane_github_client_id=<Iv1…>' [... same image/App vars ...]
+```
+
+Rollback to private at any time: `control_plane_public=false` + re-apply
+(ingress back to internal+LB, IAM check back on). #156 (IAP removal) stays
+gated until production E2E succeeds — do not remove `iap.tf` or IAP wording
+in the runbook as part of #155.
 
 ## Private IP choice (cloudsql.tf)
 
